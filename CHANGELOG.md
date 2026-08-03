@@ -6,6 +6,8 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+## [0.2.0] - 2026-08-03
+
 ### Added
 
 - Local tmux and ordinary-terminal discovery for Codex, Claude, OpenCode, and
