@@ -207,7 +207,7 @@ jobs:
           tmux -L "$socket_name" set-option -g @tmux-agent-binary "$PWD/bin/tmux-agent"
           tmux -L "$socket_name" run-shell "$PWD/tmux-agent.tmux"
           tmux -L "$socket_name" list-keys -T prefix |
-            awk '$4 == "A" && /scripts\\/launch-popup/ { found = 1 } END { exit !found }'
+            awk '$4 == "A" && index($0, "scripts/launch-popup") { found = 1 } END { exit !found }'
           socket_path=$(tmux -L "$socket_name" display-message -p '#{socket_path}')
           for _ in {1..50}; do
             status=$(TMUX="$socket_path,0,0" bin/tmux-agent daemon status)
