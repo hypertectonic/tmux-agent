@@ -197,6 +197,12 @@ jobs:
           bin/tmux-agent daemon status
           bin/tmux-agent doctor --json
       - name: Exercise the TPM entrypoint without Rust
+        env:
+          TMUX_AGENT_DATA_DIR: ${{ runner.temp }}/tmux-agent-data/tmux-agent
+          TMUX_AGENT_STATE_DIR: ${{ runner.temp }}/tmux-agent-state/tmux-agent
+          XDG_CONFIG_HOME: ${{ runner.temp }}/tmux-agent-config
+          XDG_RUNTIME_DIR: ${{ runner.temp }}/tmux-agent-runtime
+          XDG_STATE_HOME: ${{ runner.temp }}/tmux-agent-xdg-state
         run: |
           socket_name="tmux-agent-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           cleanup() {
