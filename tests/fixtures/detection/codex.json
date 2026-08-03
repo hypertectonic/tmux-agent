@@ -1,0 +1,67 @@
+[
+  {
+    "name": "blocked title overrides visible activity",
+    "basis": "synthetic precedence regression",
+    "title": "Action Required",
+    "screen": "Working (2s · esc to interrupt)",
+    "state": "blocked",
+    "source": "title",
+    "signal": "title_requests_action",
+    "scope": "terminal_title",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "current turn confirmation overrides stale activity",
+    "basis": "synthetic interaction regression",
+    "title": "project",
+    "screen": "Working (2s · esc to interrupt)\n› continue\nAllow this command?",
+    "state": "blocked",
+    "source": "screen",
+    "signal": "current_turn_requests_confirmation",
+    "scope": "current_turn",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "working footer is active",
+    "basis": "provider terminal observation",
+    "title": "",
+    "screen": "Working (2s · esc to interrupt)",
+    "state": "working",
+    "source": "screen",
+    "signal": "working_footer",
+    "scope": "recent_lines",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "transcript controls preserve state",
+    "basis": "synthetic alternate-view regression",
+    "title": "",
+    "screen": "› prompt\nesc to edit prev\n↑/↓ to scroll\npgup/pgdn to move\nhome/end to jump\nq to quit",
+    "state": "unknown",
+    "source": "screen",
+    "signal": "transcript_view",
+    "scope": "current_turn",
+    "definitive": false,
+    "inferred": false,
+    "preserve_previous": true
+  },
+  {
+    "name": "static title is ready",
+    "basis": "local terminal observation",
+    "title": "project",
+    "screen": "› prompt",
+    "state": "idle",
+    "source": "title",
+    "signal": "static_title",
+    "scope": "terminal_title",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  }
+]

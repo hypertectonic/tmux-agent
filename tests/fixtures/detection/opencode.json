@@ -1,0 +1,67 @@
+[
+  {
+    "name": "current permission panel is blocked",
+    "basis": "synthetic interaction regression",
+    "title": "",
+    "screen": "Ask anything...\nPermission required\nEsc dismiss",
+    "state": "blocked",
+    "source": "screen",
+    "signal": "permission_panel",
+    "scope": "current_interaction",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "current interrupt hint is active",
+    "basis": "local terminal observation",
+    "title": "",
+    "screen": "Ask anything...\nBuilding\nesc again to interrupt",
+    "state": "working",
+    "source": "screen",
+    "signal": "interrupt_hint",
+    "scope": "current_interaction",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "progress cells are active",
+    "basis": "provider terminal observation",
+    "title": "",
+    "screen": "Ask anything...\n■⬝■⬝",
+    "state": "working",
+    "source": "screen",
+    "signal": "progress_pattern",
+    "scope": "current_interaction",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "input prompt is ready",
+    "basis": "provider terminal observation",
+    "title": "",
+    "screen": "Ask anything...",
+    "state": "idle",
+    "source": "screen",
+    "signal": "input_prompt",
+    "scope": "current_interaction",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "quiet foreground is inferred idle",
+    "basis": "state-model requirement",
+    "title": "",
+    "screen": "",
+    "state": "idle",
+    "source": "process",
+    "signal": "opencode_foreground_without_activity",
+    "scope": "foreground_process",
+    "definitive": false,
+    "inferred": true,
+    "preserve_previous": false
+  }
+]

@@ -1,0 +1,59 @@
+#!/bin/sh
+set -eu
+
+TMUX_AGENT_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+export TMUX_AGENT_ROOT
+. "$TMUX_AGENT_ROOT/scripts/lib.sh"
+
+if binary=$(tmux_agent_current_binary 2>/dev/null); then
+    exec "$binary" doctor "$@"
+fi
+
+json=0
+case "${1:-}" in
+    '')
+        ;;
+    --json)
+        json=1
+        ;;
+    *)
+        printf 'usage: %s [--json]\n' "$0" >&2
+        exit 2
+        ;;
+esac
+
+version=$(tmux_agent_version 2>/dev/null || printf '%s' unknown)
+target=$(tmux_agent_target 2>/dev/null || printf '%s' unsupported)
+status=$(tmux_agent_read_status)
+log=$(tmux_agent_install_log)
+downloader=missing
+if command -v curl >/dev/null 2>&1; then
+    downloader=curl
+elif command -v wget >/dev/null 2>&1; then
+    downloader=wget
+fi
+tmux_status=missing
+command -v tmux >/dev/null 2>&1 && tmux_status=available
+
+if [ "$json" -eq 1 ]; then
+    escape_json() {
+        printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+    }
+    printf '{\n'
+    printf '  "application_version": null,\n'
+    printf '  "plugin_version": "%s",\n' "$(escape_json "$version")"
+    printf '  "target": "%s",\n' "$(escape_json "$target")"
+    printf '  "install_status": "%s",\n' "$(escape_json "$status")"
+    printf '  "downloader": "%s",\n' "$(escape_json "$downloader")"
+    printf '  "tmux": "%s",\n' "$(escape_json "$tmux_status")"
+    printf '  "install_log": "%s"\n' "$(escape_json "$log")"
+    printf '}\n'
+else
+    printf 'tmux-agent plugin %s for %s\n' "$version" "$target"
+    printf 'error  binary                   not installed\n'
+    printf ' info  install-status           %s\n' "$status"
+    printf ' info  downloader               %s\n' "$downloader"
+    printf ' info  tmux                     %s\n' "$tmux_status"
+    printf ' info  install-log              %s\n' "$log"
+fi
+exit 1

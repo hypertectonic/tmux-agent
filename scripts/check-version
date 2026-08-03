@@ -1,0 +1,47 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+version=$(sed -n '1p' "$root/VERSION")
+cargo_version=$(awk '
+    /^\[package\]$/ { package = 1; next }
+    /^\[/ { package = 0 }
+    package && /^version = / {
+        value = $0
+        sub(/^version = "/, "", value)
+        sub(/"$/, "", value)
+        print value
+        exit
+    }
+' "$root/Cargo.toml")
+lock_version=$(awk '
+    /^\[\[package\]\]$/ { package = 1; name = ""; next }
+    package && /^name = "tmux-agent"$/ { name = "tmux-agent"; next }
+    package && name == "tmux-agent" && /^version = / {
+        value = $0
+        sub(/^version = "/, "", value)
+        sub(/"$/, "", value)
+        print value
+        exit
+    }
+' "$root/Cargo.lock")
+
+if [ -z "$version" ] || [ "$version" != "$cargo_version" ] || [ "$version" != "$lock_version" ]; then
+    printf 'version mismatch: VERSION=%s Cargo.toml=%s Cargo.lock=%s\n' \
+        "$version" "$cargo_version" "$lock_version" >&2
+    exit 1
+fi
+
+if [ -n "${GITHUB_REF_NAME:-}" ]; then
+    case "$GITHUB_REF_NAME" in
+        v*)
+            tag_version=${GITHUB_REF_NAME#v}
+            if [ "$tag_version" != "$version" ]; then
+                printf 'tag %s does not match version %s\n' "$GITHUB_REF_NAME" "$version" >&2
+                exit 1
+            fi
+            ;;
+    esac
+fi
+
+printf '%s\n' "$version"

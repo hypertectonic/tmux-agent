@@ -1,0 +1,64 @@
+#!/bin/sh
+set -eu
+
+TMUX_AGENT_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+export TMUX_AGENT_ROOT
+. "$TMUX_AGENT_ROOT/scripts/lib.sh"
+
+purge=0
+case "${1:-}" in
+    '')
+        ;;
+    --purge)
+        purge=1
+        ;;
+    *)
+        printf 'usage: %s [--purge]\n' "$0" >&2
+        exit 2
+        ;;
+esac
+
+data_dir=$(tmux_agent_data_dir)
+state_dir=$(tmux_agent_state_dir)
+if binary=$(tmux_agent_current_binary 2>/dev/null); then
+    "$binary" daemon stop >/dev/null 2>&1 || true
+fi
+
+if [ -e "$data_dir" ]; then
+    if [ ! -f "$data_dir/.tmux-agent-managed" ]; then
+        printf 'tmux-agent: refusing to remove unmarked directory %s\n' "$data_dir" >&2
+        exit 1
+    fi
+    rm -rf -- "$data_dir"
+    printf 'removed %s\n' "$data_dir"
+fi
+
+if [ "$purge" -eq 1 ]; then
+    config_dir=${XDG_CONFIG_HOME:-"${HOME:?HOME is required}/.config"}/tmux-agent
+    case "$config_dir" in
+        */tmux-agent) ;;
+        *)
+            printf 'tmux-agent: refusing unsafe config path %s\n' "$config_dir" >&2
+            exit 1
+            ;;
+    esac
+    if [ -e "$config_dir" ]; then
+        rm -rf -- "$config_dir"
+        printf 'removed %s\n' "$config_dir"
+    fi
+    case "$state_dir" in
+        */tmux-agent) ;;
+        *)
+            printf 'tmux-agent: refusing unsafe state path %s\n' "$state_dir" >&2
+            exit 1
+            ;;
+    esac
+    if [ -e "$state_dir" ]; then
+        rm -rf -- "$state_dir"
+        printf 'removed %s\n' "$state_dir"
+    fi
+else
+    printf 'kept config under %s\n' \
+        "${XDG_CONFIG_HOME:-"${HOME:?HOME is required}/.config"}/tmux-agent"
+    printf 'kept state and logs under %s\n' "$state_dir"
+fi

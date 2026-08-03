@@ -1,0 +1,126 @@
+#!/bin/sh
+set -eu
+
+TMUX_AGENT_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+export TMUX_AGENT_ROOT
+. "$TMUX_AGENT_ROOT/scripts/lib.sh"
+
+data_dir=$(tmux_agent_data_dir)
+
+show_versions() {
+    current_target=$(readlink "$data_dir/current" 2>/dev/null || true)
+    found=0
+    for version_dir in "$data_dir"/versions/*; do
+        [ -d "$version_dir" ] || continue
+        candidate_version=${version_dir##*/}
+        candidate_binary="$version_dir/tmux-agent"
+        [ -x "$candidate_binary" ] || continue
+        found=1
+        marker=' '
+        case "$current_target" in
+            "versions/$candidate_version/tmux-agent" | "$candidate_binary")
+                marker='*'
+                ;;
+        esac
+        printf '%s %s\n' "$marker" "$candidate_version"
+    done
+    if [ "$found" -eq 0 ]; then
+        printf '%s\n' 'no managed versions installed'
+    fi
+}
+
+rollback() {
+    requested_version=${1:-}
+    case "$requested_version" in
+        '' | *[!0-9A-Za-z.+-]*)
+            printf '%s\n' 'usage: tmux-agent plugin rollback <version>' >&2
+            exit 2
+            ;;
+    esac
+    requested_binary="$data_dir/versions/$requested_version/tmux-agent"
+    if ! tmux_agent_binary_matches "$requested_binary" "$requested_version"; then
+        printf 'tmux-agent: version %s is not installed or failed verification\n' \
+            "$requested_version" >&2
+        exit 1
+    fi
+    lock_dir="$data_dir/.install.lock"
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        printf '%s\n' 'tmux-agent: installation or another rollback is in progress' >&2
+        exit 1
+    fi
+    rollback_cleanup() {
+        rm -f -- "$lock_dir/pid"
+        rmdir "$lock_dir" 2>/dev/null || true
+    }
+    trap rollback_cleanup EXIT HUP INT TERM
+    printf '%s\n' "$$" >"$lock_dir/pid"
+    link_tmp="$data_dir/.current.$$"
+    ln -s "versions/$requested_version/tmux-agent" "$link_tmp"
+    mv -f "$link_tmp" "$data_dir/current"
+    tmux_agent_write_status "READY|$requested_version"
+    "$requested_binary" daemon restart >/dev/null 2>&1 || true
+    printf 'tmux-agent: rolled back to %s\n' "$requested_version"
+    rollback_cleanup
+    trap - EXIT HUP INT TERM
+}
+
+if [ "${1:-}" = plugin ]; then
+    case "${2:-}" in
+        versions)
+            [ "$#" -eq 2 ] || {
+                printf '%s\n' 'usage: tmux-agent plugin versions' >&2
+                exit 2
+            }
+            show_versions
+            exit 0
+            ;;
+        rollback)
+            [ "$#" -eq 3 ] || {
+                printf '%s\n' 'usage: tmux-agent plugin rollback <version>' >&2
+                exit 2
+            }
+            rollback "$3"
+            exit 0
+            ;;
+        update)
+            [ "$#" -eq 2 ] || {
+                printf '%s\n' 'usage: tmux-agent plugin update' >&2
+                exit 2
+            }
+            exec "$TMUX_AGENT_ROOT/scripts/bootstrap"
+            ;;
+        *)
+            printf '%s\n' \
+                'usage: tmux-agent plugin {versions|rollback <version>|update}' >&2
+            exit 2
+            ;;
+    esac
+fi
+
+if [ -n "${TMUX_AGENT_BINARY:-}" ]; then
+    binary=$TMUX_AGENT_BINARY
+else
+    binary=$(tmux_agent_current_binary 2>/dev/null || true)
+fi
+
+if [ -z "$binary" ] || [ ! -x "$binary" ]; then
+    status=$(tmux_agent_read_status)
+    case "$status" in
+        INSTALLING\|*)
+            printf 'tmux-agent: waiting for %s\n' "$status" >&2
+            ;;
+        FAILED\|* | UNSUPPORTED\|*)
+            printf 'tmux-agent: previous installation state is %s; retrying\n' "$status" >&2
+            ;;
+    esac
+    if ! "$TMUX_AGENT_ROOT/scripts/bootstrap" --no-restart; then
+        status=$(tmux_agent_read_status)
+        log=$(tmux_agent_install_log)
+        printf 'tmux-agent: managed binary unavailable (%s)\n' "$status" >&2
+        printf 'tmux-agent: inspect %s and run %s/scripts/doctor\n' "$log" "$TMUX_AGENT_ROOT" >&2
+        exit 1
+    fi
+    binary=$(tmux_agent_current_binary)
+fi
+
+exec "$binary" "$@"

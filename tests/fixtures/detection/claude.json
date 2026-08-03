@@ -1,0 +1,67 @@
+[
+  {
+    "name": "current permission overrides old activity",
+    "basis": "synthetic precedence regression",
+    "title": "",
+    "screen": "Running command\n────\nDo you want to proceed?\n1. Yes\n2. No",
+    "state": "blocked",
+    "source": "screen",
+    "signal": "permission_question",
+    "scope": "current_panel",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "current interrupt hint is active",
+    "basis": "synthetic interaction regression",
+    "title": "",
+    "screen": "────\n❯ previous\n────\nRunning command\nesc to interrupt",
+    "state": "working",
+    "source": "screen",
+    "signal": "recent_activity_marker",
+    "scope": "recent_lines",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "empty prompt box is ready",
+    "basis": "provider terminal observation",
+    "title": "",
+    "screen": "response\n────\n❯ \n────\n? shortcuts",
+    "state": "idle",
+    "source": "screen",
+    "signal": "input_prompt",
+    "scope": "prompt_box",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "model picker preserves state",
+    "basis": "synthetic alternate-view regression",
+    "title": "",
+    "screen": "Select model\nEnter to set as default\nEsc to cancel",
+    "state": "unknown",
+    "source": "screen",
+    "signal": "model_picker",
+    "scope": "visible_screen",
+    "definitive": false,
+    "inferred": false,
+    "preserve_previous": true
+  },
+  {
+    "name": "braille title is active",
+    "basis": "provider terminal observation",
+    "title": "⠂ project",
+    "screen": "",
+    "state": "working",
+    "source": "title",
+    "signal": "title_shows_activity",
+    "scope": "terminal_title",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  }
+]

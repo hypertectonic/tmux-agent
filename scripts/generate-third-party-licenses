@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+case "$#" in
+    0) output="$root/THIRD_PARTY_LICENSES.html" ;;
+    1) output=$1 ;;
+    *)
+        printf 'usage: %s [output-file]\n' "$0" >&2
+        exit 2
+        ;;
+esac
+
+if ! command -v cargo-about >/dev/null 2>&1; then
+    printf '%s\n' \
+        'cargo-about 0.9.1 is required; run cargo install cargo-about --version 0.9.1 --locked --features cli' >&2
+    exit 1
+fi
+if [ "$(cargo about --version)" != "cargo-about 0.9.1" ]; then
+    printf '%s\n' 'cargo-about 0.9.1 is required to generate the license report' >&2
+    exit 1
+fi
+
+output_dir=$(CDPATH='' cd -- "$(dirname -- "$output")" && pwd)
+output_name=$(basename -- "$output")
+generated_raw=$(mktemp "${TMPDIR:-/tmp}/tmux-agent-licenses-raw.XXXXXX")
+generated=$(mktemp "$output_dir/.${output_name}.XXXXXX")
+cleanup() {
+    rm -f -- "$generated_raw" "$generated"
+}
+trap cleanup EXIT HUP INT TERM
+
+cd "$root"
+cargo fetch --locked
+cargo about generate --frozen --fail --output-file "$generated_raw" about.hbs
+tr -d '\r' <"$generated_raw" | sed 's/[[:blank:]]*$//' >"$generated"
+chmod 644 "$generated"
+mv -f "$generated" "$output_dir/$output_name"
+generated=
+printf 'generated %s\n' "$output_dir/$output_name"

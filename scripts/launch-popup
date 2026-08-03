@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+tmux_bin=${TMUX_AGENT_TMUX_BIN:-tmux}
+
+option() {
+    local name=$1
+    local fallback=$2
+    local value
+    value=$("$tmux_bin" show-option -gqv "$name" 2>/dev/null || true)
+    if [[ -n $value ]]; then
+        printf '%s\n' "$value"
+    else
+        printf '%s\n' "$fallback"
+    fi
+}
+
+valid_dimension() {
+    [[ $1 =~ ^([1-9][0-9]?|100)%$ || $1 =~ ^[1-9][0-9]*$ ]]
+}
+
+width=$(option @tmux-agent-popup-width 80%)
+height=$(option @tmux-agent-popup-height 80%)
+valid_dimension "$width" || width=80%
+valid_dimension "$height" || height=80%
+
+panes=()
+while IFS= read -r pane; do
+    [[ -n $pane ]] && panes[${#panes[@]}]=$pane
+done < <(
+    "$tmux_bin" list-panes -F '#{pane_id}' \
+        -f '#{&&:#{==:#{@tmux_agent_ui},1},#{&&:#{==:#{pane_dead},0},#{||:#{==:#{window_zoomed_flag},0},#{==:#{pane_active},1}}}}' \
+        2>/dev/null || true
+)
+case ${#panes[@]} in
+    1)
+        "$tmux_bin" select-pane -t "${panes[0]}"
+        exit 0
+        ;;
+    0)
+        ;;
+    *)
+        "$tmux_bin" display-message \
+            "tmux-agent: multiple UI panes are visible in this window; focus one manually"
+        exit 1
+        ;;
+esac
+
+configured_binary=$("$tmux_bin" show-option -gqv @tmux-agent-binary 2>/dev/null || true)
+if [[ -n $configured_binary ]]; then
+    if [[ ! -x $configured_binary ]]; then
+        "$tmux_bin" display-message \
+            "tmux-agent: @tmux-agent-binary is not executable; run scripts/doctor"
+        exit 1
+    fi
+    binary=$configured_binary
+else
+    binary="$root/bin/tmux-agent"
+fi
+
+printf -v popup_command '%q ui --popup' "$binary"
+"$tmux_bin" display-popup -E -w "$width" -h "$height" "$popup_command"

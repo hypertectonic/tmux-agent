@@ -1,0 +1,79 @@
+#!/bin/sh
+set -eu
+
+root=${1:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}
+failed=0
+
+check() {
+    description=$1
+    pattern=$2
+    shift 2
+    if (
+        cd "$root"
+        rg --pcre2 -n "$pattern" . \
+            -g '!target/**' -g '!.git/**' -g '!scripts/check-public-tree' "$@"
+    ); then
+        printf 'public-tree check failed: %s\n' "$description" >&2
+        failed=1
+    else
+        status=$?
+        if [ "$status" -ne 1 ]; then
+            printf 'public-tree scan error: %s\n' "$description" >&2
+            failed=1
+        fi
+    fi
+}
+
+check 'em dash found' '—'
+check 'non-example macOS home path found' '/Users/(?!agent(?:/|")|user(?:/|")|example(?:/|"))'
+check 'non-example Linux home path found' '/home/(?!agent(?:/|")|user(?:/|")|example(?:/|"))'
+check 'non-example Tailnet hostname found' '(?<!example)\.ts\.net'
+check 'private key material found' 'BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY'
+check 'probable GitHub token found' 'gh[pousr]_[A-Za-z0-9_]{30,}'
+check 'probable AWS access key found' 'AKIA[0-9A-Z]{16}'
+
+denylist=${TMUX_AGENT_PUBLIC_TREE_DENYLIST:-}
+denylist_required=0
+if [ -n "$denylist" ]; then
+    denylist_required=1
+elif command -v git >/dev/null 2>&1 &&
+    git_dir=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null); then
+    case "$git_dir" in
+        /*) ;;
+        *) git_dir="$root/$git_dir" ;;
+    esac
+    denylist="$git_dir/public-tree-denylist"
+fi
+
+if [ -n "$denylist" ]; then
+    if [ ! -e "$denylist" ]; then
+        if [ "$denylist_required" -eq 1 ]; then
+            printf 'public-tree denylist does not exist: %s\n' "$denylist" >&2
+            exit 1
+        fi
+    elif [ ! -f "$denylist" ]; then
+        printf 'public-tree denylist is not a file: %s\n' "$denylist" >&2
+        exit 1
+    else
+        tab=$(printf '\t')
+        while IFS="$tab" read -r description pattern ||
+            [ -n "$description$pattern" ]; do
+            case "$description" in
+                '' | '#'*)
+                    continue
+                    ;;
+            esac
+            if [ -z "$pattern" ]; then
+                printf 'public-tree denylist entry has no pattern: %s\n' \
+                    "$description" >&2
+                exit 1
+            fi
+            check "$description" "$pattern"
+        done <"$denylist"
+    fi
+fi
+
+if [ "$failed" -ne 0 ]; then
+    exit 1
+fi
+printf '%s\n' 'public tree scan passed'

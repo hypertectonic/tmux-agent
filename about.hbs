@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tmux-agent third-party licenses</title>
+  <style>
+    body {
+      color: #172033;
+      font: 16px/1.5 system-ui, sans-serif;
+      margin: 0;
+    }
+    main {
+      margin: 0 auto;
+      max-width: 960px;
+      padding: 2rem;
+    }
+    pre {
+      background: #f5f7fa;
+      border: 1px solid #d7dce5;
+      overflow-x: auto;
+      padding: 1rem;
+      white-space: pre-wrap;
+    }
+    @media (prefers-color-scheme: dark) {
+      body {
+        background: #171a1f;
+        color: #e5e7eb;
+      }
+      a {
+        color: #67e8f9;
+      }
+      pre {
+        background: #222d38;
+        border-color: #4b5563;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>tmux-agent third-party licenses</h1>
+    <p>
+      This report lists the Rust dependencies in the locked tmux-agent release
+      graph and the license text selected for each dependency.
+    </p>
+
+    <h2>License overview</h2>
+    <ul>
+      {{#each overview}}
+      <li><a href="#{{id}}">{{name}}</a> ({{count}} dependencies)</li>
+      {{/each}}
+    </ul>
+
+    <h2>License texts and dependencies</h2>
+    {{#each licenses}}
+    <section>
+      <h3 id="{{id}}">{{name}}</h3>
+      <p>Used by:</p>
+      <ul>
+        {{#each used_by}}
+        <li>
+          <a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">
+            {{crate.name}} {{crate.version}}
+          </a>
+        </li>
+        {{/each}}
+      </ul>
+      <pre>{{text}}</pre>
+    </section>
+    {{/each}}
+  </main>
+</body>
+</html>

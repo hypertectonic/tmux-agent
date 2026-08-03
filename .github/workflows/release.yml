@@ -1,0 +1,217 @@
+name: Release candidate
+
+on:
+  push:
+    tags:
+      - v*
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.ref }}
+      - name: Require the tagged commit on main
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main ||
+            {
+              printf '%s\n' 'release tag is not on the reviewed main branch' >&2
+              exit 1
+            }
+      - name: Install release validation tools
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Check tag and version agreement
+        run: scripts/check-version
+      - name: Scan public tree
+        run: scripts/check-public-tree
+      - name: Check release readiness
+        run: scripts/check-release-readiness
+      - name: Run release quality gates
+        run: |
+          cargo fmt --all --check
+          cargo test --locked
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Clone RustSec advisory database
+        run: git clone --depth 1 https://github.com/RustSec/advisory-db.git "$RUNNER_TEMP/advisory-db"
+      - name: Audit dependency vulnerabilities
+        run: cargo audit --no-fetch --db "$RUNNER_TEMP/advisory-db"
+      - name: Install cargo-about
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+      - name: Verify bundled dependency licenses
+        run: scripts/check-third-party-licenses
+
+  build:
+    name: Package ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.ref }}
+      - name: Install Rust target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Build native release binary
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Verify native binary version
+        run: |
+          expected=$(scripts/check-version)
+          actual=$(target/${{ matrix.target }}/release/tmux-agent --version)
+          test "$actual" = "tmux-agent $expected"
+      - name: Package release archive
+        run: |
+          scripts/package-release \
+            "${{ matrix.target }}" \
+            "target/${{ matrix.target }}/release/tmux-agent" \
+            dist
+      - name: Upload packaged archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  draft:
+    name: Create attested draft
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.ref }}
+      - name: Download packaged archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum -- *.tar.gz >SHA256SUMS
+      - name: Attest release artifacts
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --draft \
+            --title "tmux-agent $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*.tar.gz dist/SHA256SUMS
+
+  smoke:
+    name: Smoke install ${{ matrix.target }}
+    needs: draft
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.ref }}
+      - name: Install runtime requirements on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lsof tmux
+      - name: Install runtime requirements on macOS
+        if: runner.os == 'macOS'
+        run: brew install tmux
+      - name: Download assets from the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(scripts/check-version)
+          mkdir -p "draft-assets/v$version"
+          gh release download "$GITHUB_REF_NAME" \
+            --dir "draft-assets/v$version" \
+            --pattern "tmux-agent-v${version}-${{ matrix.target }}.tar.gz" \
+            --pattern SHA256SUMS
+      - name: Install and verify without Rust
+        env:
+          TMUX_AGENT_DATA_DIR: ${{ runner.temp }}/tmux-agent-data/tmux-agent
+          TMUX_AGENT_STATE_DIR: ${{ runner.temp }}/tmux-agent-state/tmux-agent
+          XDG_CONFIG_HOME: ${{ runner.temp }}/tmux-agent-config
+          XDG_RUNTIME_DIR: ${{ runner.temp }}/tmux-agent-runtime
+          XDG_STATE_HOME: ${{ runner.temp }}/tmux-agent-xdg-state
+        run: |
+          release_root="file://$PWD/draft-assets"
+          env PATH=/usr/bin:/bin \
+            TMUX_AGENT_RELEASE_BASE_URL="$release_root" \
+            scripts/install --no-restart
+          expected=$(scripts/check-version)
+          actual=$(bin/tmux-agent --version)
+          test "$actual" = "tmux-agent $expected"
+          bin/tmux-agent daemon start
+          bin/tmux-agent daemon status
+          bin/tmux-agent doctor --json
+      - name: Exercise the TPM entrypoint without Rust
+        run: |
+          socket_name="tmux-agent-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          cleanup() {
+            tmux -L "$socket_name" kill-server 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          tmux -L "$socket_name" -f /dev/null new-session -d -s release-smoke
+          tmux -L "$socket_name" set-option -g @tmux-agent-binary "$PWD/bin/tmux-agent"
+          tmux -L "$socket_name" run-shell "$PWD/tmux-agent.tmux"
+          tmux -L "$socket_name" list-keys -T prefix |
+            awk '$4 == "A" && /scripts\\/launch-popup/ { found = 1 } END { exit !found }'
+          socket_path=$(tmux -L "$socket_name" display-message -p '#{socket_path}')
+          for _ in {1..50}; do
+            status=$(TMUX="$socket_path,0,0" bin/tmux-agent daemon status)
+            [[ $status == running:* ]] && break
+            sleep 0.1
+          done
+          [[ $status == running:* ]]
+          TMUX="$socket_path,0,0" bin/tmux-agent daemon stop

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
+test_root=$(mktemp -d "${TMPDIR:-/tmp}/tmux-agent-fresh-install.XXXXXX")
+context="$test_root/public"
+
+cleanup() {
+    find "$test_root" -depth -delete
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+command -v docker >/dev/null 2>&1 || {
+    printf '%s\n' 'fresh-install test requires Docker' >&2
+    exit 1
+}
+docker info >/dev/null 2>&1 || {
+    printf '%s\n' 'fresh-install test requires a running Docker daemon' >&2
+    exit 1
+}
+
+mkdir "$context"
+git -C "$root" ls-files -z \
+    | (cd "$root" && tar --null -T - -cf -) \
+    | tar -xf - -C "$context"
+"$context/scripts/check-public-tree" "$context"
+dockerfile="$context/tests/fresh-install/Dockerfile"
+
+if (($# > 0)); then
+    platforms=("$@")
+else
+    read -r -a platforms <<<"${TMUX_AGENT_E2E_PLATFORMS:-linux/arm64 linux/amd64}"
+fi
+read -r -a images \
+    <<<"${TMUX_AGENT_E2E_IMAGES:-ubuntu:24.04 debian:12-slim}"
+
+for platform in "${platforms[@]}"; do
+    case "$platform" in
+        linux/arm64 | linux/amd64)
+            ;;
+        *)
+            printf 'unsupported fresh-install platform: %s\n' "$platform" >&2
+            exit 2
+            ;;
+    esac
+    architecture=${platform#linux/}
+    for image in "${images[@]}"; do
+        image_tag=${image//[:\/]/-}
+        test_tag="tmux-agent-fresh-install:${image_tag}-${architecture}"
+        printf 'building fresh-install image for %s on %s\n' "$image" "$platform"
+        docker buildx build \
+            --platform "$platform" \
+            --build-arg "TEST_IMAGE=$image" \
+            --file "$dockerfile" \
+            --load \
+            --tag "$test_tag" \
+            "$context"
+        for scenario in standalone plugin; do
+            printf 'running %s for %s on %s\n' \
+                "$scenario" "$image" "$platform"
+            docker run --rm --platform "$platform" \
+                "$test_tag" "$scenario"
+        done
+    done
+done
+
+printf '%s\n' 'all fresh-install Docker tests passed'

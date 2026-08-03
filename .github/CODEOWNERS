@@ -1,0 +1,3 @@
+/.github/workflows/ @hypertectonic
+/scripts/bootstrap @hypertectonic
+/scripts/package-release @hypertectonic

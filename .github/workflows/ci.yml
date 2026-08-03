@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - develop
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Quality (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install system test tools on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lsof ripgrep shellcheck tmux
+      - name: Install system test tools on macOS
+        if: runner.os == 'macOS'
+        run: brew install ripgrep shellcheck shfmt tmux
+      - name: Install pinned shfmt on Linux
+        if: runner.os == 'Linux'
+        run: |
+          go install mvdan.cc/sh/v3/cmd/shfmt@v3.13.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Check release version
+        run: scripts/check-version
+      - name: Scan public tree
+        run: scripts/check-public-tree
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+      - name: Run Rust tests
+        run: cargo test --locked
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Check shell scripts
+        run: |
+          shellcheck tmux-agent.tmux bin/tmux-agent scripts/* tests/*.sh tests/run-shell-tests
+          shfmt -d -i 4 -ci tmux-agent.tmux bin/tmux-agent scripts/* tests/*.sh tests/run-shell-tests
+      - name: Check GitHub Actions workflows
+        if: runner.os == 'Linux'
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint"
+      - name: Run shell and tmux integration tests
+        run: tests/run-shell-tests
+
+  release-target:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Build release target
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Verify native binary version
+        run: |
+          expected=$(scripts/check-version)
+          actual=$(target/${{ matrix.target }}/release/tmux-agent --version)
+          test "$actual" = "tmux-agent $expected"
+
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Clone RustSec advisory database
+        run: git clone --depth 1 https://github.com/RustSec/advisory-db.git "$RUNNER_TEMP/advisory-db"
+      - name: Audit dependency vulnerabilities
+        run: cargo audit --no-fetch --db "$RUNNER_TEMP/advisory-db"
+      - name: Install cargo-license
+        run: cargo install cargo-license --version 0.7.0 --locked
+      - name: Print dependency license inventory
+        run: cargo license --avoid-dev-deps
+      - name: Install cargo-about
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+      - name: Verify bundled dependency licenses
+        run: scripts/check-third-party-licenses

@@ -1,0 +1,191 @@
+#!/bin/sh
+set -eu
+
+case "$#" in
+    0) root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd) ;;
+    1) root=$(CDPATH='' cd -- "$1" && pwd) ;;
+    *)
+        printf 'usage: %s [source-root]\n' "$0" >&2
+        exit 2
+        ;;
+esac
+failed=0
+
+fail() {
+    printf 'release-readiness check failed: %s\n' "$1" >&2
+    failed=1
+}
+
+require_file() {
+    relative=$1
+    [ -s "$root/$relative" ] || fail "missing or empty $relative"
+}
+
+require_executable() {
+    relative=$1
+    [ -x "$root/$relative" ] || fail "$relative is not executable"
+}
+
+package_value() {
+    field=$1
+    [ -r "$root/Cargo.toml" ] || return 0
+    awk -v field="$field" '
+        /^\[package\]$/ { package = 1; next }
+        /^\[/ { package = 0 }
+        package && index($0, field " = ") == 1 {
+            value = $0
+            sub("^[^=]+=[[:space:]]*", "", value)
+            if (value ~ /^".*"$/) {
+                sub("^\"", "", value)
+                sub("\"$", "", value)
+            }
+            print value
+            exit
+        }
+    ' "$root/Cargo.toml"
+}
+
+for required in \
+    LICENSE \
+    THIRD_PARTY_NOTICES.md \
+    THIRD_PARTY_LICENSES.html \
+    about.toml \
+    about.hbs \
+    README.md \
+    CHANGELOG.md \
+    CONTRIBUTING.md \
+    SECURITY.md \
+    VERSION \
+    Cargo.toml \
+    Cargo.lock \
+    docs/installation.md \
+    docs/remote-machines.md \
+    docs/troubleshooting.md \
+    docs/architecture.md \
+    docs/dependency-licenses.md \
+    docs/assets/ui-overview.svg \
+    .github/CODEOWNERS \
+    .github/dependabot.yml \
+    .github/ISSUE_TEMPLATE/bug.yml \
+    .github/ISSUE_TEMPLATE/feature.yml \
+    .github/pull_request_template.md \
+    .github/workflows/ci.yml \
+    .github/workflows/release.yml; do
+    require_file "$required"
+done
+
+for executable in \
+    tmux-agent.tmux \
+    bin/tmux-agent \
+    scripts/bootstrap \
+    scripts/install \
+    scripts/launch-popup \
+    scripts/lib.sh \
+    scripts/doctor \
+    scripts/uninstall \
+    scripts/check-version \
+    scripts/check-public-tree \
+    scripts/generate-third-party-licenses \
+    scripts/check-third-party-licenses \
+    scripts/check-release-readiness \
+    scripts/export-public-snapshot \
+    scripts/package-release \
+    tests/run-shell-tests; do
+    require_executable "$executable"
+done
+
+license=$(package_value license)
+repository=$(package_value repository)
+homepage=$(package_value homepage)
+readme=$(package_value readme)
+keywords=$(package_value keywords)
+categories=$(package_value categories)
+
+[ -n "$license" ] || fail 'Cargo package license is missing'
+[ -n "$repository" ] || fail 'Cargo package repository is missing'
+[ -n "$homepage" ] || fail 'Cargo package homepage is missing'
+[ "$readme" = "README.md" ] || fail 'Cargo package readme must be README.md'
+[ -n "$keywords" ] || fail 'Cargo package keywords are missing'
+[ -n "$categories" ] || fail 'Cargo package categories are missing'
+
+case "$repository" in
+    https://github.com/*/tmux-agent)
+        repository_owner=${repository#https://github.com/}
+        repository_owner=${repository_owner%/tmux-agent}
+        case "$repository_owner" in
+            '' | */* | *'<'* | *'>'*) fail 'Cargo repository has no concrete GitHub owner' ;;
+        esac
+        ;;
+    *) fail 'Cargo repository must be the public HTTPS GitHub repository' ;;
+esac
+case "$homepage" in
+    https://*) ;;
+    *) fail 'Cargo homepage must use HTTPS' ;;
+esac
+
+if rg -n '<github-owner>|@maintainers' \
+    "$root/Cargo.toml" "$root/README.md" "$root/docs" "$root/.github"; then
+    fail 'public owner placeholders remain'
+fi
+if ! rg -q '^## License$' "$root/README.md"; then
+    fail 'README has no License section'
+fi
+if [ -n "$license" ] && ! rg -Fq "$license" "$root/README.md"; then
+    fail 'README does not state the Cargo package license'
+fi
+if ! rg -Fq 'THIRD_PARTY_NOTICES.md' "$root/README.md"; then
+    fail 'README does not link third-party notices'
+fi
+if ! rg -Fq 'THIRD_PARTY_LICENSES.html' "$root/README.md"; then
+    fail 'README does not link the generated dependency license report'
+fi
+if ! rg -Fq 'docs/assets/ui-overview.svg' "$root/README.md"; then
+    fail 'README does not show the release interface'
+fi
+if ! rg -Fq '> **Early release:**' "$root/README.md"; then
+    fail 'README does not contain the early-release notice'
+fi
+if ! rg -q '^## Install with a coding agent$' "$root/README.md"; then
+    fail 'README has no coding-agent installation section'
+fi
+if ! rg -q '^/\.github/workflows/\s+@' "$root/.github/CODEOWNERS"; then
+    fail 'CODEOWNERS does not protect GitHub Actions workflows'
+fi
+if ! rg -Fq 'package-ecosystem: cargo' "$root/.github/dependabot.yml" ||
+    ! rg -Fq 'package-ecosystem: github-actions' "$root/.github/dependabot.yml"; then
+    fail 'Dependabot must cover Cargo and GitHub Actions'
+fi
+if ! rg -Fq 'tmux-agent doctor --json' "$root/.github/ISSUE_TEMPLATE/bug.yml" ||
+    ! rg -Fq 'Do not paste terminal transcripts' \
+        "$root/.github/ISSUE_TEMPLATE/bug.yml"; then
+    fail 'bug issue form does not request privacy-reviewed doctor output'
+fi
+if rg --pcre2 -n 'uses:\s+[^[:space:]#]+@(?![0-9a-f]{40}(?:\s|$))' \
+    "$root/.github/workflows"; then
+    fail 'GitHub Actions dependencies are not pinned to immutable commit SHAs'
+fi
+for workflow in ci.yml release.yml; do
+    if ! rg -Uq '^permissions:\n  contents: read$' \
+        "$root/.github/workflows/$workflow"; then
+        fail "$workflow does not default to read-only repository contents"
+    fi
+done
+if ! rg -Fq -- '--draft' "$root/.github/workflows/release.yml"; then
+    fail 'release workflow does not create a draft'
+fi
+if ! rg -Fq 'merge-base --is-ancestor' "$root/.github/workflows/release.yml"; then
+    fail 'release workflow does not require the tagged commit on main'
+fi
+if rg -n 'releases/(latest|download/latest)|/latest/' \
+    "$root/scripts/bootstrap" "$root/scripts/install" "$root/scripts/lib.sh" \
+    "$root/scripts/launch-popup" "$root/bin" "$root/tmux-agent.tmux"; then
+    fail 'plugin installation contains an unpinned latest-release URL'
+fi
+
+"$root/scripts/check-version" >/dev/null || failed=1
+"$root/scripts/check-public-tree" >/dev/null || failed=1
+
+if [ "$failed" -ne 0 ]; then
+    exit 1
+fi
+printf '%s\n' 'release readiness checks passed'

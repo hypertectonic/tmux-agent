@@ -1,0 +1,25 @@
+# The local identity is normally discovered automatically.
+# host_name = "workstation"
+# server_name = "default"
+# scan_interval_ms = 300
+#
+# Use tmux_args when this daemon should watch a named tmux server.
+# tmux_args = ["-L", "agents"]
+
+[[machine]]
+name = "remote-mac"
+host = "remote-mac.example.ts.net"
+ssh_user = "agent"
+binary = "/Users/agent/.local/bin/tmux-agent"
+
+[[machine]]
+name = "laptop"
+host = "laptop.example.ts.net"
+ssh_user = "agent"
+binary = "/home/agent/.local/bin/tmux-agent"
+
+# Raw commands remain available for transports that need custom SSH options.
+#
+# [[remote]]
+# name = "custom"
+# command = ["ssh", "-T", "custom", "/opt/bin/tmux-agent", "watch", "--jsonl", "--local-only"]

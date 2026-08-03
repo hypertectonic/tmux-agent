@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+TMUX_AGENT_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+export TMUX_AGENT_ROOT
+exec "$TMUX_AGENT_ROOT/scripts/bootstrap" "$@"

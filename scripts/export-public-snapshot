@@ -1,0 +1,36 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+    printf 'usage: %s <new-empty-destination>\n' "$0" >&2
+    exit 2
+fi
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+destination=$1
+if [ -e "$destination" ]; then
+    printf 'destination already exists: %s\n' "$destination" >&2
+    exit 1
+fi
+mkdir -p "$destination"
+git -C "$root" archive --format=tar HEAD | tar -xf - -C "$destination"
+
+denylist=${TMUX_AGENT_PUBLIC_TREE_DENYLIST:-}
+if [ -z "$denylist" ]; then
+    git_dir=$(git -C "$root" rev-parse --git-common-dir)
+    case "$git_dir" in
+        /*) ;;
+        *) git_dir="$root/$git_dir" ;;
+    esac
+    if [ -e "$git_dir/public-tree-denylist" ]; then
+        denylist="$git_dir/public-tree-denylist"
+    fi
+fi
+
+if [ -n "$denylist" ]; then
+    TMUX_AGENT_PUBLIC_TREE_DENYLIST="$denylist" \
+        "$destination/scripts/check-public-tree" "$destination"
+else
+    "$destination/scripts/check-public-tree" "$destination"
+fi
+printf 'exported reviewed tree to %s\n' "$destination"

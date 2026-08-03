@@ -1,0 +1,93 @@
+[
+  {
+    "name": "current approval prompt is blocked",
+    "basis": "synthetic interaction regression",
+    "title": "",
+    "screen": "Allow this command?\n1. Yes\n2. No",
+    "state": "blocked",
+    "source": "screen",
+    "signal": "approval_prompt",
+    "scope": "latest_visible_signal",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "current interrupt hint is active",
+    "basis": "existing Grok generic behavior contract",
+    "title": "",
+    "screen": "Ask anything\nThinking (3s)\nEsc to interrupt",
+    "state": "working",
+    "source": "screen",
+    "signal": "activity_marker",
+    "scope": "latest_visible_signal",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "approval prompt overrides activity title",
+    "basis": "existing Grok generic precedence contract",
+    "title": "⠸ task - grok",
+    "screen": "Allow this command?\n1. Yes\n2. No",
+    "state": "blocked",
+    "source": "screen",
+    "signal": "approval_prompt",
+    "scope": "latest_visible_signal",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "escape to cancel is active",
+    "basis": "existing Grok generic behavior contract",
+    "title": "\"task title\" - grok",
+    "screen": "Running query\nEsc to cancel",
+    "state": "working",
+    "source": "screen",
+    "signal": "activity_marker",
+    "scope": "latest_visible_signal",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "latest input prompt is ready",
+    "basis": "local owned-PTY observation",
+    "title": "",
+    "screen": "Working (3s)\nEsc to interrupt\nShift+Tab:mode",
+    "state": "idle",
+    "source": "screen",
+    "signal": "input_prompt",
+    "scope": "latest_visible_signal",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "Floax redraw without activity is inferred idle",
+    "basis": "detached Floax state-transition regression",
+    "title": "\"task title\" - grok",
+    "screen": "",
+    "state": "idle",
+    "source": "process",
+    "signal": "grok_foreground_without_activity",
+    "scope": "foreground_process",
+    "definitive": false,
+    "inferred": true,
+    "preserve_previous": false
+  },
+  {
+    "name": "activity title is working",
+    "basis": "existing terminal title behavior contract",
+    "title": "⠸ task - grok",
+    "screen": "",
+    "state": "working",
+    "source": "title",
+    "signal": "title_shows_activity",
+    "scope": "terminal_title",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  }
+]

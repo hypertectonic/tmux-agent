@@ -1,0 +1,229 @@
+#!/bin/sh
+set -eu
+
+TMUX_AGENT_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+export TMUX_AGENT_ROOT
+. "$TMUX_AGENT_ROOT/scripts/lib.sh"
+
+restart_daemon=1
+case "${1:-}" in
+    '')
+        ;;
+    --no-restart)
+        restart_daemon=0
+        ;;
+    *)
+        printf 'usage: %s [--no-restart]\n' "$0" >&2
+        exit 2
+        ;;
+esac
+
+data_dir=$(tmux_agent_data_dir)
+state_dir=$(tmux_agent_state_dir)
+versions_dir="$data_dir/versions"
+lock_dir="$data_dir/.install.lock"
+version=$(tmux_agent_version)
+system_name=${TMUX_AGENT_UNAME_S:-$(uname -s)}
+machine_name=${TMUX_AGENT_UNAME_M:-$(uname -m)}
+target=$(tmux_agent_target) || {
+    tmux_agent_write_status "UNSUPPORTED|$system_name/$machine_name"
+    exit 1
+}
+archive_name="tmux-agent-v${version}-${target}.tar.gz"
+destination_dir="$versions_dir/$version"
+destination_binary="$destination_dir/tmux-agent"
+old_current=$(readlink "$data_dir/current" 2>/dev/null || true)
+temporary_dir=
+staging_dir=
+lock_owned=0
+install_complete=0
+
+cleanup() {
+    exit_status=$?
+    if [ -n "$temporary_dir" ] && [ -d "$temporary_dir" ]; then
+        rm -rf -- "$temporary_dir"
+    fi
+    if [ -n "$staging_dir" ] && [ -d "$staging_dir" ]; then
+        case "$staging_dir" in
+            "$versions_dir"/.staging-*) rm -rf -- "$staging_dir" ;;
+        esac
+    fi
+    if [ "$lock_owned" -eq 1 ]; then
+        rm -f -- "$lock_dir/pid"
+        rmdir "$lock_dir" 2>/dev/null || true
+    fi
+    if [ "$exit_status" -ne 0 ] && [ "$install_complete" -eq 0 ]; then
+        current_status=$(tmux_agent_read_status 2>/dev/null || true)
+        case "$current_status" in
+            FAILED\|* | UNSUPPORTED\|*)
+                ;;
+            *)
+                tmux_agent_write_status \
+                    "FAILED|installation was interrupted; inspect $(tmux_agent_install_log)"
+                ;;
+        esac
+    fi
+    return "$exit_status"
+}
+trap cleanup EXIT HUP INT TERM
+
+mkdir -p "$versions_dir" "$state_dir"
+chmod 700 "$data_dir" "$versions_dir" "$state_dir"
+: >"$data_dir/.tmux-agent-managed"
+chmod 600 "$data_dir/.tmux-agent-managed"
+
+attempt=0
+while ! mkdir "$lock_dir" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    lock_pid=
+    if [ -r "$lock_dir/pid" ]; then
+        IFS= read -r lock_pid <"$lock_dir/pid" || true
+    fi
+    case "$lock_pid" in
+        '' | *[!0-9]*) lock_pid= ;;
+    esac
+    if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+        rm -f -- "$lock_dir/pid"
+        rmdir "$lock_dir" 2>/dev/null || true
+        continue
+    fi
+    if [ "$attempt" -ge 300 ]; then
+        tmux_agent_write_status "FAILED|another installation did not finish within 30 seconds"
+        printf '%s\n' 'tmux-agent: timed out waiting for the installation lock' >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+lock_owned=1
+printf '%s\n' "$$" >"$lock_dir/pid"
+chmod 600 "$lock_dir/pid"
+
+if tmux_agent_binary_matches "$destination_binary" "$version"; then
+    link_tmp="$data_dir/.current.$$"
+    ln -s "versions/$version/tmux-agent" "$link_tmp"
+    mv -f "$link_tmp" "$data_dir/current"
+    tmux_agent_write_status "READY|$version"
+else
+    tmux_agent_write_status "INSTALLING|$version"
+    release_base=$(tmux_agent_release_base_url) || {
+        tmux_agent_write_status "FAILED|release URL is not configured"
+        exit 1
+    }
+    temporary_dir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-agent-install.XXXXXX")
+    chmod 700 "$temporary_dir"
+    archive_path="$temporary_dir/$archive_name"
+    sums_path="$temporary_dir/SHA256SUMS"
+    release_url="${release_base}/v${version}"
+
+    printf 'tmux-agent: downloading %s\n' "$archive_name"
+    if ! tmux_agent_download "$release_url/$archive_name" "$archive_path"; then
+        tmux_agent_write_status "FAILED|could not download $archive_name"
+        exit 1
+    fi
+    if ! tmux_agent_download "$release_url/SHA256SUMS" "$sums_path"; then
+        tmux_agent_write_status "FAILED|could not download SHA256SUMS"
+        exit 1
+    fi
+    expected_checksum=$(awk -v name="$archive_name" '$2 == name || $2 == "*" name { print $1; exit }' "$sums_path")
+    if [ "${#expected_checksum}" -ne 64 ] ||
+        printf '%s\n' "$expected_checksum" | grep -q '[^0-9a-fA-F]'; then
+        tmux_agent_write_status "FAILED|SHA256SUMS has no valid entry for $archive_name"
+        exit 1
+    fi
+    actual_checksum=$(tmux_agent_sha256 "$archive_path") || {
+        tmux_agent_write_status "FAILED|no checksum tool is available"
+        exit 1
+    }
+    if [ "$actual_checksum" != "$expected_checksum" ]; then
+        tmux_agent_write_status "FAILED|checksum mismatch for $archive_name"
+        printf '%s\n' "tmux-agent: checksum mismatch for $archive_name" >&2
+        exit 1
+    fi
+
+    archive_entries=$(tar -tzf "$archive_path") || {
+        tmux_agent_write_status "FAILED|release archive is unreadable"
+        exit 1
+    }
+    archive_details=$(tar -tvzf "$archive_path") || {
+        tmux_agent_write_status "FAILED|release archive metadata is unreadable"
+        exit 1
+    }
+    if printf '%s\n' "$archive_details" |
+        awk '$1 !~ /^-/ { invalid = 1 } END { exit invalid ? 0 : 1 }'; then
+        tmux_agent_write_status "FAILED|release archive contains a non-regular entry"
+        exit 1
+    fi
+    invalid_entry=0
+    for archive_entry in $archive_entries; do
+        normalized_entry=${archive_entry#./}
+        case "$normalized_entry" in
+            tmux-agent | README.md | LICENSE | THIRD_PARTY_NOTICES.md | \
+                THIRD_PARTY_LICENSES.html)
+                ;;
+            *)
+                invalid_entry=1
+                ;;
+        esac
+    done
+    if [ "$invalid_entry" -ne 0 ]; then
+        tmux_agent_write_status "FAILED|release archive contains an unexpected path"
+        exit 1
+    fi
+    for required_entry in tmux-agent README.md LICENSE THIRD_PARTY_NOTICES.md \
+        THIRD_PARTY_LICENSES.html; do
+        if ! printf '%s\n' "$archive_entries" | grep -qxE "(\\./)?${required_entry}"; then
+            tmux_agent_write_status "FAILED|release archive is missing $required_entry"
+            exit 1
+        fi
+    done
+
+    staging_dir="$versions_dir/.staging-${version}-$$"
+    mkdir "$staging_dir"
+    chmod 700 "$staging_dir"
+    if ! tar -xzf "$archive_path" -C "$staging_dir"; then
+        tmux_agent_write_status "FAILED|release archive extraction failed"
+        exit 1
+    fi
+    for required_entry in tmux-agent README.md LICENSE THIRD_PARTY_NOTICES.md \
+        THIRD_PARTY_LICENSES.html; do
+        if [ -L "$staging_dir/$required_entry" ] ||
+            [ ! -f "$staging_dir/$required_entry" ]; then
+            tmux_agent_write_status \
+                "FAILED|release archive has no regular $required_entry file"
+            exit 1
+        fi
+    done
+    chmod 755 "$staging_dir/tmux-agent"
+    if ! tmux_agent_binary_matches "$staging_dir/tmux-agent" "$version"; then
+        tmux_agent_write_status "FAILED|downloaded binary reports the wrong version"
+        exit 1
+    fi
+    chmod 644 "$staging_dir/README.md" "$staging_dir/LICENSE" \
+        "$staging_dir/THIRD_PARTY_NOTICES.md" \
+        "$staging_dir/THIRD_PARTY_LICENSES.html"
+
+    if [ -e "$destination_dir" ]; then
+        if ! tmux_agent_binary_matches "$destination_binary" "$version"; then
+            tmux_agent_write_status "FAILED|existing version directory is invalid: $destination_dir"
+            exit 1
+        fi
+        rm -rf -- "$staging_dir"
+        staging_dir=
+    else
+        mv "$staging_dir" "$destination_dir"
+        staging_dir=
+    fi
+    link_tmp="$data_dir/.current.$$"
+    ln -s "versions/$version/tmux-agent" "$link_tmp"
+    mv -f "$link_tmp" "$data_dir/current"
+    tmux_agent_write_status "READY|$version"
+fi
+
+new_current=$(readlink "$data_dir/current" 2>/dev/null || true)
+if [ "$restart_daemon" -eq 1 ] && [ "$old_current" != "$new_current" ]; then
+    "$TMUX_AGENT_ROOT/bin/tmux-agent" daemon restart >/dev/null 2>&1 || {
+        "$TMUX_AGENT_ROOT/bin/tmux-agent" daemon start >/dev/null 2>&1 || true
+    }
+fi
+install_complete=1
+printf 'tmux-agent: ready at %s\n' "$data_dir/current"
