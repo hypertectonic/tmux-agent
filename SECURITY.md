@@ -6,15 +6,18 @@ reports are treated as high priority.
 
 ## Supported versions
 
-There is no public release yet. Until the first release is published, security
-fixes are made on the active development branch.
+| Version | Supported |
+| --- | --- |
+| 0.2.x | Yes |
+
+Security fixes are prepared on the active development branch and released from
+the stable release line.
 
 ## Reporting a vulnerability
 
-Do not open a public issue for a suspected vulnerability. After the GitHub
-repository is created, use its private vulnerability reporting feature. If
-private reporting is unavailable, contact the maintainer through a private
-channel listed on the repository profile.
+Do not open a public issue for a suspected vulnerability. Use GitHub private
+vulnerability reporting when it is available. Otherwise, contact the
+maintainer through a private channel listed on the repository profile.
 
 Include only the minimum evidence needed to reproduce the issue. Do not send:
 
