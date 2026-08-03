@@ -53,6 +53,7 @@ for required in \
     about.hbs \
     README.md \
     CHANGELOG.md \
+    RELEASE_NOTES.md \
     CONTRIBUTING.md \
     SECURITY.md \
     VERSION \
@@ -172,6 +173,17 @@ for workflow in ci.yml release.yml; do
 done
 if ! rg -Fq -- '--draft' "$root/.github/workflows/release.yml"; then
     fail 'release workflow does not create a draft'
+fi
+if rg -Fq -- '--generate-notes' "$root/.github/workflows/release.yml"; then
+    fail 'release workflow uses unreviewed generated notes'
+fi
+if ! rg -Fq -- '--notes-file RELEASE_NOTES.md' \
+    "$root/.github/workflows/release.yml"; then
+    fail 'release workflow does not use curated release notes'
+fi
+version=$(tr -d '\n' <"$root/VERSION")
+if ! rg -Fq "tmux-agent v$version" "$root/RELEASE_NOTES.md"; then
+    fail 'curated release notes do not match VERSION'
 fi
 if ! rg -Fq 'merge-base --is-ancestor' "$root/.github/workflows/release.yml"; then
     fail 'release workflow does not require the tagged commit on main'
