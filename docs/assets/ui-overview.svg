@@ -45,7 +45,7 @@
   <text x="205" y="445" fill="#9ca3af" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18">build-host › integration › 1.0</text>
 
   <line x1="20" y1="476" x2="1080" y2="476" stroke="#374151"/>
-  <text x="28" y="507" fill="#4ade80" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17">● local v0.2.0</text>
-  <text x="210" y="507" fill="#4ade80" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17">● build-host v0.2.0</text>
+  <text x="28" y="507" fill="#4ade80" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17">● local v0.3.0</text>
+  <text x="210" y="507" fill="#4ade80" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17">● build-host v0.3.0</text>
   <text x="28" y="540" fill="#6b7280" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16">j/k move   enter focus/view   r refresh   q close</text>
 </svg>
