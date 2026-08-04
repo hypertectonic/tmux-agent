@@ -6,6 +6,12 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+### Added
+
+- Pi harness discovery in tmux and ordinary terminals, typed activity and
+  input-state detection, a provider badge, and the `tmux-agent pi` owned-PTY
+  shortcut.
+
 ## [0.2.0] - 2026-08-03
 
 ### Added
