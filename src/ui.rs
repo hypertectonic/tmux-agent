@@ -830,6 +830,7 @@ fn provider_palette(agent: &str) -> (&str, Color, Color) {
             Color::Rgb(50, 35, 75),
         ),
         "grok" => ("GROK", Color::Rgb(170, 195, 240), Color::Rgb(35, 45, 65)),
+        "pi" => ("PI", Color::Rgb(205, 235, 125), Color::Rgb(48, 62, 28)),
         _ => (agent, Color::Gray, Color::Rgb(45, 45, 45)),
     }
 }
@@ -1247,12 +1248,15 @@ mod tests {
         let (codex, codex_style) = provider_badge("Codex");
         let (claude, claude_style) = provider_badge("Claude");
         let (opencode, opencode_style) = provider_badge("OpenCode");
+        let (pi, pi_style) = provider_badge("Pi");
 
         assert_eq!(codex, "CODEX   ");
         assert_eq!(claude, "CLAUDE  ");
         assert_eq!(opencode, "OPENCODE");
+        assert_eq!(pi, "PI      ");
         assert_ne!(codex_style.bg, claude_style.bg);
         assert_ne!(claude_style.bg, opencode_style.bg);
+        assert_ne!(opencode_style.bg, pi_style.bg);
     }
 
     #[test]

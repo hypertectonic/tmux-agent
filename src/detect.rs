@@ -178,12 +178,13 @@ fn agent_for_command(command: &str) -> Option<String> {
 
 fn agent_for_program(program: &str) -> Option<&'static str> {
     let name = program_name(program);
-    agent_for_name(&name)
+    agent_for_name(&name).or_else(|| is_pi_package_entrypoint(program).then_some("Pi"))
 }
 
 fn agent_for_os_program(program: &OsStr) -> Option<&'static str> {
     let name = program_name_os(program);
     agent_for_name(&name)
+        .or_else(|| is_pi_package_entrypoint(&program.to_string_lossy()).then_some("Pi"))
 }
 
 fn agent_for_name(name: &str) -> Option<&'static str> {
@@ -195,9 +196,20 @@ fn agent_for_name(name: &str) -> Option<&'static str> {
         Some("OpenCode")
     } else if name == "grok" || name.starts_with("grok-") {
         Some("Grok")
+    } else if name == "pi" {
+        Some("Pi")
     } else {
         None
     }
+}
+
+fn is_pi_package_entrypoint(program: &str) -> bool {
+    let normalized = program.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/@earendil-works/pi-coding-agent/")
+        && matches!(
+            normalized.rsplit('/').next(),
+            Some("cli.js" | "cli.mjs" | "cli.cjs")
+        )
 }
 
 fn program_name(program: &str) -> String {
@@ -421,6 +433,30 @@ mod tests {
     }
 
     #[test]
+    fn pi_executable_is_detected() {
+        let result = detect("/opt/homebrew/bin/pi", "π - work", "").unwrap();
+        assert_eq!(result.agent, "Pi");
+        assert_eq!(result.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn pi_npm_entrypoint_is_detected() {
+        let result = detect(
+            "node /opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+            "π - work",
+            "⠋ Working...",
+        )
+        .unwrap();
+        assert_eq!(result.agent, "Pi");
+        assert_eq!(result.state, AgentState::Working);
+    }
+
+    #[test]
+    fn generic_node_cli_is_not_mistaken_for_pi() {
+        assert!(detect("node /opt/tools/cli.js", "π - work", "⠋ Working...").is_none());
+    }
+
+    #[test]
     fn runtime_agent_entrypoint_is_detected() {
         let result = detect(
             "/opt/homebrew/bin/node /opt/tools/codex.js",
@@ -447,6 +483,15 @@ mod tests {
     fn argv_detection_preserves_executable_paths_with_spaces() {
         let command = [OsString::from("/tmp/my agents/codex")];
         assert_eq!(agent_for_argv(&command).as_deref(), Some("Codex"));
+    }
+
+    #[test]
+    fn argv_detection_recognizes_pi_npm_entrypoint() {
+        let command = [
+            OsString::from("node"),
+            OsString::from("/opt/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
+        ];
+        assert_eq!(agent_for_argv(&command).as_deref(), Some("Pi"));
     }
 
     #[test]

@@ -81,7 +81,8 @@ enum Command {
   tmux-agent run -- codex resume
   tmux-agent run -- codex resume <session-id>
   tmux-agent run -- claude
-  tmux-agent run -- opencode")]
+  tmux-agent run -- opencode
+  tmux-agent run -- pi")]
     Run {
         /// Agent command to proxy, for example: codex resume [session-id].
         #[arg(required = true, trailing_var_arg = true)]
@@ -105,6 +106,13 @@ enum Command {
     #[command(disable_help_flag = true)]
     Opencode {
         /// Arguments forwarded directly to OpenCode.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<OsString>,
+    },
+    /// Run Pi through the owned PTY without replacing the pi command.
+    #[command(disable_help_flag = true)]
+    Pi {
+        /// Arguments forwarded directly to Pi.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<OsString>,
     },
@@ -264,6 +272,7 @@ async fn main() -> Result<()> {
         Command::Opencode { arguments } => {
             run_owned_pty(provider_command("opencode", arguments), &paths)
         }
+        Command::Pi { arguments } => run_owned_pty(provider_command("pi", arguments), &paths),
         Command::Paths => {
             println!("config {}", config_path.display());
             println!("socket {}", paths.socket.display());
@@ -366,6 +375,7 @@ mod tests {
         assert!(root_help.contains("codex"));
         assert!(root_help.contains("claude"));
         assert!(root_help.contains("opencode"));
+        assert!(root_help.contains("pi"));
 
         let command = Cli::command();
         let run = command
@@ -376,6 +386,7 @@ mod tests {
         assert!(help.contains("tmux-agent run -- codex resume <session-id>"));
         assert!(help.contains("tmux-agent run -- claude"));
         assert!(help.contains("tmux-agent run -- opencode"));
+        assert!(help.contains("tmux-agent run -- pi"));
     }
 
     #[test]
@@ -418,6 +429,15 @@ mod tests {
         assert_eq!(
             provider_command("opencode", arguments),
             [OsString::from("opencode")]
+        );
+
+        let pi = Cli::try_parse_from(["tmux-agent", "pi", "--help"]).unwrap();
+        let Command::Pi { arguments } = pi.command else {
+            panic!("expected pi shortcut");
+        };
+        assert_eq!(
+            provider_command("pi", arguments),
+            [OsString::from("pi"), OsString::from("--help")]
         );
 
         let codex = Cli::try_parse_from(["tmux-agent", "codex", "--help"]).unwrap();

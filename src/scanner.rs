@@ -1366,6 +1366,7 @@ fn derived_subagent_name(processes: &str, agent: &str) -> Option<String> {
         "Claude" => &["agent", "print"],
         "OpenCode" => &["run", "agent"],
         "Grok" => &[],
+        "Pi" => &[],
         _ => &[],
     };
     processes.lines().find_map(|process| {

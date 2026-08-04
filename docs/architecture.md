@@ -17,10 +17,10 @@ The scanner combines tmux pane metadata, foreground process groups, ordinary
 TTY process groups, and owned PTY records. Captured terminal surfaces are used
 only on the machine that owns them.
 
-Codex, Claude, OpenCode, and Grok each have a typed detector backed by minimal
-synthetic fixtures. Detectors emit semantic state and derived evidence details,
-not the source terminal content. State stabilization prevents one quiet frame
-from immediately erasing stronger working or blocked evidence.
+Codex, Claude, OpenCode, Grok, and Pi each have a typed detector backed by
+minimal synthetic fixtures. Detectors emit semantic state and derived evidence
+details, not the source terminal content. State stabilization prevents one
+quiet frame from immediately erasing stronger working or blocked evidence.
 
 The owned PTY runner transparently forwards input, output, resize events,
 signals, job control, and child exit status. Its mode `0600` heartbeat record
