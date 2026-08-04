@@ -69,3 +69,11 @@ fn opencode_visible_behavior_contract() {
         super::opencode::detect,
     );
 }
+
+#[test]
+fn pi_visible_behavior_contract() {
+    verify(
+        include_str!("../../../tests/fixtures/detection/pi.json"),
+        super::pi::detect,
+    );
+}

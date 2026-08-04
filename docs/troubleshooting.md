@@ -28,7 +28,7 @@ executable.
 
 ## A provider session is missing
 
-- Confirm the provider is Codex, Claude, OpenCode, or Grok.
+- Confirm the provider is Codex, Claude, OpenCode, Grok, or Pi.
 - Run `tmux-agent scan --json` on the machine that owns the session.
 - Confirm the agent process is in the foreground process group.
 - Inside tmux, make the pane visible once so the detector can inspect its
@@ -39,8 +39,8 @@ executable.
 
 Process-only discovery proves that a supported provider exists but cannot
 always prove its current activity. Run the provider inside tmux or through
-`tmux-agent codex`, `tmux-agent claude`, `tmux-agent opencode`, or the generic
-`tmux-agent run -- <command>` wrapper.
+`tmux-agent codex`, `tmux-agent claude`, `tmux-agent opencode`,
+`tmux-agent pi`, or the generic `tmux-agent run -- <command>` wrapper.
 
 ## The daemon uses an old version
 

@@ -1,0 +1,93 @@
+[
+  {
+    "name": "default working loader is active",
+    "basis": "official Pi terminal recording and source",
+    "title": "π - project",
+    "screen": "User request\n⠋ Working... (esc to interrupt)",
+    "state": "working",
+    "source": "screen",
+    "signal": "status_indicator",
+    "scope": "recent_lines",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "retry loader is active",
+    "basis": "official Pi status indicator source",
+    "title": "π - project",
+    "screen": "⠹ Retrying (2/3) in 4s... (esc to cancel)",
+    "state": "working",
+    "source": "screen",
+    "signal": "status_indicator",
+    "scope": "recent_lines",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "compaction loader is active",
+    "basis": "official Pi status indicator source",
+    "title": "π - project",
+    "screen": "⠸ Context overflow detected, Auto-compacting... (esc to cancel)",
+    "state": "working",
+    "source": "screen",
+    "signal": "status_indicator",
+    "scope": "recent_lines",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "extension permission selector needs input",
+    "basis": "official Pi permission-gate extension source",
+    "title": "π - project",
+    "screen": "⚠️ Dangerous command:\n\n  rm -rf build\n\nAllow?\n\n→ Yes\n  No\n\n↑↓ navigate  Enter select  Esc cancel",
+    "state": "blocked",
+    "source": "screen",
+    "signal": "permission_selector",
+    "scope": "current_selector",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "project trust prompt needs input",
+    "basis": "official Pi project trust selector source",
+    "title": "π - project",
+    "screen": "Project trust\n/project\nSaved decision: none\nCurrent session: untrusted\nTrust this project\nDo not trust\n↑↓ navigate  Enter save  Esc cancel",
+    "state": "blocked",
+    "source": "screen",
+    "signal": "project_trust_prompt",
+    "scope": "current_selector",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "ordinary selector preserves state",
+    "basis": "official Pi extension selector source",
+    "title": "π - project",
+    "screen": "⠋ Working...\nSelect model\nModel A\nModel B\n↑↓ navigate  Enter select  Esc cancel",
+    "state": "unknown",
+    "source": "screen",
+    "signal": "interactive_selector",
+    "scope": "current_selector",
+    "definitive": false,
+    "inferred": false,
+    "preserve_previous": true
+  },
+  {
+    "name": "static title and quiet editor are inferred idle",
+    "basis": "official Pi static terminal title and idle status source",
+    "title": "π - project",
+    "screen": "",
+    "state": "idle",
+    "source": "process",
+    "signal": "pi_foreground_without_activity",
+    "scope": "foreground_process",
+    "definitive": false,
+    "inferred": true,
+    "preserve_previous": false
+  }
+]

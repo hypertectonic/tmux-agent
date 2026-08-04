@@ -6,14 +6,14 @@ ordinary terminals, and explicitly configured SSH machines.
 ![tmux-agent showing local and remote agents, goals, and a child session](docs/assets/ui-overview.svg)
 
 It shows which sessions are working, blocked, idle, or done and lets you jump
-back to the exact tmux pane. Codex, Claude, OpenCode, and Grok have
+back to the exact tmux pane. Codex, Claude, OpenCode, Grok, and Pi have
 project-owned typed detectors. Codex goal progress and nested subagents are
 shown without forwarding the goal objective or rollout content in federation
 snapshots.
 
 > **Early release:** Real-world testing has focused primarily on Codex in local
-> and SSH-based tmux workflows. Claude, OpenCode, and Grok are supported but
-> have received less testing.
+> and SSH-based tmux workflows. Claude, OpenCode, Grok, and Pi are supported
+> but have received less testing.
 
 ## Install with TPM
 
@@ -53,7 +53,7 @@ Linux release archives require glibc 2.35 or newer. Windows is not supported.
 
 ## What it shows
 
-- Codex, Claude, OpenCode, and Grok sessions in tmux and ordinary terminals.
+- Codex, Claude, OpenCode, Grok, and Pi sessions in tmux and ordinary terminals.
 - `working`, `needs input`, `idle`, `done`, and evidence-limited `unknown`
   states.
 - Provider badges, working animation, task titles, pane labels, and host-first
@@ -101,6 +101,7 @@ codex
 claude
 opencode
 grok
+pi
 ```
 
 For screen-based state detection in an ordinary local or SSH terminal, use an
@@ -111,6 +112,7 @@ tmux-agent codex [args...]
 tmux-agent claude [args...]
 tmux-agent opencode [args...]
 tmux-agent run -- grok [args...]
+tmux-agent pi [args...]
 ```
 
 The wrapper forwards terminal input, output, resize events, signals, job
@@ -193,6 +195,7 @@ tmux-agent acknowledge <id-or-pane>
 tmux-agent codex [args...]
 tmux-agent claude [args...]
 tmux-agent opencode [args...]
+tmux-agent pi [args...]
 tmux-agent run -- <command> [args...]
 tmux-agent daemon start|status|restart|stop|run
 tmux-agent doctor [--json]

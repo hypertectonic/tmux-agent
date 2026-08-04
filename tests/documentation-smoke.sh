@@ -31,7 +31,7 @@ done
 cargo build --locked
 binary="$root/target/debug/tmux-agent"
 help=$("$binary" --help)
-for command in daemon list watch ui focus explain acknowledge scan run codex claude opencode paths doctor; do
+for command in daemon list watch ui focus explain acknowledge scan run codex claude opencode pi paths doctor; do
     [[ $help == *"$command"* ]] || {
         printf 'root help does not expose documented command: %s\n' "$command" >&2
         exit 1
