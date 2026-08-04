@@ -51,7 +51,7 @@ permissions:
   contents: read
 steps:
   - run: git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
-  - run: gh release create "$TAG" --draft
+  - run: gh release create "$TAG" --draft --notes-file RELEASE_NOTES.md
 EOF
 cat >"$fixture/.github/workflows/ci.yml" <<'EOF'
 permissions:
@@ -86,6 +86,7 @@ Follow the deterministic installation procedure.
 
 Licensed under MIT.
 EOF
+printf '%s\n' 'tmux-agent vfixture' >"$fixture/RELEASE_NOTES.md"
 
 cat >"$test_root/pass" <<'EOF'
 #!/bin/sh

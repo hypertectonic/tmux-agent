@@ -134,7 +134,7 @@ jobs:
             --verify-tag \
             --draft \
             --title "tmux-agent $GITHUB_REF_NAME" \
-            --generate-notes \
+            --notes-file RELEASE_NOTES.md \
             dist/*.tar.gz dist/SHA256SUMS
 
   smoke:

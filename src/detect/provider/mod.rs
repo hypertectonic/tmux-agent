@@ -4,6 +4,7 @@ mod codex;
 mod contract;
 mod grok;
 mod opencode;
+mod pi;
 mod screen;
 
 use crate::model::{AgentState, DetectionDetails, EvidenceSource};
@@ -90,6 +91,7 @@ pub(super) fn detect(agent: &str, title: &str, screen: &str) -> Option<ProviderD
         "Claude" => Some(claude::detect(title, screen)),
         "Grok" => Some(grok::detect(title, screen)),
         "OpenCode" => Some(opencode::detect(title, screen)),
+        "Pi" => Some(pi::detect(title, screen)),
         _ => None,
     }
 }

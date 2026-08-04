@@ -6,6 +6,19 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+## [0.3.0] - 2026-08-04
+
+### Added
+
+- Pi harness discovery in tmux and ordinary terminals, typed activity and
+  input-state detection, a provider badge, and the `tmux-agent pi` owned-PTY
+  shortcut.
+
+### Fixed
+
+- Restore the UI footer key hints three seconds after transient action feedback,
+  while keeping daemon connection errors visible until recovery.
+
 ## [0.2.0] - 2026-08-03
 
 ### Added
