@@ -6,6 +6,11 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+### Fixed
+
+- Restore the UI footer key hints three seconds after transient action feedback,
+  while keeping daemon connection errors visible until recovery.
+
 ### Added
 
 - Pi harness discovery in tmux and ordinary terminals, typed activity and

@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_FRAME_TIME: Duration = Duration::from_millis(120);
+const ACTION_MESSAGE_DURATION: Duration = Duration::from_secs(3);
 const PROVIDER_WIDTH: usize = 8;
 
 pub async fn run(
@@ -101,6 +102,49 @@ impl RedrawTracker {
     }
 }
 
+#[derive(Debug, Default)]
+enum UiMessage {
+    #[default]
+    None,
+    Transient {
+        text: String,
+        expires_at: Instant,
+    },
+    DaemonError(String),
+}
+
+impl UiMessage {
+    fn set_transient(&mut self, text: impl Into<String>, now: Instant) {
+        *self = Self::Transient {
+            text: text.into(),
+            expires_at: now + ACTION_MESSAGE_DURATION,
+        };
+    }
+
+    fn set_daemon_error(&mut self, text: impl Into<String>) {
+        *self = Self::DaemonError(text.into());
+    }
+
+    fn clear_daemon_error(&mut self) {
+        if matches!(self, Self::DaemonError(_)) {
+            *self = Self::None;
+        }
+    }
+
+    fn expire(&mut self, now: Instant) {
+        if matches!(self, Self::Transient { expires_at, .. } if now >= *expires_at) {
+            *self = Self::None;
+        }
+    }
+
+    fn text(&self) -> &str {
+        match self {
+            Self::None => "",
+            Self::Transient { text, .. } | Self::DaemonError(text) => text,
+        }
+    }
+}
+
 async fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
     paths: &RuntimePaths,
@@ -118,12 +162,13 @@ async fn run_loop(
     };
     let mut snapshot = ipc::snapshot(&paths.socket, false).await?;
     let mut selected = 0usize;
-    let mut message = String::new();
+    let mut message = UiMessage::default();
     let mut last_refresh = Instant::now();
     let animation_started = Instant::now();
     let mut redraw = RedrawTracker::default();
 
     loop {
+        message.expire(Instant::now());
         if selected >= snapshot.agents.len() && !snapshot.agents.is_empty() {
             selected = snapshot.agents.len() - 1;
         }
@@ -132,7 +177,7 @@ async fn run_loop(
         if redraw.needs_full_redraw(&topology) {
             terminal.clear().context("clear terminal for full redraw")?;
         }
-        terminal.draw(|frame| render(frame, &snapshot, selected, &message, spinner_frame))?;
+        terminal.draw(|frame| render(frame, &snapshot, selected, message.text(), spinner_frame))?;
         redraw.mark_rendered(topology);
         if event::poll(Duration::from_millis(100)).context("poll terminal input")? {
             match event::read().context("read terminal input")? {
@@ -169,7 +214,7 @@ async fn run_loop(
                     KeyCode::Char('r') => {
                         snapshot = ipc::snapshot(&paths.socket, false).await?;
                         last_refresh = Instant::now();
-                        message = "refreshed".to_string();
+                        message.set_transient("refreshed", Instant::now());
                         redraw.force();
                     }
                     _ => {}
@@ -216,15 +261,17 @@ async fn run_loop(
     }
 }
 
-fn apply_daemon_refresh(snapshot: &mut Snapshot, message: &mut String, result: Result<Snapshot>) {
+fn apply_daemon_refresh(
+    snapshot: &mut Snapshot,
+    message: &mut UiMessage,
+    result: Result<Snapshot>,
+) {
     match result {
         Ok(next) => {
             *snapshot = next;
-            if message.starts_with("daemon: ") {
-                message.clear();
-            }
+            message.clear_daemon_error();
         }
-        Err(error) => *message = format!("daemon: {error:#}"),
+        Err(error) => message.set_daemon_error(format!("daemon: {error:#}")),
     }
 }
 
@@ -247,7 +294,7 @@ async fn activate_record(
     context: &ActivationContext<'_>,
     snapshot: &mut Snapshot,
     selected: usize,
-    message: &mut String,
+    message: &mut UiMessage,
 ) -> Result<Activation> {
     let Some(record) = snapshot.agents.get(selected).cloned() else {
         return Ok(Activation::Continue);
@@ -259,8 +306,8 @@ async fn activate_record(
             return Ok(Activation::RunInCurrentTerminal(command));
         }
         match context.tmux.display_popup(&shell_join(&command)) {
-            Ok(()) => *message = "opened read-only subagent view".to_string(),
-            Err(error) => *message = format!("{error:#}"),
+            Ok(()) => message.set_transient("opened read-only subagent view", Instant::now()),
+            Err(error) => message.set_transient(format!("{error:#}"), Instant::now()),
         }
         return Ok(Activation::Continue);
     }
@@ -274,7 +321,10 @@ async fn activate_record(
                 if context.exit_after_focus {
                     return Ok(Activation::Close);
                 }
-                *message = format!("focused {}", focus_record.location());
+                message.set_transient(
+                    format!("focused {}", focus_record.location()),
+                    Instant::now(),
+                );
                 Ok(Activation::Continue)
             }
             Err(focus_error)
@@ -284,21 +334,27 @@ async fn activate_record(
                     && is_focus_target_missing(&focus_error) =>
             {
                 acknowledge_record(context.paths, snapshot, &record.id).await?;
-                *message = format!(
-                    "acknowledged {}; focus unavailable: {focus_error:#}",
-                    record.location()
+                message.set_transient(
+                    format!(
+                        "acknowledged {}; focus unavailable: {focus_error:#}",
+                        record.location()
+                    ),
+                    Instant::now(),
                 );
                 Ok(Activation::Continue)
             }
             Err(error) => {
-                *message = format!("{error:#}");
+                message.set_transient(format!("{error:#}"), Instant::now());
                 Ok(Activation::Continue)
             }
         };
     }
     match acknowledge_record(context.paths, snapshot, &record.id).await {
-        Ok(()) => *message = format!("acknowledged {}", record.location()),
-        Err(error) => *message = format!("{error:#}"),
+        Ok(()) => message.set_transient(
+            format!("acknowledged {}", record.location()),
+            Instant::now(),
+        ),
+        Err(error) => message.set_transient(format!("{error:#}"), Instant::now()),
     }
     Ok(Activation::Continue)
 }
@@ -986,7 +1042,8 @@ mod tests {
             revision: 1,
             ..Snapshot::default()
         };
-        let mut message = "daemon: connect to daemon socket".to_string();
+        let mut message = UiMessage::default();
+        message.set_daemon_error("daemon: connect to daemon socket");
 
         apply_daemon_refresh(
             &mut snapshot,
@@ -998,9 +1055,9 @@ mod tests {
         );
 
         assert_eq!(snapshot.revision, 2);
-        assert!(message.is_empty());
+        assert!(message.text().is_empty());
 
-        message = "focused project-one:1.0".into();
+        message.set_transient("focused project-one:1.0", Instant::now());
         apply_daemon_refresh(
             &mut snapshot,
             &mut message,
@@ -1009,7 +1066,7 @@ mod tests {
                 ..Snapshot::default()
             }),
         );
-        assert_eq!(message, "focused project-one:1.0");
+        assert_eq!(message.text(), "focused project-one:1.0");
 
         apply_daemon_refresh(
             &mut snapshot,
@@ -1017,7 +1074,70 @@ mod tests {
             Err(anyhow::anyhow!("socket unavailable")),
         );
         assert_eq!(snapshot.revision, 3);
-        assert_eq!(message, "daemon: socket unavailable");
+        assert_eq!(message.text(), "daemon: socket unavailable");
+    }
+
+    #[test]
+    fn transient_messages_expire_after_three_seconds() {
+        let started = Instant::now();
+        let mut message = UiMessage::default();
+        message.set_transient("focused project-one:1.0", started);
+
+        message.expire(started + ACTION_MESSAGE_DURATION - Duration::from_millis(1));
+        assert_eq!(message.text(), "focused project-one:1.0");
+
+        message.expire(started + ACTION_MESSAGE_DURATION);
+        assert!(message.text().is_empty());
+    }
+
+    #[test]
+    fn newer_transient_message_restarts_the_three_second_window() {
+        let started = Instant::now();
+        let mut message = UiMessage::default();
+        message.set_transient("focused project-one:1.0", started);
+        message.set_transient("refreshed", started + Duration::from_secs(2));
+
+        message.expire(started + ACTION_MESSAGE_DURATION);
+        assert_eq!(message.text(), "refreshed");
+
+        message.expire(started + Duration::from_secs(5));
+        assert!(message.text().is_empty());
+    }
+
+    #[test]
+    fn daemon_errors_do_not_expire_on_the_action_timer() {
+        let started = Instant::now();
+        let mut message = UiMessage::default();
+        message.set_daemon_error("daemon: socket unavailable");
+
+        message.expire(started + ACTION_MESSAGE_DURATION);
+
+        assert_eq!(message.text(), "daemon: socket unavailable");
+    }
+
+    #[test]
+    fn footer_restores_key_hints_after_transient_message_expires() {
+        let started = Instant::now();
+        let mut message = UiMessage::default();
+        message.set_transient("focused project-one:1.0", started);
+        let snapshot = Snapshot::default();
+        let area = Rect::new(0, 0, 80, 10);
+        let footer_row = ui_layout(area, false)[3].y;
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &snapshot, 0, message.text(), 0))
+            .unwrap();
+        assert_eq!(row_text(&terminal, footer_row), "focused project-one:1.0");
+
+        message.expire(started + ACTION_MESSAGE_DURATION);
+        terminal
+            .draw(|frame| render(frame, &snapshot, 0, message.text(), 0))
+            .unwrap();
+        assert_eq!(
+            row_text(&terminal, footer_row),
+            "j/k move  enter focus/view  r refresh  q close"
+        );
     }
 
     #[test]
@@ -1801,7 +1921,7 @@ mod tests {
             config_path: Path::new("/tmp/tmux-agent-config.toml"),
             exit_after_focus: false,
         };
-        let mut message = String::new();
+        let mut message = UiMessage::default();
 
         let activation = activate_record(&context, &mut snapshot, 0, &mut message).await;
 
@@ -1816,7 +1936,7 @@ mod tests {
             acknowledged.as_deref(),
             Some("remote/remote-mac/host/default/%1")
         );
-        assert!(message.contains("acknowledged"));
+        assert!(message.text().contains("acknowledged"));
         assert!(
             !snapshot.agents[0]
                 .goal
@@ -1851,7 +1971,7 @@ mod tests {
             config_path: Path::new("/tmp/tmux-agent-config.toml"),
             exit_after_focus: true,
         };
-        let mut message = String::new();
+        let mut message = UiMessage::default();
 
         let activation = activate_record(&context, &mut snapshot, 0, &mut message)
             .await
@@ -1862,7 +1982,7 @@ mod tests {
         };
         assert!(command.iter().any(|argument| argument == "subagent-view"));
         assert_eq!(command.last(), Some(&snapshot.agents[0].id));
-        assert!(message.is_empty());
+        assert!(message.text().is_empty());
     }
 
     #[test]
