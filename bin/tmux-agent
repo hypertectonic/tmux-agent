@@ -104,7 +104,7 @@ else
     binary=$(tmux_agent_current_binary 2>/dev/null || true)
 fi
 
-if [ -z "$binary" ] || [ ! -x "$binary" ] || \
+if [ -z "$binary" ] || [ ! -x "$binary" ] ||
     { [ -z "${TMUX_AGENT_BINARY:-}" ] && ! tmux_agent_current_binary_compatible; }; then
     status=$(tmux_agent_read_status)
     case "$status" in
