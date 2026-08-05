@@ -24,6 +24,7 @@ for file in \
     CONTRIBUTING.md \
     SECURITY.md \
     VERSION \
+    COMPATIBILITY \
     Cargo.lock \
     docs/installation.md \
     docs/remote-machines.md \

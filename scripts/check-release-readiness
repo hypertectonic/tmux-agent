@@ -57,6 +57,7 @@ for required in \
     CONTRIBUTING.md \
     SECURITY.md \
     VERSION \
+    COMPATIBILITY \
     Cargo.toml \
     Cargo.lock \
     docs/installation.md \

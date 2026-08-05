@@ -1,10 +1,12 @@
 use crate::config::{Config, RuntimePaths, default_config_path};
 use crate::ipc;
 use crate::model::{
-    APPLICATION_VERSION, CAPABILITY_SUBAGENT_VIEW, PROTOCOL_VERSION, Snapshot, terminal_safe,
+    APPLICATION_VERSION, CAPABILITY_SUBAGENT_VIEW, LAUNCHER_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    Snapshot, terminal_safe,
 };
 use crate::tmux::Tmux;
 use anyhow::Result;
+use semver::Version;
 use serde::Serialize;
 use std::env;
 use std::fs;
@@ -37,6 +39,12 @@ struct DoctorReport {
     architecture: String,
     config_path: String,
     checks: Vec<DoctorCheck>,
+}
+
+#[derive(Debug)]
+struct LauncherCompatibility {
+    launcher_protocol: u32,
+    minimum_binary_version: String,
 }
 
 impl DoctorReport {
@@ -260,28 +268,111 @@ fn check_plugin_version(report: &mut DoctorReport) {
         );
         return;
     };
-    let version_path = root.join("VERSION");
-    match fs::read_to_string(&version_path) {
-        Ok(value) if value.trim() == APPLICATION_VERSION => report.check(
-            "plugin-version",
-            CheckStatus::Ok,
-            format!("plugin and binary agree on {}", APPLICATION_VERSION),
-        ),
-        Ok(value) => report.check(
+    let compatibility_path = root.join("COMPATIBILITY");
+    let value = match fs::read_to_string(&compatibility_path) {
+        Ok(value) => value,
+        Err(error) => {
+            report.check(
+                "plugin-version",
+                CheckStatus::Error,
+                format!(
+                    "could not read {}: {error}",
+                    private_path(&compatibility_path)
+                ),
+            );
+            return;
+        }
+    };
+    let compatibility = match parse_launcher_compatibility(&value) {
+        Some(compatibility) => compatibility,
+        None => {
+            report.check(
+                "plugin-version",
+                CheckStatus::Error,
+                format!("could not parse {}", private_path(&compatibility_path)),
+            );
+            return;
+        }
+    };
+    if compatibility.launcher_protocol != LAUNCHER_PROTOCOL_VERSION {
+        report.check(
             "plugin-version",
             CheckStatus::Error,
             format!(
-                "plugin expects {} but binary reports {}; run tmux-agent plugin update",
-                value.trim(),
-                APPLICATION_VERSION
+                "checkout launcher protocol {} is incompatible with binary protocol {}",
+                compatibility.launcher_protocol, LAUNCHER_PROTOCOL_VERSION
             ),
-        ),
-        Err(error) => report.check(
+        );
+        return;
+    }
+    let Ok(binary_version) = Version::parse(APPLICATION_VERSION) else {
+        report.check(
             "plugin-version",
             CheckStatus::Error,
-            format!("could not read {}: {error}", private_path(&version_path)),
-        ),
+            format!("binary reports invalid semantic version {APPLICATION_VERSION}"),
+        );
+        return;
+    };
+    let Ok(minimum_version) = Version::parse(&compatibility.minimum_binary_version) else {
+        report.check(
+            "plugin-version",
+            CheckStatus::Error,
+            format!(
+                "checkout compatibility floor {} is not a semantic version",
+                compatibility.minimum_binary_version
+            ),
+        );
+        return;
+    };
+    if binary_version >= minimum_version {
+        report.check(
+            "plugin-version",
+            CheckStatus::Ok,
+            format!(
+                "binary {} satisfies launcher protocol {} and minimum {}",
+                APPLICATION_VERSION,
+                LAUNCHER_PROTOCOL_VERSION,
+                compatibility.minimum_binary_version
+            ),
+        );
+    } else {
+        report.check(
+            "plugin-version",
+            CheckStatus::Error,
+            format!(
+                "checkout requires binary {} or newer on launcher protocol {}; binary reports {}",
+                compatibility.minimum_binary_version,
+                LAUNCHER_PROTOCOL_VERSION,
+                APPLICATION_VERSION
+            ),
+        );
     }
+}
+
+fn parse_launcher_compatibility(value: &str) -> Option<LauncherCompatibility> {
+    let mut launcher_protocol = None;
+    let mut minimum_binary_version = None;
+    for line in value.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, value) = line.split_once('=')?;
+        match name {
+            "launcher_protocol" if launcher_protocol.is_none() => {
+                launcher_protocol = value.parse().ok();
+            }
+            "minimum_binary_version" if minimum_binary_version.is_none() => {
+                Version::parse(value).ok()?;
+                minimum_binary_version = Some(value.to_string());
+            }
+            _ => return None,
+        }
+    }
+    Some(LauncherCompatibility {
+        launcher_protocol: launcher_protocol?,
+        minimum_binary_version: minimum_binary_version?,
+    })
 }
 
 fn check_peer_health(report: &mut DoctorReport, snapshot: &Snapshot) {
@@ -613,6 +704,18 @@ mod tests {
         assert!(tmux_version_supported("tmux 3.5"));
         assert!(tmux_version_supported("tmux next-3.6"));
         assert!(!tmux_version_supported("tmux unknown"));
+    }
+
+    #[test]
+    fn plugin_compatibility_uses_protocol_and_semantic_floor() {
+        let compatibility: LauncherCompatibility =
+            parse_launcher_compatibility(include_str!("../COMPATIBILITY")).unwrap();
+        assert_eq!(compatibility.launcher_protocol, LAUNCHER_PROTOCOL_VERSION);
+        let minimum = Version::parse(&compatibility.minimum_binary_version).unwrap();
+        assert!(Version::parse(APPLICATION_VERSION).unwrap() >= minimum);
+        assert!(Version::parse("0.4.0").unwrap() > Version::parse("0.3.0").unwrap());
+        assert!(Version::parse("0.3.0-rc.1").unwrap() < Version::parse("0.3.0").unwrap());
+        assert!(Version::parse("0.03.0").is_err());
     }
 
     #[test]

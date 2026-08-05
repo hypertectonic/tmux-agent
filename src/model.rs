@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 pub const PROTOCOL_VERSION: u32 = 3;
+pub const LAUNCHER_PROTOCOL_VERSION: u32 = 1;
 pub const APPLICATION_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CAPABILITY_SUBAGENT_VIEW: &str = "codex_subagent_view_v1";
 pub const SUBAGENT_VIEW_MINIMUM_VERSION: &str = "0.2.0";

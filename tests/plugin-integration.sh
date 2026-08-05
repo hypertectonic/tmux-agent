@@ -74,6 +74,30 @@ spaced_binding=$(
 [[ $("${tmux_test[@]}" show-option -gqv @tmux-agent-popup-width) == 80% ]]
 [[ $("${tmux_test[@]}" show-option -gqv @tmux-agent-popup-height) == 80% ]]
 
+managed_data="$test_root/managed/tmux-agent"
+managed_version=0.4.0
+mkdir -p "$managed_data/versions/$managed_version"
+cat >"$managed_data/versions/$managed_version/tmux-agent" <<EOF
+#!/bin/sh
+if [ "\${1:-}" = "--version" ]; then
+    printf '%s\\n' 'tmux-agent $managed_version'
+fi
+EOF
+chmod +x "$managed_data/versions/$managed_version/tmux-agent"
+cat >"$managed_data/versions/$managed_version/COMPATIBILITY" <<EOF
+launcher_protocol=1
+binary_version=$managed_version
+EOF
+ln -s "versions/$managed_version/tmux-agent" "$managed_data/current"
+"${tmux_test[@]}" set-environment -g TMUX_AGENT_DATA_DIR "$managed_data"
+"${tmux_test[@]}" set-option -gu @tmux-agent-binary
+"${tmux_test[@]}" run-shell "$root/tmux-agent.tmux"
+sleep 0.2
+[[ $("$managed_data/current" --version) == "tmux-agent $managed_version" ]]
+[[ ! -e $managed_data/install-status ]]
+"${tmux_test[@]}" set-environment -gu TMUX_AGENT_DATA_DIR
+"${tmux_test[@]}" set-option -g @tmux-agent-binary "$root/target/debug/tmux-agent"
+
 "${tmux_test[@]}" set-environment -g XDG_RUNTIME_DIR "$test_root/runtime"
 "${tmux_test[@]}" set-environment -g XDG_STATE_HOME "$test_root/state"
 "${tmux_test[@]}" set-option -g @tmux-agent-auto-start on

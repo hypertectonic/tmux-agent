@@ -2,6 +2,10 @@
 
 tmux_agent_root=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 tmux_agent_tmux=${TMUX_AGENT_TMUX_BIN:-tmux}
+TMUX_AGENT_ROOT=$tmux_agent_root
+export TMUX_AGENT_ROOT
+# shellcheck source=scripts/lib.sh
+. "$tmux_agent_root/scripts/lib.sh"
 
 tmux_agent_option() {
     local name=$1
@@ -81,18 +85,7 @@ tmux_agent_install_log="$tmux_agent_state_root/install.log"
 
 if [[ -z $tmux_agent_binary ]]; then
     tmux_agent_binary="$tmux_agent_root/bin/tmux-agent"
-    if [[ -n ${TMUX_AGENT_DATA_DIR:-} ]]; then
-        tmux_agent_managed_binary="$TMUX_AGENT_DATA_DIR/current"
-    elif [[ -n ${XDG_DATA_HOME:-} ]]; then
-        tmux_agent_managed_binary="$XDG_DATA_HOME/tmux-agent/current"
-    else
-        tmux_agent_managed_binary="$HOME/.local/share/tmux-agent/current"
-    fi
-    tmux_agent_expected_version=$(sed -n '1p' "$tmux_agent_root/VERSION")
-    tmux_agent_reported_version=$(
-        "$tmux_agent_managed_binary" --version 2>/dev/null || true
-    )
-    if [[ $tmux_agent_reported_version != "tmux-agent $tmux_agent_expected_version" ]]; then
+    if ! tmux_agent_current_binary_compatible; then
         "$tmux_agent_root/scripts/bootstrap" \
             >>"$tmux_agent_install_log" 2>&1 &
     fi
@@ -114,7 +107,6 @@ esac
 unset tmux_agent_root tmux_agent_tmux tmux_agent_key tmux_agent_width
 unset tmux_agent_height tmux_agent_auto_start tmux_agent_binary
 unset tmux_agent_previous_key tmux_agent_previous_binding tmux_agent_existing_binding
-unset tmux_agent_state_root tmux_agent_install_log tmux_agent_managed_binary
+unset tmux_agent_state_root tmux_agent_install_log
 unset tmux_agent_launch_command
-unset tmux_agent_expected_version tmux_agent_reported_version
 unset -f tmux_agent_option tmux_agent_valid_dimension tmux_agent_binding

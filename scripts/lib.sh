@@ -36,6 +36,291 @@ tmux_agent_version() {
     printf '%s\n' "$version"
 }
 
+tmux_agent_compatibility_contract() (
+    compatibility_file="${TMUX_AGENT_ROOT:?TMUX_AGENT_ROOT is required}/COMPATIBILITY"
+    [ -r "$compatibility_file" ] || {
+        printf 'tmux-agent: missing compatibility contract at %s\n' \
+            "$compatibility_file" >&2
+        exit 1
+    }
+    awk '
+        /^[[:space:]]*$/ || /^[[:space:]]*#/ { next }
+        /^launcher_protocol=[1-9][0-9]*$/ {
+            if (protocol != "") invalid = 1
+            protocol = substr($0, index($0, "=") + 1)
+            next
+        }
+        /^minimum_binary_version=[0-9A-Za-z.+-]+$/ {
+            if (minimum != "") invalid = 1
+            minimum = substr($0, index($0, "=") + 1)
+            next
+        }
+        { invalid = 1 }
+        END {
+            if (invalid || protocol == "" || minimum == "") exit 1
+            print protocol "|" minimum
+        }
+    ' "$compatibility_file" || {
+        printf 'tmux-agent: invalid compatibility contract at %s\n' \
+            "$compatibility_file" >&2
+        exit 1
+    }
+)
+
+tmux_agent_version_at_least() (
+    candidate=$1
+    minimum=$2
+    awk -v candidate="$candidate" -v minimum="$minimum" '
+        function numeric(value) {
+            return value ~ /^[0-9][0-9]*$/
+        }
+        function compare_numeric(left, right, left_trimmed, right_trimmed) {
+            left_trimmed = left
+            right_trimmed = right
+            sub(/^0+/, "", left_trimmed)
+            sub(/^0+/, "", right_trimmed)
+            if (left_trimmed == "") left_trimmed = "0"
+            if (right_trimmed == "") right_trimmed = "0"
+            if (length(left_trimmed) != length(right_trimmed))
+                return length(left_trimmed) < length(right_trimmed) ? -1 : 1
+            if (left_trimmed == right_trimmed) return 0
+            return left_trimmed < right_trimmed ? -1 : 1
+        }
+        function valid_identifiers(value, reject_numeric_leading_zero,
+            identifiers, count, index_value) {
+            if (value == "") return 0
+            count = split(value, identifiers, ".")
+            for (index_value = 1; index_value <= count; index_value++) {
+                if (identifiers[index_value] !~ /^[0-9A-Za-z-][0-9A-Za-z-]*$/)
+                    return 0
+                if (reject_numeric_leading_zero &&
+                    identifiers[index_value] ~ /^0[0-9]/)
+                    return 0
+            }
+            return 1
+        }
+        function parse(version, fields, core, count, index_value, build_index,
+            build) {
+            build_index = index(version, "+")
+            if (build_index > 0) {
+                build = substr(version, build_index + 1)
+                version = substr(version, 1, build_index - 1)
+                if (!valid_identifiers(build, 0)) return 0
+            }
+            fields["prerelease"] = ""
+            index_value = index(version, "-")
+            if (index_value > 0) {
+                fields["prerelease"] = substr(version, index_value + 1)
+                version = substr(version, 1, index_value - 1)
+                if (!valid_identifiers(fields["prerelease"], 1)) return 0
+            }
+            count = split(version, core, ".")
+            if (count != 3) return 0
+            for (index_value = 1; index_value <= 3; index_value++) {
+                if (!numeric(core[index_value])) return 0
+                if (core[index_value] ~ /^0[0-9]/) return 0
+                fields[index_value] = core[index_value]
+            }
+            return 1
+        }
+        function compare_prerelease(left, right, left_parts, right_parts,
+            left_count, right_count, count, index_value, result,
+            left_numeric, right_numeric) {
+            if (left == "" && right == "") return 0
+            if (left == "") return 1
+            if (right == "") return -1
+            left_count = split(left, left_parts, ".")
+            right_count = split(right, right_parts, ".")
+            count = left_count > right_count ? left_count : right_count
+            for (index_value = 1; index_value <= count; index_value++) {
+                if (index_value > left_count) return -1
+                if (index_value > right_count) return 1
+                if (left_parts[index_value] == "" || right_parts[index_value] == "")
+                    return 2
+                left_numeric = numeric(left_parts[index_value])
+                right_numeric = numeric(right_parts[index_value])
+                if (left_numeric && right_numeric) {
+                    result = compare_numeric(left_parts[index_value], right_parts[index_value])
+                } else if (left_numeric) {
+                    result = -1
+                } else if (right_numeric) {
+                    result = 1
+                } else if (left_parts[index_value] == right_parts[index_value]) {
+                    result = 0
+                } else {
+                    result = left_parts[index_value] < right_parts[index_value] ? -1 : 1
+                }
+                if (result != 0) return result
+            }
+            return 0
+        }
+        BEGIN {
+            if (!parse(candidate, candidate_fields) ||
+                !parse(minimum, minimum_fields)) exit 2
+            for (component = 1; component <= 3; component++) {
+                result = compare_numeric(candidate_fields[component], minimum_fields[component])
+                if (result < 0) exit 1
+                if (result > 0) exit 0
+            }
+            result = compare_prerelease(candidate_fields["prerelease"], minimum_fields["prerelease"])
+            if (result == 2) exit 2
+            exit result < 0 ? 1 : 0
+        }
+    '
+)
+
+tmux_agent_binary_version() (
+    binary_path=$1
+    [ -x "$binary_path" ] || exit 1
+    reported_version=$("$binary_path" --version 2>/dev/null) || exit 1
+    case "$reported_version" in
+        'tmux-agent '*) binary_version=${reported_version#tmux-agent } ;;
+        *) exit 1 ;;
+    esac
+    tmux_agent_version_at_least "$binary_version" "$binary_version" || exit 1
+    printf '%s\n' "$binary_version"
+)
+
+tmux_agent_version_compatibility() (
+    version_dir=$1
+    metadata_file="$version_dir/COMPATIBILITY"
+    [ -r "$metadata_file" ] || exit 1
+    awk '
+        /^launcher_protocol=[1-9][0-9]*$/ {
+            if (protocol != "") invalid = 1
+            protocol = substr($0, index($0, "=") + 1)
+            next
+        }
+        /^binary_version=[0-9A-Za-z.+-]+$/ {
+            if (version != "") invalid = 1
+            version = substr($0, index($0, "=") + 1)
+            next
+        }
+        { invalid = 1 }
+        END {
+            if (invalid || protocol == "" || version == "") exit 1
+            print protocol "|" version
+        }
+    ' "$metadata_file"
+)
+
+tmux_agent_write_version_compatibility() (
+    version_dir=$1
+    binary_version=$2
+    contract=$(tmux_agent_compatibility_contract) || exit 1
+    launcher_protocol=${contract%%|*}
+    metadata_tmp="$version_dir/.compatibility.$$"
+    trap 'rm -f -- "$metadata_tmp"' EXIT HUP INT TERM
+    {
+        printf 'launcher_protocol=%s\n' "$launcher_protocol"
+        printf 'binary_version=%s\n' "$binary_version"
+    } >"$metadata_tmp"
+    chmod 600 "$metadata_tmp"
+    mv -f "$metadata_tmp" "$version_dir/COMPATIBILITY"
+    trap - EXIT HUP INT TERM
+)
+
+tmux_agent_managed_version_compatible() (
+    candidate_version=$1
+    data_dir=$(tmux_agent_data_dir)
+    version_dir="$data_dir/versions/$candidate_version"
+    binary_path="$version_dir/tmux-agent"
+    reported_version=$(tmux_agent_binary_version "$binary_path") || exit 1
+    [ "$reported_version" = "$candidate_version" ] || exit 1
+    contract=$(tmux_agent_compatibility_contract) || exit 1
+    required_protocol=${contract%%|*}
+    minimum_version=${contract#*|}
+    metadata=$(tmux_agent_version_compatibility "$version_dir") || exit 1
+    installed_protocol=${metadata%%|*}
+    installed_version=${metadata#*|}
+    [ "$installed_protocol" = "$required_protocol" ] || exit 1
+    [ "$installed_version" = "$reported_version" ] || exit 1
+    tmux_agent_version_at_least "$reported_version" "$minimum_version"
+)
+
+tmux_agent_current_managed_version() (
+    data_dir=$(tmux_agent_data_dir)
+    current_path="$data_dir/current"
+    [ -x "$current_path" ] || exit 1
+    reported_version=$(tmux_agent_binary_version "$current_path") || exit 1
+    current_target=$(readlink "$current_path" 2>/dev/null) || exit 1
+    expected_relative="versions/$reported_version/tmux-agent"
+    expected_absolute="$data_dir/$expected_relative"
+    case "$current_target" in
+        "$expected_relative" | "$expected_absolute") ;;
+        *) exit 1 ;;
+    esac
+    printf '%s\n' "$reported_version"
+)
+
+tmux_agent_current_binary_compatible() (
+    current_version=$(tmux_agent_current_managed_version) || exit 1
+    tmux_agent_managed_version_compatible "$current_version"
+)
+
+tmux_agent_install_lock_acquire() (
+    data_dir=$(tmux_agent_data_dir)
+    lock_dir="$data_dir/.install.lock"
+    attempts=${TMUX_AGENT_INSTALL_LOCK_ATTEMPTS:-300}
+    case "$attempts" in
+        '' | *[!0-9]*)
+            printf '%s\n' 'tmux-agent: invalid installation lock attempt count' >&2
+            exit 1
+            ;;
+    esac
+    attempt=0
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+        attempt=$((attempt + 1))
+        lock_pid=
+        if [ -r "$lock_dir/pid" ]; then
+            IFS= read -r lock_pid <"$lock_dir/pid" || true
+        fi
+        case "$lock_pid" in
+            '' | *[!0-9]*) lock_pid= ;;
+        esac
+        if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+            rm -f -- "$lock_dir/pid"
+            rmdir "$lock_dir" 2>/dev/null || true
+            continue
+        fi
+        if [ "$attempt" -ge "$attempts" ]; then
+            printf '%s\n' 'tmux-agent: timed out waiting for the installation lock' >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+    printf '%s\n' "$$" >"$lock_dir/pid"
+    chmod 600 "$lock_dir/pid"
+)
+
+tmux_agent_install_lock_release() (
+    lock_dir="$(tmux_agent_data_dir)/.install.lock"
+    lock_pid=
+    if [ -r "$lock_dir/pid" ]; then
+        IFS= read -r lock_pid <"$lock_dir/pid" || true
+    fi
+    [ "$lock_pid" = "$$" ] || exit 1
+    rm -f -- "$lock_dir/pid"
+    rmdir "$lock_dir" 2>/dev/null
+)
+
+tmux_agent_activate_version() (
+    candidate_version=$1
+    data_dir=$(tmux_agent_data_dir)
+    lock_pid=
+    if [ -r "$data_dir/.install.lock/pid" ]; then
+        IFS= read -r lock_pid <"$data_dir/.install.lock/pid" || true
+    fi
+    [ "$lock_pid" = "$$" ] || exit 1
+    candidate_binary="$data_dir/versions/$candidate_version/tmux-agent"
+    tmux_agent_binary_matches "$candidate_binary" "$candidate_version" || exit 1
+    link_tmp="$data_dir/.current.$$"
+    trap 'rm -f -- "$link_tmp"' EXIT HUP INT TERM
+    ln -s "versions/$candidate_version/tmux-agent" "$link_tmp"
+    mv -f "$link_tmp" "$data_dir/current"
+    trap - EXIT HUP INT TERM
+)
+
 tmux_agent_target() {
     system_name=${TMUX_AGENT_UNAME_S:-$(uname -s)}
     machine_name=${TMUX_AGENT_UNAME_M:-$(uname -m)}

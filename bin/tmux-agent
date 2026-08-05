@@ -38,25 +38,24 @@ rollback() {
             ;;
     esac
     requested_binary="$data_dir/versions/$requested_version/tmux-agent"
-    if ! tmux_agent_binary_matches "$requested_binary" "$requested_version"; then
-        printf 'tmux-agent: version %s is not installed or failed verification\n' \
+    if ! tmux_agent_managed_version_compatible "$requested_version"; then
+        printf 'tmux-agent: version %s is not installed or is not compatible with this checkout\n' \
             "$requested_version" >&2
         exit 1
     fi
-    lock_dir="$data_dir/.install.lock"
-    if ! mkdir "$lock_dir" 2>/dev/null; then
-        printf '%s\n' 'tmux-agent: installation or another rollback is in progress' >&2
+    if ! tmux_agent_install_lock_acquire; then
         exit 1
     fi
     rollback_cleanup() {
-        rm -f -- "$lock_dir/pid"
-        rmdir "$lock_dir" 2>/dev/null || true
+        tmux_agent_install_lock_release 2>/dev/null || true
     }
     trap rollback_cleanup EXIT HUP INT TERM
-    printf '%s\n' "$$" >"$lock_dir/pid"
-    link_tmp="$data_dir/.current.$$"
-    ln -s "versions/$requested_version/tmux-agent" "$link_tmp"
-    mv -f "$link_tmp" "$data_dir/current"
+    if ! tmux_agent_managed_version_compatible "$requested_version"; then
+        printf 'tmux-agent: version %s changed while waiting for the installation lock\n' \
+            "$requested_version" >&2
+        exit 1
+    fi
+    tmux_agent_activate_version "$requested_version"
     tmux_agent_write_status "READY|$requested_version"
     "$requested_binary" daemon restart >/dev/null 2>&1 || true
     printf 'tmux-agent: rolled back to %s\n' "$requested_version"
@@ -87,6 +86,8 @@ if [ "${1:-}" = plugin ]; then
                 printf '%s\n' 'usage: tmux-agent plugin update' >&2
                 exit 2
             }
+            printf '%s\n' \
+                "tmux-agent: 'plugin update' is deprecated; checking checkout compatibility only" >&2
             exec "$TMUX_AGENT_ROOT/scripts/bootstrap"
             ;;
         *)
@@ -103,7 +104,8 @@ else
     binary=$(tmux_agent_current_binary 2>/dev/null || true)
 fi
 
-if [ -z "$binary" ] || [ ! -x "$binary" ]; then
+if [ -z "$binary" ] || [ ! -x "$binary" ] ||
+    { [ -z "${TMUX_AGENT_BINARY:-}" ] && ! tmux_agent_current_binary_compatible; }; then
     status=$(tmux_agent_read_status)
     case "$status" in
         INSTALLING\|*)
