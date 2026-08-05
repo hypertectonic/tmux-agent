@@ -156,7 +156,7 @@ else
         normalized_entry=${archive_entry#./}
         case "$normalized_entry" in
             tmux-agent | README.md | LICENSE | THIRD_PARTY_NOTICES.md | \
-                THIRD_PARTY_LICENSES.html)
+                THIRD_PARTY_LICENSES.html | COMPATIBILITY | TARGET)
                 ;;
             *)
                 invalid_entry=1
@@ -168,7 +168,7 @@ else
         exit 1
     fi
     for required_entry in tmux-agent README.md LICENSE THIRD_PARTY_NOTICES.md \
-        THIRD_PARTY_LICENSES.html; do
+        THIRD_PARTY_LICENSES.html COMPATIBILITY TARGET; do
         if ! printf '%s\n' "$archive_entries" | grep -qxE "(\\./)?${required_entry}"; then
             tmux_agent_write_status "FAILED|release archive is missing $required_entry"
             exit 1
@@ -183,7 +183,7 @@ else
         exit 1
     fi
     for required_entry in tmux-agent README.md LICENSE THIRD_PARTY_NOTICES.md \
-        THIRD_PARTY_LICENSES.html; do
+        THIRD_PARTY_LICENSES.html COMPATIBILITY TARGET; do
         if [ -L "$staging_dir/$required_entry" ] ||
             [ ! -f "$staging_dir/$required_entry" ]; then
             tmux_agent_write_status \
@@ -198,7 +198,25 @@ else
     fi
     chmod 644 "$staging_dir/README.md" "$staging_dir/LICENSE" \
         "$staging_dir/THIRD_PARTY_NOTICES.md" \
-        "$staging_dir/THIRD_PARTY_LICENSES.html"
+        "$staging_dir/THIRD_PARTY_LICENSES.html" "$staging_dir/COMPATIBILITY" \
+        "$staging_dir/TARGET"
+    IFS= read -r packaged_target <"$staging_dir/TARGET" || true
+    if [ "$packaged_target" != "$target" ]; then
+        tmux_agent_write_status "FAILED|release archive records the wrong platform"
+        exit 1
+    fi
+    packaged_compatibility=$(tmux_agent_version_compatibility "$staging_dir") || {
+        tmux_agent_write_status "FAILED|release archive compatibility metadata is invalid"
+        exit 1
+    }
+    packaged_protocol=${packaged_compatibility%%|*}
+    packaged_version=${packaged_compatibility#*|}
+    required_protocol=${contract%%|*}
+    if [ "$packaged_protocol" != "$required_protocol" ] ||
+        [ "$packaged_version" != "$version" ]; then
+        tmux_agent_write_status "FAILED|release archive compatibility metadata does not match"
+        exit 1
+    fi
     tmux_agent_write_version_compatibility "$staging_dir" "$version"
 
     if [ -e "$destination_dir" ]; then

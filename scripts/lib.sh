@@ -262,9 +262,16 @@ tmux_agent_install_lock_acquire() (
     data_dir=$(tmux_agent_data_dir)
     lock_dir="$data_dir/.install.lock"
     attempts=${TMUX_AGENT_INSTALL_LOCK_ATTEMPTS:-300}
+    incomplete_grace_attempts=${TMUX_AGENT_INCOMPLETE_LOCK_GRACE_ATTEMPTS:-50}
     case "$attempts" in
         '' | *[!0-9]*)
             printf '%s\n' 'tmux-agent: invalid installation lock attempt count' >&2
+            exit 1
+            ;;
+    esac
+    case "$incomplete_grace_attempts" in
+        '' | 0 | *[!0-9]*)
+            printf '%s\n' 'tmux-agent: invalid incomplete lock grace count' >&2
             exit 1
             ;;
     esac
@@ -283,14 +290,24 @@ tmux_agent_install_lock_acquire() (
             rmdir "$lock_dir" 2>/dev/null || true
             continue
         fi
+        if [ -z "$lock_pid" ] && [ "$attempt" -ge "$incomplete_grace_attempts" ]; then
+            rm -f -- "$lock_dir/pid"
+            rmdir "$lock_dir" 2>/dev/null || true
+            continue
+        fi
         if [ "$attempt" -ge "$attempts" ]; then
             printf '%s\n' 'tmux-agent: timed out waiting for the installation lock' >&2
             exit 1
         fi
         sleep 0.1
     done
-    printf '%s\n' "$$" >"$lock_dir/pid"
-    chmod 600 "$lock_dir/pid"
+    if ! printf '%s\n' "$$" >"$lock_dir/pid" ||
+        ! chmod 600 "$lock_dir/pid"; then
+        rm -f -- "$lock_dir/pid"
+        rmdir "$lock_dir" 2>/dev/null || true
+        printf '%s\n' 'tmux-agent: failed to publish installation lock owner' >&2
+        exit 1
+    fi
 )
 
 tmux_agent_install_lock_release() (

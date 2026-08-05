@@ -176,6 +176,7 @@ tmux-agent daemon start
 tmux-agent daemon status
 tmux-agent daemon restart
 tmux-agent daemon stop
+tmux-agent update [--version <version>]
 tmux-agent plugin versions
 tmux-agent plugin rollback <version>
 tmux-agent paths
@@ -201,6 +202,7 @@ tmux-agent pi [args...]
 tmux-agent run -- <command> [args...]
 tmux-agent daemon start|status|restart|stop|run
 tmux-agent doctor [--json]
+tmux-agent update [--version <version>]
 tmux-agent paths
 ```
 
