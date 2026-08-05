@@ -69,6 +69,32 @@ version, protocol, and capabilities. It intentionally has no freshness
 timestamp because snapshots are emitted on state changes, not as connection
 heartbeats.
 
+## Plugin and managed-binary compatibility
+
+The TPM checkout owns launcher behavior and fallback installation; the managed
+binary store owns executable versions. `COMPATIBILITY` defines the launcher
+protocol and minimum binary version required by a checkout. Every published
+managed version directory records its binary version and launcher protocol in
+its own `COMPATIBILITY` metadata. Compatibility requires all of the following:
+
+- `current` names the verified binary in its immutable `versions/<version>`
+  directory;
+- the binary reports the same semantic version as that directory and metadata;
+- the installed and checkout launcher protocols are equal; and
+- the binary version is at or above the checkout's minimum.
+
+Bootstrap holds `~/.local/share/tmux-agent/.install.lock` (under the configured
+data directory) while it rechecks compatibility, publishes a complete version
+directory, and atomically renames a relative `current` symlink. Rollback uses
+the same lock and activation operation. Thus an older checkout treats a newer
+binary with the same launcher protocol as current and cannot replace it with
+the checkout-pinned fallback. A missing, below-minimum, corrupt, or
+protocol-incompatible managed binary is repaired from that pinned fallback.
+
+This launcher protocol is separate from the daemon federation protocol. TPM's
+`prefix + U` continues to update the plugin checkout; it is not a managed-binary
+update command.
+
 ## SSH federation
 
 A structured machine produces a hardened command equivalent to:

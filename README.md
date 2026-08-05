@@ -30,9 +30,11 @@ set -g @plugin 'hypertectonic/tmux-agent'
 set -g @tmux-agent-key 'A'
 ```
 
-Press `prefix + I`, then `prefix + A`. The plugin downloads the exact version
-recorded in `VERSION`, verifies the checksum and binary version, starts one
-daemon for the selected tmux server, and opens an 80 percent popup.
+Press `prefix + I`, then `prefix + A`. When no compatible managed binary is
+installed, the plugin downloads the version recorded in `VERSION`, verifies
+the checksum and binary version, starts one daemon for the selected tmux
+server, and opens an 80 percent popup. A newer compatible managed binary is
+kept in place.
 
 The plugin does not create a sidebar, split, window, or session. A pane where
 you run `tmux-agent ui` can be used as a user-managed sidebar.

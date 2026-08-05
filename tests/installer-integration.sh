@@ -19,6 +19,10 @@ plugin_root="$test_root/plugin with spaces"
 release_root="$test_root/releases"
 mkdir -p "$plugin_root/scripts" "$plugin_root/bin" "$release_root"
 printf '%s\n' 0.1.0 >"$plugin_root/VERSION"
+cat >"$plugin_root/COMPATIBILITY" <<'EOF'
+launcher_protocol=1
+minimum_binary_version=0.1.0
+EOF
 cp "$source_root/scripts/lib.sh" "$source_root/scripts/bootstrap" \
     "$source_root/scripts/install" "$source_root/scripts/uninstall" "$plugin_root/scripts/"
 cp "$source_root/bin/tmux-agent" "$plugin_root/bin/tmux-agent"
@@ -65,6 +69,34 @@ EOF
         >"$release_dir/SHA256SUMS"
 }
 
+make_managed_version() {
+    local data_dir=$1
+    local version=$2
+    local protocol=$3
+    local version_dir="$data_dir/versions/$version"
+    mkdir -p "$version_dir"
+    cat >"$version_dir/tmux-agent" <<EOF
+#!/bin/sh
+if [ "\${1:-}" = "--version" ]; then
+    printf '%s\\n' 'tmux-agent $version'
+    exit 0
+fi
+exit 0
+EOF
+    chmod +x "$version_dir/tmux-agent"
+    cat >"$version_dir/COMPATIBILITY" <<EOF
+launcher_protocol=$protocol
+binary_version=$version
+EOF
+}
+
+make_current() {
+    local data_dir=$1
+    local version=$2
+    mkdir -p "$data_dir"
+    ln -s "versions/$version/tmux-agent" "$data_dir/current"
+}
+
 run_bootstrap() {
     local data_dir=$1
     local state_dir=$2
@@ -84,6 +116,8 @@ secret='should-not-enter-install-logs'
 TEST_SECRET="$secret" run_bootstrap "$data_dir" "$state_dir" \
     >"$test_root/install.log" 2>&1
 [[ $("$data_dir/current" --version) == 'tmux-agent 0.1.0' ]]
+grep -Fx 'launcher_protocol=1' \
+    "$data_dir/versions/0.1.0/COMPATIBILITY" >/dev/null
 [[ -f $data_dir/versions/0.1.0/THIRD_PARTY_NOTICES.md ]]
 [[ -f $data_dir/versions/0.1.0/THIRD_PARTY_LICENSES.html ]]
 if grep -F "$secret" "$test_root/install.log"; then
@@ -94,6 +128,55 @@ fi
 mv "$release_root" "$test_root/releases-offline"
 run_bootstrap "$data_dir" "$state_dir" >/dev/null
 mv "$test_root/releases-offline" "$release_root"
+
+below_data="$test_root/below-floor/tmux-agent"
+make_managed_version "$below_data" 0.0.9 1
+make_current "$below_data" 0.0.9
+run_bootstrap "$below_data" "$test_root/below-floor-state/tmux-agent" >/dev/null
+[[ $("$below_data/current" --version) == 'tmux-agent 0.1.0' ]]
+
+newer_data="$test_root/newer-compatible/tmux-agent"
+make_managed_version "$newer_data" 0.2.0 1
+make_current "$newer_data" 0.2.0
+mv "$release_root" "$test_root/releases-offline"
+run_bootstrap "$newer_data" "$test_root/newer-state/tmux-agent" \
+    >"$test_root/newer-bootstrap.out"
+grep -F 'compatible managed binary 0.2.0 is already current' \
+    "$test_root/newer-bootstrap.out" >/dev/null
+TMUX_AGENT_DATA_DIR="$newer_data" \
+    TMUX_AGENT_STATE_DIR="$test_root/newer-state/tmux-agent" \
+    TMUX_AGENT_RELEASE_BASE_URL="file://${release_root// /%20}" \
+    TMUX_AGENT_UNAME_S=Linux TMUX_AGENT_UNAME_M=x86_64 \
+    "$plugin_root/bin/tmux-agent" plugin update \
+    >"$test_root/plugin-update.out" 2>"$test_root/plugin-update.err"
+grep -F "'plugin update' is deprecated" "$test_root/plugin-update.err" >/dev/null
+[[ $("$newer_data/current" --version) == 'tmux-agent 0.2.0' ]]
+TMUX_AGENT_DATA_DIR="$newer_data" \
+    TMUX_AGENT_STATE_DIR="$test_root/newer-state/tmux-agent" \
+    TMUX_AGENT_RELEASE_BASE_URL="file://${release_root// /%20}" \
+    "$plugin_root/bin/tmux-agent" --version \
+    >"$test_root/newer-launcher.out"
+grep -Fx 'tmux-agent 0.2.0' "$test_root/newer-launcher.out" >/dev/null
+mv "$test_root/releases-offline" "$release_root"
+
+plugin_update_data="$test_root/plugin-update-missing/tmux-agent"
+TMUX_AGENT_DATA_DIR="$plugin_update_data" \
+    TMUX_AGENT_STATE_DIR="$test_root/plugin-update-missing-state/tmux-agent" \
+    TMUX_AGENT_RELEASE_BASE_URL="file://${release_root// /%20}" \
+    TMUX_AGENT_UNAME_S=Linux TMUX_AGENT_UNAME_M=x86_64 \
+    "$plugin_root/bin/tmux-agent" plugin update \
+    >"$test_root/plugin-update-missing.out" \
+    2>"$test_root/plugin-update-missing.err"
+grep -F "'plugin update' is deprecated" \
+    "$test_root/plugin-update-missing.err" >/dev/null
+[[ $("$plugin_update_data/current" --version) == 'tmux-agent 0.1.0' ]]
+
+incompatible_data="$test_root/incompatible/tmux-agent"
+make_managed_version "$incompatible_data" 0.2.0 2
+make_current "$incompatible_data" 0.2.0
+run_bootstrap "$incompatible_data" \
+    "$test_root/incompatible-state/tmux-agent" >/dev/null
+[[ $("$incompatible_data/current" --version) == 'tmux-agent 0.1.0' ]]
 
 stale_data="$test_root/stale/tmux-agent"
 mkdir -p "$stale_data/.install.lock"
@@ -191,6 +274,10 @@ fi
 grep -F 'non-regular entry' "$unsafe_data/install-status" >/dev/null
 
 printf '%s\n' 0.1.1 >"$plugin_root/VERSION"
+cat >"$plugin_root/COMPATIBILITY" <<'EOF'
+launcher_protocol=1
+minimum_binary_version=0.1.1
+EOF
 make_release 0.1.1 9.9.9
 if run_bootstrap "$data_dir" "$state_dir" >/dev/null 2>&1; then
     printf '%s\n' 'wrong binary version should fail' >&2
@@ -208,6 +295,10 @@ TMUX_AGENT_DAEMON_TEST_LOG="$daemon_test_log" \
     "$plugin_root/scripts/bootstrap" >/dev/null
 [[ $("$data_dir/current" --version) == 'tmux-agent 0.1.1' ]]
 grep -F 'tmux-agent 0.1.1 daemon restart' "$daemon_test_log" >/dev/null
+cat >"$plugin_root/COMPATIBILITY" <<'EOF'
+launcher_protocol=1
+minimum_binary_version=0.1.0
+EOF
 TMUX_AGENT_DATA_DIR="$data_dir" TMUX_AGENT_STATE_DIR="$state_dir" \
     "$plugin_root/bin/tmux-agent" plugin rollback 0.1.0 >/dev/null
 [[ $("$data_dir/current" --version) == 'tmux-agent 0.1.0' ]]

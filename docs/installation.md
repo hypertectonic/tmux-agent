@@ -15,8 +15,12 @@ set -g @tmux-agent-key 'A'
 
 Press `prefix + I` to install plugins. Press `prefix + A` to open tmux-agent.
 
-The launcher downloads the version recorded in the plugin's `VERSION` file,
-verifies `SHA256SUMS`, checks the reported binary version, and atomically makes
+The checkout's `COMPATIBILITY` file declares the launcher protocol and minimum
+managed-binary version it requires. If the current managed binary has that
+protocol and is at or above the minimum, the launcher keeps it, including when
+it is newer than the version in the checkout. Otherwise the launcher downloads
+the version recorded in `VERSION`, verifies `SHA256SUMS` and the reported
+binary version, publishes an immutable version directory, and atomically makes
 that binary current. It does not download an unpinned latest release.
 
 ### TPM options
@@ -78,16 +82,27 @@ pane contents.
 
 ## Update and rollback
 
+`prefix + U` remains TPM's checkout-update operation. Updating the checkout may
+raise its compatibility floor and bootstrap the pinned version only when the
+current managed binary no longer satisfies that floor.
+
 With the stable launcher:
 
 ```sh
-tmux-agent plugin update
+tmux-agent plugin update # deprecated compatibility repair
 tmux-agent plugin versions
 tmux-agent plugin rollback <version>
 ```
 
-Updates are checksum verified and activated atomically. Rollback selects an
-already installed version and restarts the daemon.
+`tmux-agent plugin update` is retained as a deprecated migration command. It
+checks the current checkout's compatibility floor and repairs an absent,
+below-minimum, or protocol-incompatible managed installation; it does not seek
+a latest release and never replaces a newer compatible binary with the
+checkout-pinned version.
+
+Rollback selects an already installed version compatible with the current
+checkout and restarts the daemon. Bootstrap and rollback serialize through the
+same installation lock and switch the `current` symlink only by atomic rename.
 
 ## Uninstall
 

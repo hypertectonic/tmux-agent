@@ -7,6 +7,7 @@ for required in \
     README.md \
     THIRD_PARTY_NOTICES.md \
     THIRD_PARTY_LICENSES.html \
+    COMPATIBILITY \
     docs/installation.md \
     docs/remote-machines.md \
     docs/troubleshooting.md \
