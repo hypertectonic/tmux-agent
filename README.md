@@ -39,6 +39,12 @@ kept in place.
 The plugin does not create a sidebar, split, window, or session. A pane where
 you run `tmux-agent ui` can be used as a user-managed sidebar.
 
+For a standalone installation, run `scripts/install`. It publishes a stable,
+versioned launcher at `~/.local/bin/tmux-agent`, keeps runtime and lifecycle
+controller selections independent, and safely upgrades older official
+launchers. Direct binaries are preserved during migration; a same-version
+binary must exactly match the verified release.
+
 See [Installation](docs/installation.md) for standalone installation, plugin
 options, update, rollback, and uninstall instructions.
 
@@ -177,8 +183,8 @@ tmux-agent daemon status
 tmux-agent daemon restart
 tmux-agent daemon stop
 tmux-agent update [--version <version>]
-tmux-agent plugin versions
-tmux-agent plugin rollback <version>
+tmux-agent versions
+tmux-agent rollback <version>
 tmux-agent paths
 ```
 
@@ -203,6 +209,8 @@ tmux-agent run -- <command> [args...]
 tmux-agent daemon start|status|restart|stop|run
 tmux-agent doctor [--json]
 tmux-agent update [--version <version>]
+tmux-agent versions
+tmux-agent rollback <version>
 tmux-agent paths
 ```
 

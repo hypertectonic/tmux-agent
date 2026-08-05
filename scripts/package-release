@@ -60,6 +60,7 @@ launcher_protocol=$(awk -F= '
 {
     printf 'launcher_protocol=%s\n' "$launcher_protocol"
     printf 'binary_version=%s\n' "$version"
+    printf '%s\n' 'management_protocol=1'
 } >"$package_dir/COMPATIBILITY"
 printf '%s\n' "$target" >"$package_dir/TARGET"
 chmod 755 "$package_dir/tmux-agent"

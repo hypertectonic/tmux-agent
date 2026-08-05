@@ -13,6 +13,7 @@ for required in \
     docs/troubleshooting.md \
     docs/architecture.md \
     scripts/install \
+    scripts/standalone-launcher \
     scripts/uninstall \
     scripts/doctor \
     scripts/check-version \
@@ -32,7 +33,7 @@ done
 cargo build --locked
 binary="$root/target/debug/tmux-agent"
 help=$("$binary" --help)
-for command in daemon list watch ui focus explain acknowledge scan run codex claude opencode pi paths doctor update; do
+for command in daemon list watch ui focus explain acknowledge scan run codex claude opencode pi paths doctor update versions rollback; do
     [[ $help == *"$command"* ]] || {
         printf 'root help does not expose documented command: %s\n' "$command" >&2
         exit 1

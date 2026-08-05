@@ -12,6 +12,16 @@ The project uses semantic versioning.
   release discovery, immutable version-pinned downloads, native package and
   checksum verification, atomic activation, restart rollback, and explicit
   exact-version prerelease updates.
+- Checkout-independent managed-version listing and fail-safe rollback commands,
+  plus direct standalone and existing TPM layout migration to the stable
+  launcher without discarding the previous binary.
+- A separately verified lifecycle controller keeps update, version listing, and
+  roll-forward recovery available after selecting a legacy runtime binary. A
+  verified newer controller is retained when the runtime moves to an older or
+  intermediate version.
+- The stable standalone launcher has a versioned ownership header, supports the
+  legacy lifecycle aliases, upgrades independently of its managed binaries, and
+  is removed safely by the uninstaller.
 
 ### Security
 
@@ -20,6 +30,11 @@ The project uses semantic versioning.
   and embedded binary versions without replacing the active binary. Network
   client configuration is isolated, and transfer, extraction, and binary
   verification work is bounded.
+- Rollback rejects missing, incompatible, non-native, symlinked, or corrupt
+  managed targets and restores the prior activation if daemon restart fails.
+- Direct-binary migration rejects symlinked store collisions and accepts a
+  same-version binary only when it exactly matches the verified release, leaving
+  custom binaries untouched.
 
 ## [0.3.0] - 2026-08-04
 

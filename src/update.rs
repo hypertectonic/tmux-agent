@@ -23,6 +23,7 @@ const CANONICAL_RELEASE_API: &str =
 const CANONICAL_RELEASE_BASE: &str =
     "https://github.com/hypertectonic/tmux-agent/releases/download";
 const LAUNCHER_PROTOCOL: u32 = 1;
+const MANAGEMENT_PROTOCOL: u32 = 1;
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
@@ -75,6 +76,19 @@ impl Platform {
 struct InstalledVersion {
     version: Version,
     link_target: PathBuf,
+}
+
+#[derive(Debug)]
+struct InstalledCompatibility {
+    launcher_protocol: u32,
+    binary_version: Version,
+    management_protocol: Option<u32>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ManagedVersions {
+    active: Version,
+    rollback: Vec<Version>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -208,30 +222,55 @@ struct FilesystemActivator;
 
 impl Activator for FilesystemActivator {
     fn activate(&self, data_dir: &Path, target: Option<&Path>) -> Result<()> {
-        let current = data_dir.join("current");
-        match target {
-            Some(target) => {
-                let temporary = unique_path(data_dir, ".current");
-                symlink(target, &temporary)
-                    .with_context(|| format!("create activation link {}", temporary.display()))?;
-                if let Err(error) = fs::rename(&temporary, &current) {
-                    let _ = fs::remove_file(&temporary);
-                    return Err(error).with_context(|| {
-                        format!("activate managed binary at {}", current.display())
-                    });
-                }
-            }
-            None => match fs::remove_file(&current) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("remove activation link {}", current.display()));
-                }
-            },
-        }
-        Ok(())
+        activate_managed_link(data_dir, "current", target)
     }
+}
+
+fn activate_manager(data_dir: &Path, target: &Path) -> Result<()> {
+    activate_managed_link(data_dir, "manager", Some(target))
+}
+
+fn activate_manager_if_newer(
+    data_dir: &Path,
+    candidate_version: &Version,
+    candidate_target: &Path,
+) -> Result<()> {
+    if read_manager_installation(data_dir)?
+        .is_some_and(|manager| manager.version >= *candidate_version)
+    {
+        return Ok(());
+    }
+    activate_manager(data_dir, candidate_target)
+}
+
+fn activate_managed_link(data_dir: &Path, name: &str, target: Option<&Path>) -> Result<()> {
+    ensure!(
+        matches!(name, "current" | "manager"),
+        "invalid managed link name"
+    );
+    let selection = data_dir.join(name);
+    match target {
+        Some(target) => {
+            let temporary = unique_path(data_dir, &format!(".{name}"));
+            symlink(target, &temporary)
+                .with_context(|| format!("create activation link {}", temporary.display()))?;
+            if let Err(error) = fs::rename(&temporary, &selection) {
+                let _ = fs::remove_file(&temporary);
+                return Err(error).with_context(|| {
+                    format!("activate managed binary at {}", selection.display())
+                });
+            }
+        }
+        None => match fs::remove_file(&selection) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("remove activation link {}", selection.display()));
+            }
+        },
+    }
+    Ok(())
 }
 
 trait Restarter {
@@ -298,6 +337,54 @@ pub fn run(requested_version: Option<&str>, config_path: Option<&Path>) -> Resul
     }
 }
 
+pub fn run_versions() -> Result<()> {
+    let data_dir = data_dir()?;
+    let platform = Platform::native()?;
+    let versions = inspect_managed_versions(&data_dir, &platform)?;
+    println!("active    {}", versions.active);
+    if versions.rollback.is_empty() {
+        println!("rollback  none");
+    } else {
+        for version in versions.rollback {
+            println!("rollback  {version}");
+        }
+    }
+    Ok(())
+}
+
+pub fn run_rollback(requested_version: &str, config_path: Option<&Path>) -> Result<()> {
+    let data_dir = data_dir()?;
+    let requested = parse_managed_version(requested_version, "rollback version")?;
+    let result = perform_rollback(
+        &requested,
+        &data_dir,
+        config_path,
+        Platform::native()?,
+        300,
+        &FilesystemActivator,
+        &CommandRestarter,
+    );
+    match result {
+        Ok(()) => {
+            println!("tmux-agent: rolled back to {requested}");
+            println!(
+                "tmux-agent: ready at {}",
+                data_dir.join("current").display()
+            );
+            Ok(())
+        }
+        Err(error) => {
+            if data_dir.is_dir() {
+                let _ = write_status(
+                    &data_dir,
+                    "FAILED|rollback failed; the previous binary was preserved",
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn perform_update(
     requested_version: Option<&str>,
@@ -312,6 +399,7 @@ fn perform_update(
     ensure_managed_dirs(data_dir)?;
     let _lock = InstallLock::acquire(data_dir, 300)?;
     let current = read_current_installation(data_dir)?;
+    let manager_ready = ensure_manager_from_current(data_dir, current.as_ref(), &platform)?;
     let installed_version = current
         .as_ref()
         .map(|installed| installed.version.clone())
@@ -325,10 +413,18 @@ fn perform_update(
 
     match version.cmp(&installed_version) {
         std::cmp::Ordering::Equal => {
+            ensure!(
+                manager_ready,
+                "no verified lifecycle controller is installed"
+            );
             write_status(data_dir, &format!("READY|{installed_version}"))?;
             return Ok(UpdateOutcome::AlreadyCurrent(installed_version));
         }
         std::cmp::Ordering::Less => {
+            ensure!(
+                manager_ready,
+                "no verified lifecycle controller is installed"
+            );
             write_status(data_dir, &format!("READY|{installed_version}"))?;
             return Ok(UpdateOutcome::NewerAlreadyCurrent {
                 current: installed_version,
@@ -367,6 +463,8 @@ fn perform_update(
     if destination.exists() {
         validate_managed_version(&destination, &version, Some(platform.target))
             .context("existing immutable version directory is invalid")?;
+        validate_management_version(&destination)
+            .context("existing immutable version is not a lifecycle controller")?;
     } else {
         fs::rename(staging.path(), &destination).with_context(|| {
             format!(
@@ -378,39 +476,23 @@ fn perform_update(
         staging.disarm();
     }
     validate_managed_version(&destination, &version, Some(platform.target))?;
+    validate_management_version(&destination)?;
 
     let new_target = PathBuf::from(format!("versions/{version}/tmux-agent"));
+    activate_manager_if_newer(data_dir, &version, &new_target)?;
     let previous_target = current
         .as_ref()
         .map(|installed| installed.link_target.as_path());
-    activator.activate(data_dir, Some(&new_target))?;
-    let finish_result = (|| -> Result<()> {
-        let active = read_current_installation(data_dir)?
-            .context("activation did not produce a managed current binary")?;
-        ensure!(
-            active.version == version,
-            "activation selected the wrong version"
-        );
-        restarter.restart(&data_dir.join("current"), config_path)?;
-        write_status(data_dir, &format!("READY|{version}"))?;
-        Ok(())
-    })();
-    if let Err(error) = finish_result {
-        let rollback_result = activator.activate(data_dir, previous_target);
-        if let Err(rollback_error) = rollback_result {
-            return Err(error).context(format!(
-                "update failed and activation rollback also failed: {rollback_error:#}"
-            ));
-        }
-        if previous_target.is_some()
-            && let Err(restart_error) = restarter.restart(&data_dir.join("current"), config_path)
-        {
-            return Err(error).context(format!(
-                "update failed; previous activation was restored but its daemon restart also failed: {restart_error:#}"
-            ));
-        }
-        return Err(error).context("update failed after activation; previous binary restored");
-    }
+    activate_and_restart(
+        data_dir,
+        &version,
+        &new_target,
+        previous_target,
+        config_path,
+        "update",
+        activator,
+        restarter,
+    )?;
 
     Ok(UpdateOutcome::Updated(version))
 }
@@ -427,6 +509,184 @@ fn parse_requested_version(value: &str) -> Result<Version> {
         "requested update version is not canonical semantic version"
     );
     Ok(version)
+}
+
+fn parse_managed_version(value: &str, description: &str) -> Result<Version> {
+    ensure!(
+        !value.starts_with('v'),
+        "{description} must not have a v prefix"
+    );
+    let version = Version::parse(value)
+        .with_context(|| format!("{description} is not valid semantic version"))?;
+    ensure!(
+        version.to_string() == value,
+        "{description} is not canonical semantic version"
+    );
+    Ok(version)
+}
+
+fn inspect_managed_versions(data_dir: &Path, platform: &Platform) -> Result<ManagedVersions> {
+    ensure!(data_dir.is_dir(), "no managed versions are installed");
+    let _lock = InstallLock::acquire(data_dir, 300)?;
+    let active =
+        read_current_installation(data_dir)?.context("no active managed version is installed")?;
+    let manager = read_manager_installation(data_dir)?
+        .context("no verified lifecycle controller is installed")?;
+    validate_managed_version(
+        &data_dir.join("versions").join(manager.version.to_string()),
+        &manager.version,
+        Some(platform.target),
+    )
+    .context("managed lifecycle controller is invalid, incompatible, or corrupt")?;
+    validate_managed_version(
+        &data_dir.join("versions").join(active.version.to_string()),
+        &active.version,
+        Some(platform.target),
+    )
+    .context("active managed version is invalid, incompatible, or corrupt")?;
+    let mut rollback = Vec::new();
+    for entry in fs::read_dir(data_dir.join("versions")).context("read managed version store")? {
+        let entry = entry.context("read managed version entry")?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("managed version directory name is not UTF-8"))?;
+        if name.starts_with('.') {
+            continue;
+        }
+        let version = parse_managed_version(&name, "managed version directory")?;
+        if version == active.version {
+            continue;
+        }
+        validate_managed_version(&entry.path(), &version, Some(platform.target)).with_context(
+            || format!("managed rollback target {version} is invalid, incompatible, or corrupt"),
+        )?;
+        rollback.push(version);
+    }
+    rollback.sort_by(|left, right| right.cmp(left));
+    Ok(ManagedVersions {
+        active: active.version,
+        rollback,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn perform_rollback(
+    requested: &Version,
+    data_dir: &Path,
+    config_path: Option<&Path>,
+    platform: Platform,
+    lock_attempts: usize,
+    activator: &dyn Activator,
+    restarter: &dyn Restarter,
+) -> Result<()> {
+    ensure!(data_dir.is_dir(), "no managed versions are installed");
+    let _lock = InstallLock::acquire(data_dir, lock_attempts)?;
+    let current =
+        read_current_installation(data_dir)?.context("no active managed version is installed")?;
+    let manager = read_manager_installation(data_dir)?
+        .context("no verified lifecycle controller is installed")?;
+    validate_managed_version(
+        &data_dir.join("versions").join(manager.version.to_string()),
+        &manager.version,
+        Some(platform.target),
+    )
+    .context("managed lifecycle controller is invalid, incompatible, or corrupt")?;
+    ensure!(
+        requested != &current.version,
+        "version {requested} is already active"
+    );
+    let destination = data_dir.join("versions").join(requested.to_string());
+    ensure!(
+        destination.exists(),
+        "rollback version {requested} is not installed"
+    );
+    validate_managed_version(&destination, requested, Some(platform.target)).with_context(
+        || format!("rollback version {requested} is invalid, incompatible, or corrupt"),
+    )?;
+    let new_target = PathBuf::from(format!("versions/{requested}/tmux-agent"));
+    write_status(data_dir, &format!("ROLLING_BACK|{requested}"))?;
+    activate_and_restart(
+        data_dir,
+        requested,
+        &new_target,
+        Some(current.link_target.as_path()),
+        config_path,
+        "rollback",
+        activator,
+        restarter,
+    )
+}
+
+fn ensure_manager_from_current(
+    data_dir: &Path,
+    current: Option<&InstalledVersion>,
+    platform: &Platform,
+) -> Result<bool> {
+    if let Some(manager) = read_manager_installation(data_dir)? {
+        validate_managed_version(
+            &data_dir.join("versions").join(manager.version.to_string()),
+            &manager.version,
+            Some(platform.target),
+        )
+        .context("managed lifecycle controller is invalid, incompatible, or corrupt")?;
+        return Ok(true);
+    }
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    let version_dir = data_dir.join("versions").join(current.version.to_string());
+    validate_managed_version(&version_dir, &current.version, Some(platform.target))?;
+    if validate_management_version(&version_dir).is_err() {
+        return Ok(false);
+    }
+    activate_manager(data_dir, &current.link_target)?;
+    read_manager_installation(data_dir)?
+        .context("lifecycle controller activation did not produce a valid manager")?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_and_restart(
+    data_dir: &Path,
+    version: &Version,
+    new_target: &Path,
+    previous_target: Option<&Path>,
+    config_path: Option<&Path>,
+    operation: &str,
+    activator: &dyn Activator,
+    restarter: &dyn Restarter,
+) -> Result<()> {
+    activator.activate(data_dir, Some(new_target))?;
+    let finish_result = (|| -> Result<()> {
+        let active = read_current_installation(data_dir)?
+            .context("activation did not produce a managed current binary")?;
+        ensure!(
+            active.version == *version,
+            "activation selected the wrong version"
+        );
+        restarter.restart(&data_dir.join("current"), config_path)?;
+        write_status(data_dir, &format!("READY|{version}"))?;
+        Ok(())
+    })();
+    if let Err(error) = finish_result {
+        if let Err(rollback_error) = activator.activate(data_dir, previous_target) {
+            return Err(error).context(format!(
+                "{operation} failed and activation rollback also failed: {rollback_error:#}"
+            ));
+        }
+        if previous_target.is_some()
+            && let Err(restart_error) = restarter.restart(&data_dir.join("current"), config_path)
+        {
+            return Err(error).context(format!(
+                "{operation} failed; previous activation was restored but its daemon restart also failed: {restart_error:#}"
+            ));
+        }
+        return Err(error).context(format!(
+            "{operation} failed after activation; previous binary restored"
+        ));
+    }
+    Ok(())
 }
 
 fn discover_latest_stable(http: &dyn HttpClient, work_dir: &Path) -> Result<Version> {
@@ -482,18 +742,36 @@ fn ensure_managed_dirs(data_dir: &Path) -> Result<()> {
 }
 
 fn read_current_installation(data_dir: &Path) -> Result<Option<InstalledVersion>> {
-    let current = data_dir.join("current");
-    let metadata = match fs::symlink_metadata(&current) {
+    read_managed_selection(data_dir, "current", false)
+}
+
+fn read_manager_installation(data_dir: &Path) -> Result<Option<InstalledVersion>> {
+    read_managed_selection(data_dir, "manager", true)
+}
+
+fn read_managed_selection(
+    data_dir: &Path,
+    name: &str,
+    require_management: bool,
+) -> Result<Option<InstalledVersion>> {
+    ensure!(
+        matches!(name, "current" | "manager"),
+        "invalid managed selection name"
+    );
+    let selection = data_dir.join(name);
+    let metadata = match fs::symlink_metadata(&selection) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("inspect {}", current.display())),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", selection.display()));
+        }
     };
     ensure!(
         metadata.file_type().is_symlink(),
-        "managed current path is not a symlink"
+        "managed {name} path is not a symlink"
     );
-    let link_target = fs::read_link(&current)
-        .with_context(|| format!("read managed link {}", current.display()))?;
+    let link_target = fs::read_link(&selection)
+        .with_context(|| format!("read managed link {}", selection.display()))?;
     let binary = if link_target.is_absolute() {
         link_target.clone()
     } else {
@@ -515,10 +793,22 @@ fn read_current_installation(data_dir: &Path) -> Result<Option<InstalledVersion>
         "managed current symlink has an unexpected target"
     );
     validate_managed_version(version_dir, &version, None)?;
+    if require_management {
+        validate_management_version(version_dir)?;
+    }
     Ok(Some(InstalledVersion {
         version,
         link_target,
     }))
+}
+
+fn validate_management_version(version_dir: &Path) -> Result<()> {
+    let compatibility = read_compatibility(&version_dir.join("COMPATIBILITY"))?;
+    ensure!(
+        compatibility.management_protocol == Some(MANAGEMENT_PROTOCOL),
+        "managed binary does not provide the required lifecycle controller"
+    );
+    Ok(())
 }
 
 fn validate_managed_version(
@@ -526,29 +816,54 @@ fn validate_managed_version(
     expected_version: &Version,
     expected_target: Option<&str>,
 ) -> Result<()> {
+    let directory_metadata = fs::symlink_metadata(version_dir).with_context(|| {
+        format!(
+            "inspect managed version directory {}",
+            version_dir.display()
+        )
+    })?;
+    ensure!(
+        directory_metadata.file_type().is_dir(),
+        "managed version path is not a real directory"
+    );
     let binary = version_dir.join("tmux-agent");
+    ensure_regular_file(&binary, "managed binary")?;
     let reported = binary_version(&binary)?;
     ensure!(
         &reported == expected_version,
         "managed binary reports the wrong version"
     );
-    let (protocol, metadata_version) = read_compatibility(&version_dir.join("COMPATIBILITY"))?;
+    let compatibility = version_dir.join("COMPATIBILITY");
+    ensure_regular_file(&compatibility, "managed compatibility metadata")?;
+    let compatibility = read_compatibility(&compatibility)?;
     ensure!(
-        protocol == LAUNCHER_PROTOCOL,
+        compatibility.launcher_protocol == LAUNCHER_PROTOCOL,
         "managed binary uses an incompatible launcher protocol"
     );
     ensure!(
-        &metadata_version == expected_version,
+        &compatibility.binary_version == expected_version,
         "managed compatibility metadata has the wrong version"
     );
     if let Some(target) = expected_target {
-        let recorded_target = fs::read_to_string(version_dir.join("TARGET"))
-            .context("read managed target metadata")?;
+        let target_path = version_dir.join("TARGET");
+        ensure_regular_file(&target_path, "managed target metadata")?;
+        let recorded_target =
+            fs::read_to_string(target_path).context("read managed target metadata")?;
         ensure!(
             recorded_target == target || recorded_target == format!("{target}\n"),
             "managed version records the wrong platform target"
         );
     }
+    Ok(())
+}
+
+fn ensure_regular_file(path: &Path, description: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {description} at {}", path.display()))?;
+    ensure!(
+        metadata.file_type().is_file(),
+        "{description} is not a regular file"
+    );
     Ok(())
 }
 
@@ -662,11 +977,12 @@ fn terminate_process_group(process_group: u32) {
     }
 }
 
-fn read_compatibility(path: &Path) -> Result<(u32, Version)> {
+fn read_compatibility(path: &Path) -> Result<InstalledCompatibility> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("read compatibility metadata {}", path.display()))?;
     let mut protocol = None;
     let mut version = None;
+    let mut management_protocol = None;
     for line in contents.lines() {
         if let Some(value) = line.strip_prefix("launcher_protocol=") {
             ensure!(protocol.is_none(), "duplicate launcher protocol metadata");
@@ -678,14 +994,25 @@ fn read_compatibility(path: &Path) -> Result<(u32, Version)> {
         } else if let Some(value) = line.strip_prefix("binary_version=") {
             ensure!(version.is_none(), "duplicate binary version metadata");
             version = Some(Version::parse(value).context("invalid binary version metadata")?);
+        } else if let Some(value) = line.strip_prefix("management_protocol=") {
+            ensure!(
+                management_protocol.is_none(),
+                "duplicate management protocol metadata"
+            );
+            management_protocol = Some(
+                value
+                    .parse::<u32>()
+                    .context("invalid management protocol metadata")?,
+            );
         } else {
             bail!("unexpected compatibility metadata");
         }
     }
-    Ok((
-        protocol.context("missing launcher protocol metadata")?,
-        version.context("missing binary version metadata")?,
-    ))
+    Ok(InstalledCompatibility {
+        launcher_protocol: protocol.context("missing launcher protocol metadata")?,
+        binary_version: version.context("missing binary version metadata")?,
+        management_protocol,
+    })
 }
 
 fn verify_checksum(archive: &Path, sums: &Path, archive_name: &str) -> Result<()> {
@@ -783,7 +1110,9 @@ fn extract_and_verify_archive(
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
     validate_managed_version(staging, version, Some(target))
-        .context("release archive metadata or binary does not match the request")
+        .context("release archive metadata or binary does not match the request")?;
+    validate_management_version(staging)
+        .context("release archive does not provide lifecycle management")
 }
 
 fn checked_extracted_size(current: u64, name: &str, entry_size: u64) -> Result<u64> {
@@ -1101,8 +1430,10 @@ mod tests {
         append_regular(
             &mut builder,
             "COMPATIBILITY",
-            format!("launcher_protocol={LAUNCHER_PROTOCOL}\nbinary_version={release_version}\n")
-                .as_bytes(),
+            format!(
+                "launcher_protocol={LAUNCHER_PROTOCOL}\nbinary_version={release_version}\nmanagement_protocol={MANAGEMENT_PROTOCOL}\n"
+            )
+            .as_bytes(),
             0o644,
         );
         append_regular(
@@ -1171,21 +1502,44 @@ mod tests {
         client
     }
 
-    fn install_current(data_dir: &Path, current_version: &str) {
-        let version_dir = data_dir.join("versions").join(current_version);
+    fn install_version(data_dir: &Path, installed_version: &str) {
+        let version_dir = data_dir.join("versions").join(installed_version);
         fs::create_dir_all(&version_dir).unwrap();
         let binary = version_dir.join("tmux-agent");
-        fs::write(&binary, shell_binary(current_version)).unwrap();
+        fs::write(&binary, shell_binary(installed_version)).unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(
             version_dir.join("COMPATIBILITY"),
-            format!("launcher_protocol={LAUNCHER_PROTOCOL}\nbinary_version={current_version}\n"),
+            format!(
+                "launcher_protocol={LAUNCHER_PROTOCOL}\nbinary_version={installed_version}\nmanagement_protocol={MANAGEMENT_PROTOCOL}\n"
+            ),
         )
         .unwrap();
+        fs::write(version_dir.join("TARGET"), format!("{TEST_TARGET}\n")).unwrap();
+    }
+
+    fn install_current(data_dir: &Path, current_version: &str) {
+        install_version(data_dir, current_version);
         fs::create_dir_all(data_dir).unwrap();
         symlink(
             format!("versions/{current_version}/tmux-agent"),
             data_dir.join("current"),
+        )
+        .unwrap();
+        symlink(
+            format!("versions/{current_version}/tmux-agent"),
+            data_dir.join("manager"),
+        )
+        .unwrap();
+    }
+
+    fn mark_legacy(data_dir: &Path, installed_version: &str) {
+        fs::write(
+            data_dir
+                .join("versions")
+                .join(installed_version)
+                .join("COMPATIBILITY"),
+            format!("launcher_protocol={LAUNCHER_PROTOCOL}\nbinary_version={installed_version}\n"),
         )
         .unwrap();
     }
@@ -1193,6 +1547,16 @@ mod tests {
     fn assert_current(data_dir: &Path, expected: &str) {
         assert_eq!(
             read_current_installation(data_dir)
+                .unwrap()
+                .unwrap()
+                .version,
+            version(expected)
+        );
+    }
+
+    fn assert_manager(data_dir: &Path, expected: &str) {
+        assert_eq!(
+            read_manager_installation(data_dir)
                 .unwrap()
                 .unwrap()
                 .version,
@@ -1231,6 +1595,13 @@ mod tests {
             UpdateOutcome::Updated(version("0.4.0"))
         );
         assert_current(&data_dir, "0.4.0");
+        assert_manager(&data_dir, "0.4.0");
+        validate_managed_version(
+            &data_dir.join("versions/0.3.0"),
+            &version("0.3.0"),
+            Some(TEST_TARGET),
+        )
+        .unwrap();
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests[0], CANONICAL_RELEASE_API);
         assert!(requests[1..].iter().all(|url| {
@@ -1244,10 +1615,205 @@ mod tests {
     }
 
     #[test]
+    fn update_keeps_a_newer_verified_lifecycle_controller() {
+        let root = TempDir::new().unwrap();
+        let data_dir = root.path().join("managed");
+        install_current(&data_dir, "0.3.0");
+        install_version(&data_dir, "0.5.0");
+        fs::remove_file(data_dir.join("manager")).unwrap();
+        symlink("versions/0.5.0/tmux-agent", data_dir.join("manager")).unwrap();
+        let client = client_for_latest("0.4.0");
+
+        assert_eq!(
+            run_default(
+                &data_dir,
+                &client,
+                &FilesystemActivator,
+                &RecordingRestarter::default()
+            )
+            .unwrap(),
+            UpdateOutcome::Updated(version("0.4.0"))
+        );
+        assert_current(&data_dir, "0.4.0");
+        assert_manager(&data_dir, "0.5.0");
+    }
+
+    #[test]
+    fn versions_distinguish_the_active_version_and_sorted_rollback_targets() {
+        let root = TempDir::new().unwrap();
+        let data_dir = root.path().join("managed");
+        install_current(&data_dir, "0.4.0");
+        install_version(&data_dir, "0.2.0");
+        install_version(&data_dir, "0.3.0");
+
+        assert_eq!(
+            inspect_managed_versions(&data_dir, &platform()).unwrap(),
+            ManagedVersions {
+                active: version("0.4.0"),
+                rollback: vec![version("0.3.0"), version("0.2.0")],
+            }
+        );
+    }
+
+    #[test]
+    fn rollback_activates_an_installed_older_version_and_restarts_with_config() {
+        let root = TempDir::new().unwrap();
+        let data_dir = root.path().join("managed");
+        let config_path = root.path().join("custom config.toml");
+        install_current(&data_dir, "0.4.0");
+        install_version(&data_dir, "0.3.0");
+        mark_legacy(&data_dir, "0.3.0");
+        let restarter = RecordingRestarter::default();
+
+        perform_rollback(
+            &version("0.3.0"),
+            &data_dir,
+            Some(&config_path),
+            platform(),
+            300,
+            &FilesystemActivator,
+            &restarter,
+        )
+        .unwrap();
+
+        assert_current(&data_dir, "0.3.0");
+        assert_manager(&data_dir, "0.4.0");
+        assert_eq!(
+            *restarter.calls.lock().unwrap(),
+            vec![(version("0.3.0"), Some(config_path))]
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_missing_invalid_incompatible_and_corrupt_targets() {
+        let root = TempDir::new().unwrap();
+        let data_dir = root.path().join("managed");
+        install_current(&data_dir, "0.4.0");
+
+        let run = |requested: &str| {
+            perform_rollback(
+                &version(requested),
+                &data_dir,
+                None,
+                platform(),
+                300,
+                &FilesystemActivator,
+                &RecordingRestarter::default(),
+            )
+        };
+
+        assert!(
+            run("0.3.0")
+                .unwrap_err()
+                .to_string()
+                .contains("not installed")
+        );
+
+        install_version(&data_dir, "0.3.0");
+        fs::write(
+            data_dir.join("versions/0.3.0/COMPATIBILITY"),
+            "launcher_protocol=2\nbinary_version=0.3.0\n",
+        )
+        .unwrap();
+        assert!(
+            run("0.3.0")
+                .unwrap_err()
+                .to_string()
+                .contains("incompatible")
+        );
+
+        fs::write(
+            data_dir.join("versions/0.3.0/COMPATIBILITY"),
+            format!("launcher_protocol={LAUNCHER_PROTOCOL}\nbinary_version=0.3.0\n"),
+        )
+        .unwrap();
+        fs::write(data_dir.join("versions/0.3.0/TARGET"), "wrong-target\n").unwrap();
+        assert!(run("0.3.0").unwrap_err().to_string().contains("corrupt"));
+
+        fs::write(
+            data_dir.join("versions/0.3.0/TARGET"),
+            format!("{TEST_TARGET}\n"),
+        )
+        .unwrap();
+        fs::write(
+            data_dir.join("versions/0.3.0/tmux-agent"),
+            shell_binary("9.9.9"),
+        )
+        .unwrap();
+        assert!(run("0.3.0").unwrap_err().to_string().contains("corrupt"));
+        assert_current(&data_dir, "0.4.0");
+    }
+
+    #[test]
+    fn rollback_activation_and_restart_failures_preserve_the_previous_version() {
+        let root = TempDir::new().unwrap();
+        let data_dir = root.path().join("managed");
+        install_current(&data_dir, "0.4.0");
+        install_version(&data_dir, "0.3.0");
+
+        assert!(
+            perform_rollback(
+                &version("0.3.0"),
+                &data_dir,
+                None,
+                platform(),
+                300,
+                &FailOnceActivator::new(),
+                &RecordingRestarter::default(),
+            )
+            .is_err()
+        );
+        assert_current(&data_dir, "0.4.0");
+
+        let restarter = RecordingRestarter::fail_once();
+        assert!(
+            perform_rollback(
+                &version("0.3.0"),
+                &data_dir,
+                None,
+                platform(),
+                300,
+                &FilesystemActivator,
+                &restarter,
+            )
+            .is_err()
+        );
+        assert_current(&data_dir, "0.4.0");
+        assert_eq!(
+            *restarter.calls.lock().unwrap(),
+            vec![(version("0.3.0"), None), (version("0.4.0"), None)]
+        );
+    }
+
+    #[test]
+    fn rollback_serializes_on_the_shared_installation_lock() {
+        let root = TempDir::new().unwrap();
+        let data_dir = root.path().join("managed");
+        install_current(&data_dir, "0.4.0");
+        install_version(&data_dir, "0.3.0");
+        let _held = InstallLock::acquire(&data_dir, 1).unwrap();
+
+        let error = perform_rollback(
+            &version("0.3.0"),
+            &data_dir,
+            None,
+            platform(),
+            1,
+            &FilesystemActivator,
+            &RecordingRestarter::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("installation lock"));
+        assert_current(&data_dir, "0.4.0");
+    }
+
+    #[test]
     fn current_version_is_a_clear_no_op_without_asset_downloads() {
         let root = TempDir::new().unwrap();
         let data_dir = root.path().join("managed");
         install_current(&data_dir, "0.4.0");
+        fs::remove_file(data_dir.join("manager")).unwrap();
         let client = client_for_latest("0.4.0");
         let restarter = RecordingRestarter::default();
 
@@ -1261,6 +1827,7 @@ mod tests {
         );
         assert!(restarter.calls.lock().unwrap().is_empty());
         assert_current(&data_dir, "0.4.0");
+        assert_manager(&data_dir, "0.4.0");
     }
 
     #[test]

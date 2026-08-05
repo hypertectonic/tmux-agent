@@ -49,11 +49,23 @@ scripts/install
 ```
 
 The installer selects the native archive, verifies it, and installs it under
-the tmux-agent data directory. Use `--no-restart` when no running daemon should
+the tmux-agent data directory. It atomically installs a checkout-independent
+launcher at `~/.local/bin/tmux-agent`; set `TMUX_AGENT_INSTALL_PATH` to choose
+another exact launcher path. Use `--no-restart` when no running daemon should
 be restarted.
 
-The stable launcher is `bin/tmux-agent`. Add it to `PATH` or invoke it by its
-absolute path.
+If that launcher path already contains a direct standalone tmux-agent binary,
+the installer copies and verifies it under `versions/<version>` while holding
+the shared installation lock. The original version remains an available
+recovery target. The direct path is replaced with the stable launcher only
+after a compatible managed binary is active. A failed migration leaves the
+direct binary untouched. When the direct binary and checkout have the same
+version, the binary must be byte-identical to the checksum-verified release;
+a custom same-version build is left untouched and the installation fails
+closed. Symlinked store collisions, launcher-path symlinks, and unrelated files
+are refused rather than overwritten. An older official launcher is recognized
+by its exact versioned format header and upgraded atomically without being
+misclassified as a direct binary.
 
 ## Build from source
 
@@ -91,9 +103,11 @@ With the stable launcher:
 ```sh
 tmux-agent update
 tmux-agent update --version <version>
-tmux-agent plugin update # deprecated compatibility repair
-tmux-agent plugin versions
-tmux-agent plugin rollback <version>
+tmux-agent versions
+tmux-agent rollback <version>
+tmux-agent plugin update # deprecated; behavior depends on launcher type
+tmux-agent plugin versions # legacy alias
+tmux-agent plugin rollback <version> # legacy alias
 ```
 
 `tmux-agent update` is the packaged-binary update path. It needs no Git
@@ -116,17 +130,36 @@ requested older version never replaces a newer current binary. When `--config`
 is supplied, the same configuration is used for both the updated daemon restart
 and any rollback restart.
 
-`tmux-agent plugin update` is retained as a deprecated migration command. It
-checks the current checkout's compatibility floor and repairs an absent,
-below-minimum, or protocol-incompatible managed installation; it does not seek
-a latest release and never replaces a newer compatible binary with the
-checkout-pinned version.
+`tmux-agent plugin update` is retained as a deprecated migration command. Under
+the TPM checkout launcher it checks the checkout's compatibility floor and
+repairs an absent, below-minimum, or protocol-incompatible managed installation;
+it does not seek a latest release and never replaces a newer compatible binary
+with the checkout-pinned version. The checkout-independent standalone launcher
+has no checkout to repair, so its exact `plugin update` alias delegates to
+packaged `tmux-agent update`. The legacy aliases enforce their documented
+argument counts.
 
-Rollback selects an already installed version compatible with the current
-checkout and restarts the daemon. Bootstrap and rollback serialize through the
-same installation lock and switch the `current` symlink only by atomic rename.
-TPM's `prefix + U` updates only the plugin checkout; it does not replace
-`tmux-agent update` or select a packaged binary release.
+`tmux-agent versions` identifies the active version and lists the other
+verified native versions as available rollback targets. `tmux-agent rollback`
+revalidates the selected directory, metadata, platform, and embedded binary
+version while holding the same installation lock used by bootstrap and update.
+It switches the `current` symlink only by atomic rename and restarts the daemon.
+Activation or restart failure restores the previously active version.
+The stable launcher routes only `update`, `versions`, and `rollback` (including
+forms preceded by global `--config`) through the separately verified `manager`
+selection. All normal commands continue through `current`. Rollback never moves
+`manager`, so lifecycle commands remain available even when the selected
+runtime predates those commands. Update and bootstrap also keep a verified
+`manager` whose version is newer than the candidate, preventing controller
+downgrades while allowing `current` to move independently.
+
+The legacy `plugin versions` and `plugin rollback` forms delegate to these
+packaged commands; the TPM checkout no longer owns a separate rollback
+implementation. TPM's `prefix + U` updates only the plugin checkout; it does
+not replace `tmux-agent update` or select a packaged binary release. Existing
+TPM-managed stores are reused without moving `current` back under checkout
+control. Bootstrap installs or repairs a missing controller under the shared
+lock and refuses an invalid existing `manager` link rather than guessing.
 
 ## Uninstall
 
@@ -138,6 +171,11 @@ scripts/uninstall
 
 Use `scripts/uninstall --purge` only when runtime state, acknowledgements, and
 all managed versions should also be removed.
+
+The uninstaller also removes the standalone launcher at
+`TMUX_AGENT_INSTALL_PATH` (default `~/.local/bin/tmux-agent`) only when it is a
+regular executable with the exact managed-launcher format header. Unrelated
+executables and symlinks at that path are reported and retained.
 
 ## Install with a coding agent
 
