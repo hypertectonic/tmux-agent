@@ -100,7 +100,13 @@ the candidate.
 Bootstrap holds `~/.local/share/tmux-agent/.install.lock` (under the configured
 data directory) while it rechecks compatibility, publishes a complete version
 directory, and atomically renames a relative `current` symlink. Rollback uses
-the same lock and Rust activation/restart-recovery operation as update. The
+the same lock and Rust activation/restart-recovery operation as update. Under
+that lock, bootstrap can add native target and launcher metadata to the exact
+pre-self-update TPM layout: an in-store, metadata-absent `current` runtime with
+no `manager`. It publishes `TARGET` first and `COMPATIBILITY` as the commit
+point, so an exact `TARGET`-only interruption is rerunnable without granting
+the legacy runtime management capability. Other partial or ambiguous layouts
+fail closed. The
 packaged `tmux-agent update`
 command also uses this contract without reading a checkout: mutable GitHub
 metadata is used only to discover and validate the latest stable semantic

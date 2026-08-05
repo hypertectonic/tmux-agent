@@ -23,6 +23,12 @@ The project uses semantic versioning.
   legacy lifecycle aliases, upgrades independently of its managed binaries, and
   is removed safely by the uninstaller.
 
+### Fixed
+
+- Preserve a validated metadata-absent pre-self-update TPM runtime as a native
+  rollback target without moving `current` or granting it lifecycle-controller
+  capability; ambiguous and partially published layouts fail closed.
+
 ### Security
 
 - Release archives now carry platform and launcher compatibility metadata, and

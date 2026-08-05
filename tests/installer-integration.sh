@@ -151,6 +151,15 @@ make_current() {
     fi
 }
 
+make_legacy_tpm_current() {
+    local data_dir=$1
+    local version=$2
+    make_managed_version "$data_dir" "$version" 1 0
+    rm "$data_dir/versions/$version/COMPATIBILITY" \
+        "$data_dir/versions/$version/TARGET"
+    ln -s "versions/$version/tmux-agent" "$data_dir/current"
+}
+
 run_bootstrap() {
     local data_dir=$1
     local state_dir=$2
@@ -366,6 +375,147 @@ cat >"$plugin_root/COMPATIBILITY" <<'EOF'
 launcher_protocol=1
 minimum_binary_version=0.1.0
 EOF
+
+legacy_tpm_data="$test_root/legacy-tpm/tmux-agent"
+legacy_tpm_state="$test_root/legacy-tpm-state/tmux-agent"
+make_legacy_tpm_current "$legacy_tpm_data" 0.1.0
+run_bootstrap "$legacy_tpm_data" "$legacy_tpm_state" >/dev/null
+[[ $(readlink "$legacy_tpm_data/current") == 'versions/0.1.0/tmux-agent' ]]
+[[ $(readlink "$legacy_tpm_data/manager") == 'versions/0.1.1/tmux-agent' ]]
+[[ $(cat "$legacy_tpm_data/versions/0.1.0/TARGET") == x86_64-unknown-linux-gnu ]]
+grep -Fx 'launcher_protocol=1' \
+    "$legacy_tpm_data/versions/0.1.0/COMPATIBILITY" >/dev/null
+grep -Fx 'binary_version=0.1.0' \
+    "$legacy_tpm_data/versions/0.1.0/COMPATIBILITY" >/dev/null
+if grep -q '^management_protocol=' \
+    "$legacy_tpm_data/versions/0.1.0/COMPATIBILITY"; then
+    printf '%s\n' 'legacy TPM migration granted lifecycle-controller capability' >&2
+    exit 1
+fi
+legacy_versions=$(TMUX_AGENT_DATA_DIR="$legacy_tpm_data" \
+    "$plugin_root/bin/tmux-agent" versions)
+[[ $legacy_versions == *'0.1.0'* && $legacy_versions == *'0.1.1'* ]]
+TMUX_AGENT_DATA_DIR="$legacy_tpm_data" TMUX_AGENT_STATE_DIR="$legacy_tpm_state" \
+    "$plugin_root/bin/tmux-agent" rollback 0.1.1 >/dev/null
+[[ $(readlink "$legacy_tpm_data/current") == 'versions/0.1.1/tmux-agent' ]]
+[[ $(readlink "$legacy_tpm_data/manager") == 'versions/0.1.1/tmux-agent' ]]
+TMUX_AGENT_DATA_DIR="$legacy_tpm_data" TMUX_AGENT_STATE_DIR="$legacy_tpm_state" \
+    "$plugin_root/bin/tmux-agent" rollback 0.1.0 >/dev/null
+[[ $(readlink "$legacy_tpm_data/current") == 'versions/0.1.0/tmux-agent' ]]
+[[ $(readlink "$legacy_tpm_data/manager") == 'versions/0.1.1/tmux-agent' ]]
+
+legacy_resume_data="$test_root/legacy-resume/tmux-agent"
+make_legacy_tpm_current "$legacy_resume_data" 0.1.0
+printf '%s\n' x86_64-unknown-linux-gnu \
+    >"$legacy_resume_data/versions/0.1.0/TARGET"
+run_bootstrap "$legacy_resume_data" \
+    "$test_root/legacy-resume-state/tmux-agent" >/dev/null
+grep -Fx 'binary_version=0.1.0' \
+    "$legacy_resume_data/versions/0.1.0/COMPATIBILITY" >/dev/null
+
+assert_legacy_tpm_rejected() {
+    local description=$1
+    local data_dir=$2
+    local state_dir=$3
+    local original_current
+    original_current=$(readlink "$data_dir/current")
+    if run_bootstrap "$data_dir" "$state_dir" >/dev/null 2>&1; then
+        printf 'legacy TPM migration accepted %s\n' "$description" >&2
+        exit 1
+    fi
+    [[ $(readlink "$data_dir/current") == "$original_current" ]]
+    [[ ! -e $data_dir/manager && ! -L $data_dir/manager ]]
+}
+
+legacy_partial_data="$test_root/legacy-partial/tmux-agent"
+make_legacy_tpm_current "$legacy_partial_data" 0.1.0
+cat >"$legacy_partial_data/versions/0.1.0/COMPATIBILITY" <<'EOF'
+launcher_protocol=1
+binary_version=0.1.0
+EOF
+assert_legacy_tpm_rejected 'COMPATIBILITY-only partial metadata' \
+    "$legacy_partial_data" "$test_root/legacy-partial-state/tmux-agent"
+[[ ! -e $legacy_partial_data/versions/0.1.0/TARGET ]]
+
+legacy_wrong_target_data="$test_root/legacy-wrong-target/tmux-agent"
+make_legacy_tpm_current "$legacy_wrong_target_data" 0.1.0
+printf '%s\n' aarch64-unknown-linux-gnu \
+    >"$legacy_wrong_target_data/versions/0.1.0/TARGET"
+assert_legacy_tpm_rejected 'mismatched resumable target metadata' \
+    "$legacy_wrong_target_data" \
+    "$test_root/legacy-wrong-target-state/tmux-agent"
+[[ ! -e $legacy_wrong_target_data/versions/0.1.0/COMPATIBILITY ]]
+
+legacy_below_floor_data="$test_root/legacy-below-floor/tmux-agent"
+make_legacy_tpm_current "$legacy_below_floor_data" 0.0.9
+assert_legacy_tpm_rejected 'a binary below the checkout compatibility floor' \
+    "$legacy_below_floor_data" \
+    "$test_root/legacy-below-floor-state/tmux-agent"
+[[ ! -e $legacy_below_floor_data/versions/0.0.9/TARGET ]]
+
+legacy_newer_data="$test_root/legacy-newer/tmux-agent"
+make_legacy_tpm_current "$legacy_newer_data" 0.2.0
+printf '%s\n' 0.1.0 >"$plugin_root/VERSION"
+assert_legacy_tpm_rejected 'a legacy binary newer than the checkout candidate' \
+    "$legacy_newer_data" "$test_root/legacy-newer-state/tmux-agent"
+[[ ! -e $legacy_newer_data/versions/0.2.0/TARGET ]]
+[[ ! -e $legacy_newer_data/versions/0.2.0/COMPATIBILITY ]]
+printf '%s\n' 0.1.1 >"$plugin_root/VERSION"
+
+legacy_equal_precedence_data="$test_root/legacy-equal-precedence/tmux-agent"
+make_legacy_tpm_current "$legacy_equal_precedence_data" 0.2.0
+printf '%s\n' 0.2.0+candidate >"$plugin_root/VERSION"
+assert_legacy_tpm_rejected 'equal-precedence build metadata' \
+    "$legacy_equal_precedence_data" \
+    "$test_root/legacy-equal-precedence-state/tmux-agent"
+[[ ! -e $legacy_equal_precedence_data/versions/0.2.0/TARGET ]]
+[[ ! -e $legacy_equal_precedence_data/versions/0.2.0/COMPATIBILITY ]]
+printf '%s\n' 0.1.1 >"$plugin_root/VERSION"
+
+legacy_candidate_floor_data="$test_root/legacy-candidate-floor/tmux-agent"
+make_legacy_tpm_current "$legacy_candidate_floor_data" 0.2.0
+cat >"$plugin_root/COMPATIBILITY" <<'EOF'
+launcher_protocol=1
+minimum_binary_version=0.2.0
+EOF
+assert_legacy_tpm_rejected 'a checkout below its own compatibility floor' \
+    "$legacy_candidate_floor_data" \
+    "$test_root/legacy-candidate-floor-state/tmux-agent"
+[[ ! -e $legacy_candidate_floor_data/versions/0.2.0/TARGET ]]
+cat >"$plugin_root/COMPATIBILITY" <<'EOF'
+launcher_protocol=1
+minimum_binary_version=0.1.0
+EOF
+
+legacy_manager_data="$test_root/legacy-manager/tmux-agent"
+make_legacy_tpm_current "$legacy_manager_data" 0.1.0
+ln -s versions/0.1.0/tmux-agent "$legacy_manager_data/manager"
+if run_bootstrap "$legacy_manager_data" \
+    "$test_root/legacy-manager-state/tmux-agent" >/dev/null 2>&1; then
+    printf '%s\n' 'legacy TPM migration accepted an existing manager selection' >&2
+    exit 1
+fi
+[[ ! -e $legacy_manager_data/versions/0.1.0/TARGET ]]
+
+legacy_outside_data="$test_root/legacy-outside/tmux-agent"
+legacy_outside_version="$test_root/legacy-outside-version/versions/0.1.0"
+make_managed_version "$test_root/legacy-outside-version" 0.1.0 1 0
+rm "$legacy_outside_version/COMPATIBILITY" "$legacy_outside_version/TARGET"
+mkdir -p "$legacy_outside_data"
+ln -s "$legacy_outside_version/tmux-agent" "$legacy_outside_data/current"
+assert_legacy_tpm_rejected 'an out-of-store current target' \
+    "$legacy_outside_data" "$test_root/legacy-outside-state/tmux-agent"
+
+legacy_symlink_data="$test_root/legacy-symlink/tmux-agent"
+legacy_symlink_external="$test_root/legacy-symlink-external/tmux-agent"
+make_legacy_tpm_current "$legacy_symlink_external" 0.1.0
+mkdir -p "$legacy_symlink_data/versions"
+ln -s "$legacy_symlink_external/versions/0.1.0" \
+    "$legacy_symlink_data/versions/0.1.0"
+ln -s versions/0.1.0/tmux-agent "$legacy_symlink_data/current"
+assert_legacy_tpm_rejected 'a symlinked version directory' \
+    "$legacy_symlink_data" "$test_root/legacy-symlink-state/tmux-agent"
+
 TMUX_AGENT_DATA_DIR="$data_dir" TMUX_AGENT_STATE_DIR="$state_dir" \
     "$plugin_root/bin/tmux-agent" plugin rollback 0.1.0 >/dev/null
 [[ $("$data_dir/current" --version) == 'tmux-agent 0.1.0' ]]

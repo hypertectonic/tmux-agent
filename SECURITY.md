@@ -61,6 +61,11 @@ reproduction.
   `current`, so selecting a legacy runtime cannot make lifecycle recovery depend
   on that runtime. Bootstrap and update never replace a verified controller with
   an older candidate. Invalid controller links or metadata fail closed.
+- Legacy TPM metadata migration accepts only a canonical, executable in-store
+  `current` runtime at or above the checkout compatibility floor when `manager`
+  and both metadata files are absent. An exact native `TARGET`-only state is the
+  sole resumable interruption; other partial, symlinked, or ambiguous states
+  fail closed, and migrated runtimes are not marked management-capable.
 - The standalone launcher's exact three-line format marker is the ownership
   boundary for in-place launcher upgrades and removal. Uninstall leaves
   unrelated executables and every symlink at the configured launcher path
