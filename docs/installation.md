@@ -159,7 +159,12 @@ implementation. TPM's `prefix + U` updates only the plugin checkout; it does
 not replace `tmux-agent update` or select a packaged binary release. Existing
 TPM-managed stores are reused without moving `current` back under checkout
 control. Bootstrap installs or repairs a missing controller under the shared
-lock and refuses an invalid existing `manager` link rather than guessing.
+lock and refuses an invalid existing `manager` link rather than guessing. A
+pre-self-update TPM runtime that has the exact in-store legacy layout, meets the
+checkout compatibility floor, and has no `manager` is preserved as a rollback
+target by adding only its native target and launcher metadata. Partial,
+symlinked, out-of-store, same-version, or otherwise ambiguous legacy layouts
+are not migrated.
 
 ## Uninstall
 

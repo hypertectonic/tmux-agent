@@ -5,6 +5,178 @@ TMUX_AGENT_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 export TMUX_AGENT_ROOT
 . "$TMUX_AGENT_ROOT/scripts/lib.sh"
 
+migrate_legacy_tpm_current() (
+    data_dir=$1
+    versions_dir=$2
+    candidate_version=$3
+    contract=$4
+    current_path="$data_dir/current"
+
+    if [ ! -e "$current_path" ] && [ ! -L "$current_path" ]; then
+        exit 0
+    fi
+    if [ ! -L "$current_path" ]; then
+        tmux_agent_write_status "FAILED|managed current selection is not a symlink"
+        exit 1
+    fi
+    current_target=$(readlink "$current_path" 2>/dev/null) || {
+        tmux_agent_write_status "FAILED|managed current selection is unreadable"
+        exit 1
+    }
+    case "$current_target" in
+        versions/*)
+            current_suffix=${current_target#versions/}
+            ;;
+        "$data_dir"/versions/*)
+            current_suffix=${current_target#"$data_dir"/versions/}
+            ;;
+        *)
+            tmux_agent_write_status "FAILED|managed current selection is outside the version store"
+            exit 1
+            ;;
+    esac
+    case "$current_suffix" in
+        */tmux-agent) legacy_version=${current_suffix%/tmux-agent} ;;
+        *)
+            tmux_agent_write_status "FAILED|managed current selection has an invalid target"
+            exit 1
+            ;;
+    esac
+    case "$legacy_version" in
+        '' | */*)
+            tmux_agent_write_status "FAILED|managed current version directory is invalid"
+            exit 1
+            ;;
+    esac
+    if ! tmux_agent_version_at_least "$legacy_version" "$legacy_version"; then
+        tmux_agent_write_status "FAILED|managed current version is not canonical semantic versioning"
+        exit 1
+    fi
+    expected_relative="versions/$legacy_version/tmux-agent"
+    expected_absolute="$data_dir/$expected_relative"
+    case "$current_target" in
+        "$expected_relative" | "$expected_absolute") ;;
+        *)
+            tmux_agent_write_status "FAILED|managed current selection has an invalid target"
+            exit 1
+            ;;
+    esac
+
+    version_dir="$versions_dir/$legacy_version"
+    binary_path="$version_dir/tmux-agent"
+    compatibility_path="$version_dir/COMPATIBILITY"
+    target_path="$version_dir/TARGET"
+    if [ ! -d "$version_dir" ] || [ -L "$version_dir" ] ||
+        [ ! -f "$binary_path" ] || [ -L "$binary_path" ] ||
+        [ ! -x "$binary_path" ]; then
+        tmux_agent_write_status "FAILED|managed current binary is not a real in-store executable"
+        exit 1
+    fi
+    reported_version=$(tmux_agent_binary_version "$binary_path") || {
+        tmux_agent_write_status "FAILED|managed current binary reports an invalid version"
+        exit 1
+    }
+    if [ "$reported_version" != "$legacy_version" ]; then
+        tmux_agent_write_status "FAILED|managed current binary version does not match its directory"
+        exit 1
+    fi
+
+    compatibility_present=0
+    target_present=0
+    if [ -e "$compatibility_path" ] || [ -L "$compatibility_path" ]; then
+        compatibility_present=1
+        if [ ! -f "$compatibility_path" ] || [ -L "$compatibility_path" ]; then
+            tmux_agent_write_status "FAILED|managed current compatibility metadata is invalid"
+            exit 1
+        fi
+    fi
+    if [ -e "$target_path" ] || [ -L "$target_path" ]; then
+        target_present=1
+        if [ ! -f "$target_path" ] || [ -L "$target_path" ]; then
+            tmux_agent_write_status "FAILED|managed current target metadata is invalid"
+            exit 1
+        fi
+    fi
+
+    if [ "$compatibility_present" -eq 1 ]; then
+        if [ "$target_present" -eq 0 ]; then
+            tmux_agent_write_status "FAILED|managed current metadata is only partially published"
+            exit 1
+        fi
+        native_target=$(tmux_agent_target) || {
+            tmux_agent_write_status "FAILED|managed current platform is unsupported"
+            exit 1
+        }
+        if ! awk -v expected="$native_target" '
+            NR == 1 && $0 == expected { found = 1; next }
+            { exit 1 }
+            END { if (!found) exit 1 }
+        ' "$target_path"; then
+            tmux_agent_write_status "FAILED|managed current target metadata does not match"
+            exit 1
+        fi
+        metadata=$(tmux_agent_version_compatibility "$version_dir" || true)
+        if [ -z "$metadata" ] || [ "${metadata#*|}" != "$legacy_version" ]; then
+            tmux_agent_write_status "FAILED|managed current compatibility metadata does not match"
+            exit 1
+        fi
+        # Normal bootstrap compatibility repair below handles a complete
+        # version whose launcher protocol differs from this checkout.
+        exit 0
+    fi
+
+    if [ -e "$data_dir/manager" ] || [ -L "$data_dir/manager" ]; then
+        tmux_agent_write_status \
+            "FAILED|metadata-absent current binary has an unexpected lifecycle controller"
+        exit 1
+    fi
+    if [ "$legacy_version" = "$candidate_version" ]; then
+        tmux_agent_write_status "FAILED|metadata-absent current binary matches the checkout version"
+        exit 1
+    fi
+    if ! tmux_agent_version_at_least "$candidate_version" "$legacy_version" ||
+        tmux_agent_version_at_least "$legacy_version" "$candidate_version"; then
+        tmux_agent_write_status \
+            "FAILED|checkout version is not newer than the metadata-absent current binary"
+        exit 1
+    fi
+    minimum_version=${contract#*|}
+    if ! tmux_agent_version_at_least "$candidate_version" "$minimum_version"; then
+        tmux_agent_write_status \
+            "FAILED|checkout version is below its compatibility floor"
+        exit 1
+    fi
+    if ! tmux_agent_version_at_least "$legacy_version" "$minimum_version"; then
+        tmux_agent_write_status \
+            "FAILED|metadata-absent current binary is below the checkout compatibility floor"
+        exit 1
+    fi
+    native_target=$(tmux_agent_target) || {
+        tmux_agent_write_status "FAILED|managed current platform is unsupported"
+        exit 1
+    }
+    if [ "$target_present" -eq 1 ] &&
+        ! awk -v expected="$native_target" '
+            NR == 1 && $0 == expected { found = 1; next }
+            { exit 1 }
+            END { if (!found) exit 1 }
+        ' "$target_path"; then
+        tmux_agent_write_status "FAILED|managed current target metadata does not match"
+        exit 1
+    fi
+
+    if [ "$target_present" -eq 0 ]; then
+        target_tmp="$version_dir/.legacy-target.$$"
+        trap 'rm -f -- "$target_tmp"' EXIT HUP INT TERM
+        printf '%s\n' "$native_target" >"$target_tmp"
+        chmod 600 "$target_tmp"
+        mv -f "$target_tmp" "$target_path"
+        trap - EXIT HUP INT TERM
+        target_tmp=
+    fi
+    tmux_agent_write_version_compatibility "$version_dir" "$legacy_version"
+)
+
 restart_daemon=1
 case "${1:-}" in
     '')
@@ -89,6 +261,12 @@ if ! tmux_agent_install_lock_acquire; then
     exit 1
 fi
 lock_owned=1
+
+contract=$(tmux_agent_compatibility_contract) || {
+    tmux_agent_write_status "FAILED|checkout compatibility contract is invalid"
+    exit 1
+}
+migrate_legacy_tpm_current "$data_dir" "$versions_dir" "$version" "$contract"
 
 old_current=$(readlink "$data_dir/current" 2>/dev/null || true)
 preserve_current=0
@@ -184,10 +362,6 @@ if [ "$migration_same_version" -eq 0 ] && tmux_agent_current_binary_compatible; 
     preserve_current=1
 fi
 
-contract=$(tmux_agent_compatibility_contract) || {
-    tmux_agent_write_status "FAILED|checkout compatibility contract is invalid"
-    exit 1
-}
 minimum_version=${contract#*|}
 if ! tmux_agent_version_at_least "$version" "$minimum_version"; then
     tmux_agent_write_status \
