@@ -30,7 +30,12 @@ interactive operations but should not start a background collector.
 
 ## Setup order
 
-1. Install the new version on remote machines.
+1. Log in to each remote machine and update it locally. tmux-agent does not
+   orchestrate remote updates:
+
+   ```sh
+   tmux-agent update
+   ```
 2. Verify each remote directly:
 
    ```sh

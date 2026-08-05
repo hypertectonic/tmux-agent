@@ -86,10 +86,22 @@ its own `COMPATIBILITY` metadata. Compatibility requires all of the following:
 Bootstrap holds `~/.local/share/tmux-agent/.install.lock` (under the configured
 data directory) while it rechecks compatibility, publishes a complete version
 directory, and atomically renames a relative `current` symlink. Rollback uses
-the same lock and activation operation. Thus an older checkout treats a newer
-binary with the same launcher protocol as current and cannot replace it with
-the checkout-pinned fallback. A missing, below-minimum, corrupt, or
-protocol-incompatible managed binary is repaired from that pinned fallback.
+the same lock and activation operation. The packaged `tmux-agent update`
+command also uses this contract without reading a checkout: mutable GitHub
+metadata is used only to discover and validate the latest stable semantic
+version, while archive and `SHA256SUMS` downloads use immutable version-pinned
+URLs. Release archives carry explicit target and launcher compatibility
+metadata in addition to the binary version. All entries must be regular files
+from a fixed allowlist and remain within transfer and expansion bounds before
+an immutable version directory is published. Binary-version probes are also
+time- and output-bounded.
+
+Thus an older checkout treats a newer binary with the same launcher protocol
+as current and cannot replace it with the checkout-pinned fallback. A missing,
+below-minimum, corrupt, or protocol-incompatible managed binary is repaired
+from that pinned fallback. Self-update activates only a completely verified
+version, restarts the daemon afterward, and restores the previous activation
+if the restart fails.
 
 This launcher protocol is separate from the daemon federation protocol. TPM's
 `prefix + U` continues to update the plugin checkout; it is not a managed-binary

@@ -194,6 +194,19 @@ if rg -n 'releases/(latest|download/latest)|/latest/' \
     "$root/scripts/launch-popup" "$root/bin" "$root/tmux-agent.tmux"; then
     fail 'plugin installation contains an unpinned latest-release URL'
 fi
+if [ -f "$root/src/update.rs" ]; then
+    if ! rg -Fq \
+        'https://api.github.com/repos/hypertectonic/tmux-agent/releases/latest' \
+        "$root/src/update.rs" ||
+        ! rg -Fq \
+            'https://github.com/hypertectonic/tmux-agent/releases/download' \
+            "$root/src/update.rs"; then
+        fail 'self-update does not use the canonical GitHub release endpoints'
+    fi
+    if rg -n 'releases/(latest/download|download/latest)' "$root/src/update.rs"; then
+        fail 'self-update contains a mutable latest-release asset URL'
+    fi
+fi
 
 "$root/scripts/check-version" >/dev/null || failed=1
 "$root/scripts/check-public-tree" >/dev/null || failed=1

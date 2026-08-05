@@ -34,7 +34,7 @@ expected_version="tmux-agent $version"
     exit 1
 }
 for required in README.md LICENSE THIRD_PARTY_NOTICES.md \
-    THIRD_PARTY_LICENSES.html; do
+    THIRD_PARTY_LICENSES.html COMPATIBILITY; do
     [ -s "$root/$required" ] || {
         printf 'release input is missing or empty: %s\n' "$root/$required" >&2
         exit 1
@@ -50,12 +50,25 @@ trap cleanup EXIT HUP INT TERM
 cp "$binary" "$package_dir/tmux-agent"
 cp "$root/README.md" "$root/LICENSE" "$root/THIRD_PARTY_NOTICES.md" \
     "$root/THIRD_PARTY_LICENSES.html" "$package_dir/"
+launcher_protocol=$(awk -F= '
+    /^launcher_protocol=[1-9][0-9]*$/ { if (found) exit 1; found = 1; print $2 }
+    END { if (!found) exit 1 }
+' "$root/COMPATIBILITY") || {
+    printf '%s\n' 'release compatibility contract is invalid' >&2
+    exit 1
+}
+{
+    printf 'launcher_protocol=%s\n' "$launcher_protocol"
+    printf 'binary_version=%s\n' "$version"
+} >"$package_dir/COMPATIBILITY"
+printf '%s\n' "$target" >"$package_dir/TARGET"
 chmod 755 "$package_dir/tmux-agent"
 chmod 644 "$package_dir/README.md" "$package_dir/LICENSE" \
     "$package_dir/THIRD_PARTY_NOTICES.md" \
-    "$package_dir/THIRD_PARTY_LICENSES.html"
+    "$package_dir/THIRD_PARTY_LICENSES.html" "$package_dir/COMPATIBILITY" \
+    "$package_dir/TARGET"
 mkdir -p "$output_dir"
 tar -czf "$output_dir/$asset" -C "$package_dir" \
     tmux-agent README.md LICENSE THIRD_PARTY_NOTICES.md \
-    THIRD_PARTY_LICENSES.html
+    THIRD_PARTY_LICENSES.html COMPATIBILITY TARGET
 printf '%s\n' "$output_dir/$asset"

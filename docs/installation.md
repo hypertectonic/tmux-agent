@@ -89,10 +89,32 @@ current managed binary no longer satisfies that floor.
 With the stable launcher:
 
 ```sh
+tmux-agent update
+tmux-agent update --version <version>
 tmux-agent plugin update # deprecated compatibility repair
 tmux-agent plugin versions
 tmux-agent plugin rollback <version>
 ```
+
+`tmux-agent update` is the packaged-binary update path. It needs no Git
+checkout, Rust toolchain, GitHub CLI, browser, or GitHub credentials. By
+default it reads the latest stable release metadata from the canonical public
+GitHub repository over HTTPS. It validates the release tag, constructs
+immutable version-pinned archive and checksum URLs, verifies the native target,
+checksum, archive allowlist, compatibility metadata, and embedded binary
+version, then stages the release in the managed version store and atomically
+activates it. Implicit curl/wget configuration and netrc credentials are
+disabled, and downloads, extraction, and binary probes are bounded. A
+prerelease is accepted only when its exact semantic version is provided with
+`--version`.
+
+The daemon is restarted only after activation succeeds. If discovery,
+download, verification, staging, activation, or restart fails, the previous
+`current` binary remains usable; a restart failure also restores the previous
+activation. Re-running at the current version is a no-op, and a discovered or
+requested older version never replaces a newer current binary. When `--config`
+is supplied, the same configuration is used for both the updated daemon restart
+and any rollback restart.
 
 `tmux-agent plugin update` is retained as a deprecated migration command. It
 checks the current checkout's compatibility floor and repairs an absent,
@@ -103,6 +125,8 @@ checkout-pinned version.
 Rollback selects an already installed version compatible with the current
 checkout and restarts the daemon. Bootstrap and rollback serialize through the
 same installation lock and switch the `current` symlink only by atomic rename.
+TPM's `prefix + U` updates only the plugin checkout; it does not replace
+`tmux-agent update` or select a packaged binary release.
 
 ## Uninstall
 

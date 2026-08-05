@@ -40,6 +40,14 @@ reproduction.
 - Remote transcript content is transmitted only through an explicitly opened
   read-only SSH viewer and is not persisted on the central machine.
 - The project does not install aliases or replace provider executables.
+- Packaged updates discover only a validated stable semantic version from the
+  canonical public repository, download assets through immutable version-pinned
+  HTTPS URLs, and verify their checksum, file allowlist, platform metadata,
+  launcher protocol, and embedded binary version before atomic activation.
+  Implicit curl/wget configuration and netrc credentials are disabled, and
+  transfer, extraction, and binary-version probes have explicit bounds.
+- Update failures preserve the previous usable binary; a daemon restart
+  failure restores the previous activation.
 
 These boundaries are security invariants. Changes that weaken them require
 explicit design review and documentation.

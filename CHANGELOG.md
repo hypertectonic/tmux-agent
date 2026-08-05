@@ -6,6 +6,21 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+### Added
+
+- A checkout-independent `tmux-agent update` command with anonymous stable
+  release discovery, immutable version-pinned downloads, native package and
+  checksum verification, atomic activation, restart rollback, and explicit
+  exact-version prerelease updates.
+
+### Security
+
+- Release archives now carry platform and launcher compatibility metadata, and
+  self-update rejects unsafe entries, mismatched checksums, targets, protocols,
+  and embedded binary versions without replacing the active binary. Network
+  client configuration is isolated, and transfer, extraction, and binary
+  verification work is bounded.
+
 ## [0.3.0] - 2026-08-04
 
 ### Added

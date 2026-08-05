@@ -45,9 +45,14 @@ always prove its current activity. Run the provider inside tmux or through
 ## The daemon uses an old version
 
 ```sh
+tmux-agent update
 tmux-agent daemon restart
 tmux-agent doctor
 ```
+
+If update fails, the prior managed binary remains active. Inspect the reported
+verification or network error, then re-run `tmux-agent update`; completed
+versions are immutable and re-running the current version is a no-op.
 
 If the plugin launcher and direct shell command resolve different binaries,
 use `tmux-agent paths` and `command -v tmux-agent` to compare them.

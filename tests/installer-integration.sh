@@ -62,9 +62,14 @@ EOF
     printf '%s\n' license >"$package_dir/LICENSE"
     printf '%s\n' notices >"$package_dir/THIRD_PARTY_NOTICES.md"
     printf '%s\n' licenses >"$package_dir/THIRD_PARTY_LICENSES.html"
+    cat >"$package_dir/COMPATIBILITY" <<EOF
+launcher_protocol=1
+binary_version=$version
+EOF
+    printf '%s\n' x86_64-unknown-linux-gnu >"$package_dir/TARGET"
     tar -czf "$release_dir/$asset" -C "$package_dir" \
         tmux-agent README.md LICENSE THIRD_PARTY_NOTICES.md \
-        THIRD_PARTY_LICENSES.html
+        THIRD_PARTY_LICENSES.html COMPATIBILITY TARGET
     printf '%s  %s\n' "$(checksum "$release_dir/$asset")" "$asset" \
         >"$release_dir/SHA256SUMS"
 }
@@ -184,6 +189,13 @@ printf '%s\n' 999999 >"$stale_data/.install.lock/pid"
 run_bootstrap "$stale_data" "$test_root/stale-state/tmux-agent" >/dev/null
 [[ $("$stale_data/current" --version) == 'tmux-agent 0.1.0' ]]
 
+incomplete_lock_data="$test_root/incomplete-lock/tmux-agent"
+mkdir -p "$incomplete_lock_data/.install.lock"
+TMUX_AGENT_INCOMPLETE_LOCK_GRACE_ATTEMPTS=1 \
+    run_bootstrap "$incomplete_lock_data" \
+    "$test_root/incomplete-lock-state/tmux-agent" >/dev/null
+[[ $("$incomplete_lock_data/current" --version) == 'tmux-agent 0.1.0' ]]
+
 concurrent_data="$test_root/concurrent/tmux-agent"
 run_bootstrap "$concurrent_data" "$test_root/concurrent-state/tmux-agent" >/dev/null &
 first_pid=$!
@@ -255,10 +267,15 @@ cp "$test_root/package-0.1.0-0.1.0/tmux-agent" "$unsafe_package/tmux-agent"
 printf '%s\n' readme >"$unsafe_package/README.md"
 printf '%s\n' notices >"$unsafe_package/THIRD_PARTY_NOTICES.md"
 printf '%s\n' licenses >"$unsafe_package/THIRD_PARTY_LICENSES.html"
+cat >"$unsafe_package/COMPATIBILITY" <<'EOF'
+launcher_protocol=1
+binary_version=0.1.0
+EOF
+printf '%s\n' x86_64-unknown-linux-gnu >"$unsafe_package/TARGET"
 ln -s /etc/passwd "$unsafe_package/LICENSE"
 tar -czf "$unsafe_release_root/v0.1.0/$unsafe_asset" -C "$unsafe_package" \
     tmux-agent README.md LICENSE THIRD_PARTY_NOTICES.md \
-    THIRD_PARTY_LICENSES.html
+    THIRD_PARTY_LICENSES.html COMPATIBILITY TARGET
 printf '%s  %s\n' \
     "$(checksum "$unsafe_release_root/v0.1.0/$unsafe_asset")" "$unsafe_asset" \
     >"$unsafe_release_root/v0.1.0/SHA256SUMS"
