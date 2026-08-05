@@ -146,6 +146,17 @@ This launcher protocol is separate from the daemon federation protocol. TPM's
 `prefix + U` continues to update the plugin checkout; it is not a managed-binary
 update command.
 
+The release lifecycle gate combines these component contracts without giving
+one component another's authority. Rust tests exercise update discovery,
+downgrade prevention, locking, verification, atomic activation, daemon restart
+recovery, version selection, and rollback. Shell integration tests exercise
+bootstrap and both launchers. The release workflow then uses the checksum-pinned
+public v0.3.0 packages and a genuinely newer candidate package to exercise
+fresh and upgrade layouts in standalone and TPM modes on every supported
+release target. The v0.3.0 runtime remains `current` during TPM checkout
+migration while the candidate becomes `manager`; lifecycle commands therefore
+remain available after rolling back to a runtime that predates them.
+
 ## SSH federation
 
 A structured machine produces a hardened command equivalent to:
@@ -160,6 +171,11 @@ The central daemon verifies protocol compatibility, namespaces remote IDs with
 the configured alias, merges derived records, and removes them when the stream
 fails. SSH provides encryption, authentication, host keys, and routing. There
 is no application TCP listener or shared application credential.
+
+Remote lifecycle changes remain outside the federation protocol. A user may
+run `tmux-agent update`, `versions`, or `rollback` through an ordinary explicit
+SSH command, but neither the central daemon nor a configured peer can initiate
+that command.
 
 Federation snapshots never include captured pane contents, screen buffers,
 prompts, reasoning, rollout events, goal objectives, or raw process command

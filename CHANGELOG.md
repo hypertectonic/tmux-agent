@@ -22,6 +22,10 @@ The project uses semantic versioning.
 - The stable standalone launcher has a versioned ownership header, supports the
   legacy lifecycle aliases, upgrades independently of its managed binaries, and
   is removed safely by the uninstaller.
+- A cross-target release lifecycle gate validates fresh standalone and TPM
+  installs plus direct-binary and checksum-pinned v0.3.0 TPM upgrades. Public
+  guidance now covers explicit update, migration, rollback, failure recovery,
+  checkout ownership, and user-controlled SSH procedures.
 
 ### Fixed
 

@@ -1831,6 +1831,30 @@ mod tests {
     }
 
     #[test]
+    fn older_release_is_a_clear_no_op_without_asset_downloads() {
+        let root = TempDir::new().unwrap();
+        let data_dir = root.path().join("managed");
+        install_current(&data_dir, "0.4.0");
+        let client = client_for_latest("0.3.0");
+        let restarter = RecordingRestarter::default();
+
+        assert_eq!(
+            run_default(&data_dir, &client, &FilesystemActivator, &restarter).unwrap(),
+            UpdateOutcome::NewerAlreadyCurrent {
+                current: version("0.4.0"),
+                requested: version("0.3.0"),
+            }
+        );
+        assert_eq!(
+            *client.requests.lock().unwrap(),
+            vec![CANONICAL_RELEASE_API]
+        );
+        assert!(restarter.calls.lock().unwrap().is_empty());
+        assert_current(&data_dir, "0.4.0");
+        assert_manager(&data_dir, "0.4.0");
+    }
+
+    #[test]
     fn rerunning_a_successful_update_is_idempotent() {
         let root = TempDir::new().unwrap();
         let data_dir = root.path().join("managed");

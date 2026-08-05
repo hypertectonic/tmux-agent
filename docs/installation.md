@@ -98,6 +98,12 @@ pane contents.
 raise its compatibility floor and bootstrap the pinned version only when the
 current managed binary no longer satisfies that floor.
 
+Use the same checkout entrypoint for an initial TPM install and a checkout
+upgrade. Use `scripts/install` for an initial standalone install or to migrate
+a pre-launcher direct binary. Once either mode has a managed launcher, use the
+packaged lifecycle commands below for binary releases; reinstalling a checkout
+is not the normal binary-update path.
+
 With the stable launcher:
 
 ```sh
@@ -165,6 +171,13 @@ checkout compatibility floor, and has no `manager` is preserved as a rollback
 target by adding only its native target and launcher metadata. Partial,
 symlinked, out-of-store, same-version, or otherwise ambiguous legacy layouts
 are not migrated.
+
+The release-candidate gate tests fresh standalone and TPM stores separately.
+It also tests a direct standalone upgrade and the exact metadata-absent TPM
+store produced by the public v0.3.0 release against a genuinely newer
+candidate. The gate pins the four v0.3.0 archive checksums and rejects a
+same-version candidate instead of presenting reinstall coverage as a
+cross-version upgrade.
 
 ## Uninstall
 

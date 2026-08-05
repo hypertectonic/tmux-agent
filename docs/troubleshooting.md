@@ -57,6 +57,46 @@ versions are immutable and re-running the current version is a no-op.
 If the plugin launcher and direct shell command resolve different binaries,
 use `tmux-agent paths` and `command -v tmux-agent` to compare them.
 
+## An update was interrupted or failed verification
+
+Discovery, download, checksum, archive, target, compatibility, and embedded
+version failures leave the prior `current` selection active. Do not move files
+inside the managed store manually. Correct the network or release-input error,
+then run:
+
+```sh
+tmux-agent update
+tmux-agent versions
+```
+
+Temporary `.update-*` and `.staging-*` directories are cleaned on normal error
+paths. A completed immutable version directory is revalidated and reused. If a
+daemon restart failed, update restores the prior activation and attempts to
+restart that binary; use `tmux-agent daemon status` and `tmux-agent doctor`
+before retrying.
+
+## A lifecycle command is waiting for the installation lock
+
+Bootstrap, update, version listing, and rollback serialize on
+`~/.local/share/tmux-agent/.install.lock` (or the configured data directory).
+Let the other operation finish and retry. A lock owned by a dead process is
+recovered automatically; an incomplete lock is given a grace period so a
+concurrent process publishing its owner is not mistaken for stale state. Do
+not remove a lock held by a live process.
+
+## A pre-self-update TPM installation does not migrate
+
+The automatic migration recognizes only the exact v0.3-style layout: `current`
+must select a real executable under `versions/<version>`, both `TARGET` and
+`COMPATIBILITY` must be absent (or the exact resumable `TARGET` state may be
+present), and `manager` must be absent. The binary must be older than the new
+checkout and meet its compatibility floor.
+
+Partial metadata, an existing invalid manager, symlinks inside the version
+directory, an out-of-store selection, and ambiguous same-version binaries fail
+closed. Preserve the reported state and install from a current trusted
+checkout; do not add metadata or rewrite `current` by hand.
+
 ## A remote peer is disconnected
 
 Verify SSH independently:
@@ -98,8 +138,10 @@ tmux-agent rollback <version>
 Rollback uses an already installed, verified native version. It refuses a
 missing, active, incompatible, symlinked, or corrupt target. If daemon restart
 fails after activation, the previously active version is restored and
-restarted. Legacy `plugin versions` and `plugin rollback` commands delegate to
-the same packaged implementation. If the launcher reports that no verified
-lifecycle controller is available, run `scripts/install` from a current trusted
-checkout; an existing malformed `manager` link is rejected rather than
-silently replaced.
+restarted. Check `tmux-agent daemon status`; if both restart attempts fail, the
+reported activation still identifies which binary was restored, and the error
+reports the second failure explicitly. Legacy `plugin versions` and `plugin
+rollback` commands delegate to the same packaged implementation. If the
+launcher reports that no verified lifecycle controller is available, run
+`scripts/install` from a current trusted checkout; an existing malformed
+`manager` link is rejected rather than silently replaced.

@@ -12,6 +12,7 @@ for required in \
     docs/remote-machines.md \
     docs/troubleshooting.md \
     docs/architecture.md \
+    docs/release-checklist.md \
     scripts/install \
     scripts/standalone-launcher \
     scripts/uninstall \
@@ -22,6 +23,7 @@ for required in \
     scripts/check-third-party-licenses \
     scripts/check-release-readiness \
     scripts/package-release \
+    tests/release-lifecycle-smoke.sh \
     bin/tmux-agent \
     tmux-agent.tmux; do
     [[ -e $root/$required ]] || {
@@ -76,7 +78,54 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir -p "$test_root/runtime" "$test_root/state" "$test_root/config" \
-    "$test_root/home"
+    "$test_root/home" "$test_root/ssh-bin" "$test_root/remote/bin"
+
+for documented_remote_command in update versions --version rollback; do
+    rg -F "tmux-agent $documented_remote_command" \
+        "$root/docs/remote-machines.md" >/dev/null || {
+        printf 'remote guide does not document explicit %s execution\n' \
+            "$documented_remote_command" >&2
+        exit 1
+    }
+done
+[[ $(rg -c 'ssh -T agent@build-host\.example\.ts\.net' \
+    "$root/docs/remote-machines.md") -ge 4 ]]
+
+cat >"$test_root/ssh-bin/ssh" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$#" -eq 3 ] && [ "$1" = -T ] && [ "$2" = fixture-host ] || {
+    printf '%s\n' 'unexpected explicit SSH test arguments' >&2
+    exit 2
+}
+printf '%s\n' "$2|$3" >>"${TMUX_AGENT_SSH_TEST_LOG:?}"
+exec sh -c "$3"
+EOF
+cat >"$test_root/remote/bin/tmux-agent" <<'EOF'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"${TMUX_AGENT_REMOTE_TEST_LOG:?}"
+case "${1:-}" in
+    update) printf '%s\n' 'tmux-agent: updated to fixture' ;;
+    versions) printf '%s\n' 'active    fixture' ;;
+    --version) printf '%s\n' 'tmux-agent fixture' ;;
+    rollback) [ "$#" -eq 2 ] ;;
+    *) exit 2 ;;
+esac
+EOF
+chmod +x "$test_root/ssh-bin/ssh" "$test_root/remote/bin/tmux-agent"
+remote_agent="$test_root/remote/bin/tmux-agent"
+for remote_command in update versions --version 'rollback previous'; do
+    PATH="$test_root/ssh-bin:$PATH" \
+        TMUX_AGENT_SSH_TEST_LOG="$test_root/ssh.log" \
+        TMUX_AGENT_REMOTE_TEST_LOG="$test_root/remote.log" \
+        ssh -T fixture-host "$remote_agent $remote_command" >/dev/null
+done
+[[ $(wc -l <"$test_root/ssh.log" | tr -d ' ') == 4 ]]
+grep -Fx 'update' "$test_root/remote.log" >/dev/null
+grep -Fx 'versions' "$test_root/remote.log" >/dev/null
+grep -Fx -- '--version' "$test_root/remote.log" >/dev/null
+grep -Fx 'rollback previous' "$test_root/remote.log" >/dev/null
 
 TMUX_AGENT_ROOT="$root" \
     XDG_RUNTIME_DIR="$test_root/runtime" \
