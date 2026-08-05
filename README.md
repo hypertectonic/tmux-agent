@@ -48,6 +48,30 @@ binary must exactly match the verified release.
 See [Installation](docs/installation.md) for standalone installation, plugin
 options, update, rollback, and uninstall instructions.
 
+## Update and rollback
+
+The packaged binary owns its lifecycle in both installation modes:
+
+```sh
+tmux-agent update
+tmux-agent versions
+tmux-agent rollback <version>
+```
+
+`tmux-agent update` installs a newer verified release, `versions` shows the
+active and available recovery versions, and `rollback` selects an already
+installed version. Normal release updates are user-initiated: tmux-agent does
+not poll for releases, update on a schedule, or issue lifecycle commands on an
+SSH peer.
+
+For TPM installations, `prefix + U` updates the plugin checkout rather than
+seeking the latest binary release. Loading that checkout may run its narrow
+compatibility repair: when `current` is absent, below the checkout's floor, or
+protocol-incompatible, bootstrap verifies and activates the checkout-pinned
+binary. Under the TPM launcher, deprecated `tmux-agent plugin update` runs that
+same compatibility repair. Under the checkout-independent standalone launcher,
+the legacy alias instead delegates to packaged `tmux-agent update`.
+
 ## Supported platforms
 
 | Platform | Release target | Support |
@@ -243,6 +267,10 @@ The fresh-install test builds a context from tracked files only, creates real
 release archives, and exercises standalone and tmux plugin installation as a
 non-root user in clean ARM64 and AMD64 Linux containers. Docker is required
 for this release-candidate test.
+
+The [release checklist](docs/release-checklist.md) defines the cross-version
+self-update gate, including the real v0.3.0 layout fixture and all four release
+targets.
 
 Architecture and protocol details are in
 [Architecture](docs/architecture.md). Contributions are described in

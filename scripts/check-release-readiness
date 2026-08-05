@@ -64,6 +64,7 @@ for required in \
     docs/remote-machines.md \
     docs/troubleshooting.md \
     docs/architecture.md \
+    docs/release-checklist.md \
     docs/dependency-licenses.md \
     docs/assets/ui-overview.svg \
     .github/CODEOWNERS \
@@ -93,6 +94,7 @@ for executable in \
     scripts/check-release-readiness \
     scripts/export-public-snapshot \
     scripts/package-release \
+    tests/release-lifecycle-smoke.sh \
     tests/run-shell-tests; do
     require_executable "$executable"
 done
@@ -189,6 +191,37 @@ if ! rg -Fq "tmux-agent v$version" "$root/RELEASE_NOTES.md"; then
 fi
 if ! rg -Fq 'merge-base --is-ancestor' "$root/.github/workflows/release.yml"; then
     fail 'release workflow does not require the tagged commit on main'
+fi
+if ! rg -Fq 'tests/release-lifecycle-smoke.sh' \
+    "$root/.github/workflows/release.yml"; then
+    fail 'release workflow does not run the cross-version lifecycle smoke test'
+fi
+if ! rg -Fq 'gh release download v0.3.0' \
+    "$root/.github/workflows/release.yml"; then
+    fail 'release workflow does not fetch the immutable v0.3.0 lifecycle baseline'
+fi
+for target in \
+    aarch64-apple-darwin \
+    x86_64-apple-darwin \
+    x86_64-unknown-linux-gnu \
+    aarch64-unknown-linux-gnu; do
+    if ! rg -Fq "target: $target" "$root/.github/workflows/ci.yml" ||
+        ! rg -Fq "target: $target" "$root/.github/workflows/release.yml"; then
+        fail "supported release target is missing from CI or release smoke: $target"
+    fi
+done
+for command in 'tmux-agent update' 'tmux-agent versions' 'tmux-agent rollback'; do
+    if ! rg -Fq "$command" "$root/docs/release-checklist.md"; then
+        fail "release checklist does not cover $command"
+    fi
+done
+if ! rg -Fq 'same-version' "$root/docs/release-checklist.md" ||
+    ! rg -Fq 'v0.3.0' "$root/docs/release-checklist.md"; then
+    fail 'release checklist does not distinguish the historical upgrade gate'
+fi
+if ! rg -Fq 'ssh -T agent@build-host.example.ts.net' \
+    "$root/docs/remote-machines.md"; then
+    fail 'remote guide does not use explicit user-controlled SSH lifecycle commands'
 fi
 if rg -n 'releases/(latest|download/latest)|/latest/' \
     "$root/scripts/bootstrap" "$root/scripts/install" "$root/scripts/lib.sh" \

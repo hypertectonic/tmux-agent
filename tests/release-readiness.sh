@@ -30,6 +30,7 @@ for file in \
     docs/remote-machines.md \
     docs/troubleshooting.md \
     docs/architecture.md \
+    docs/release-checklist.md \
     docs/dependency-licenses.md \
     docs/assets/ui-overview.svg \
     .github/ISSUE_TEMPLATE/feature.yml \
@@ -52,11 +53,21 @@ permissions:
   contents: read
 steps:
   - run: git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+  - run: gh release download v0.3.0
+  - run: tests/release-lifecycle-smoke.sh
   - run: gh release create "$TAG" --draft --notes-file RELEASE_NOTES.md
+# target: aarch64-apple-darwin
+# target: x86_64-apple-darwin
+# target: x86_64-unknown-linux-gnu
+# target: aarch64-unknown-linux-gnu
 EOF
 cat >"$fixture/.github/workflows/ci.yml" <<'EOF'
 permissions:
   contents: read
+# target: aarch64-apple-darwin
+# target: x86_64-apple-darwin
+# target: x86_64-unknown-linux-gnu
+# target: aarch64-unknown-linux-gnu
 EOF
 cat >"$fixture/Cargo.toml" <<'EOF'
 [package]
@@ -88,6 +99,16 @@ Follow the deterministic installation procedure.
 Licensed under MIT.
 EOF
 printf '%s\n' 'tmux-agent vfixture' >"$fixture/RELEASE_NOTES.md"
+cat >"$fixture/docs/release-checklist.md" <<'EOF'
+The v0.3.0 cross-version gate rejects a same-version fixture.
+
+tmux-agent update
+tmux-agent versions
+tmux-agent rollback <version>
+EOF
+cat >"$fixture/docs/remote-machines.md" <<'EOF'
+ssh -T agent@build-host.example.ts.net 'tmux-agent update'
+EOF
 
 cat >"$test_root/pass" <<'EOF'
 #!/bin/sh
@@ -111,11 +132,27 @@ for executable in \
     scripts/check-release-readiness \
     scripts/export-public-snapshot \
     scripts/package-release \
+    tests/release-lifecycle-smoke.sh \
     tests/run-shell-tests; do
     cp "$test_root/pass" "$fixture/$executable"
 done
 
 "$source_root/scripts/check-release-readiness" "$fixture" >/dev/null
+
+cp "$fixture/.github/workflows/release.yml" \
+    "$test_root/release-workflow.original"
+sed -i.bak '/tests\/release-lifecycle-smoke\.sh/d' \
+    "$fixture/.github/workflows/release.yml"
+rm -f "$fixture/.github/workflows/release.yml.bak"
+if "$source_root/scripts/check-release-readiness" "$fixture" \
+    >"$test_root/lifecycle.out" 2>"$test_root/lifecycle.err"; then
+    printf '%s\n' 'missing lifecycle smoke should fail release readiness' >&2
+    exit 1
+fi
+grep -F 'release workflow does not run the cross-version lifecycle smoke test' \
+    "$test_root/lifecycle.err" >/dev/null
+cp "$test_root/release-workflow.original" \
+    "$fixture/.github/workflows/release.yml"
 
 printf '%s\n' '<github-owner>' >>"$fixture/README.md"
 if "$source_root/scripts/check-release-readiness" "$fixture" \

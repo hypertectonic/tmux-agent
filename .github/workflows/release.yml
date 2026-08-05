@@ -178,47 +178,19 @@ jobs:
             --dir "draft-assets/v$version" \
             --pattern "tmux-agent-v${version}-${{ matrix.target }}.tar.gz" \
             --pattern SHA256SUMS
-      - name: Install and verify without Rust
+      - name: Download immutable v0.3.0 lifecycle baseline
         env:
-          TMUX_AGENT_DATA_DIR: ${{ runner.temp }}/tmux-agent-data/tmux-agent
-          TMUX_AGENT_STATE_DIR: ${{ runner.temp }}/tmux-agent-state/tmux-agent
-          XDG_CONFIG_HOME: ${{ runner.temp }}/tmux-agent-config
-          XDG_RUNTIME_DIR: ${{ runner.temp }}/tmux-agent-runtime
-          XDG_STATE_HOME: ${{ runner.temp }}/tmux-agent-xdg-state
+          GH_TOKEN: ${{ github.token }}
         run: |
-          release_root="file://$PWD/draft-assets"
-          env PATH=/usr/bin:/bin \
-            TMUX_AGENT_RELEASE_BASE_URL="$release_root" \
-            scripts/install --no-restart
-          expected=$(scripts/check-version)
-          actual=$(bin/tmux-agent --version)
-          test "$actual" = "tmux-agent $expected"
-          bin/tmux-agent daemon start
-          bin/tmux-agent daemon status
-          bin/tmux-agent doctor --json
-      - name: Exercise the TPM entrypoint without Rust
-        env:
-          TMUX_AGENT_DATA_DIR: ${{ runner.temp }}/tmux-agent-data/tmux-agent
-          TMUX_AGENT_STATE_DIR: ${{ runner.temp }}/tmux-agent-state/tmux-agent
-          XDG_CONFIG_HOME: ${{ runner.temp }}/tmux-agent-config
-          XDG_RUNTIME_DIR: ${{ runner.temp }}/tmux-agent-runtime
-          XDG_STATE_HOME: ${{ runner.temp }}/tmux-agent-xdg-state
+          mkdir -p historical-assets/v0.3.0
+          gh release download v0.3.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir historical-assets/v0.3.0 \
+            --pattern "tmux-agent-v0.3.0-${{ matrix.target }}.tar.gz" \
+            --pattern SHA256SUMS
+      - name: Exercise fresh install and v0.3.0 upgrade lifecycle
         run: |
-          socket_name="tmux-agent-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          cleanup() {
-            tmux -L "$socket_name" kill-server 2>/dev/null || true
-          }
-          trap cleanup EXIT
-          tmux -L "$socket_name" -f /dev/null new-session -d -s release-smoke
-          tmux -L "$socket_name" set-option -g @tmux-agent-binary "$PWD/bin/tmux-agent"
-          tmux -L "$socket_name" run-shell "$PWD/tmux-agent.tmux"
-          tmux -L "$socket_name" list-keys -T prefix |
-            awk '$4 == "A" && index($0, "scripts/launch-popup") { found = 1 } END { exit !found }'
-          socket_path=$(tmux -L "$socket_name" display-message -p '#{socket_path}')
-          for _ in {1..50}; do
-            status=$(TMUX="$socket_path,0,0" bin/tmux-agent daemon status)
-            [[ $status == running:* ]] && break
-            sleep 0.1
-          done
-          [[ $status == running:* ]]
-          TMUX="$socket_path,0,0" bin/tmux-agent daemon stop
+          tests/release-lifecycle-smoke.sh \
+            "${{ matrix.target }}" \
+            "$PWD/draft-assets" \
+            "$PWD/historical-assets"
