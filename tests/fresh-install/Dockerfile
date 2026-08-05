@@ -47,6 +47,7 @@ RUN chmod 0755 \
         /opt/tmux-agent/scripts/bootstrap \
         /opt/tmux-agent/scripts/doctor \
         /opt/tmux-agent/scripts/install \
+        /opt/tmux-agent/scripts/standalone-launcher \
         /opt/tmux-agent/scripts/launch-popup \
         /opt/tmux-agent/scripts/uninstall \
         /opt/tmux-agent/tests/fresh-install/container-test.sh \

@@ -131,6 +131,13 @@ enum Command {
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
     },
+    /// List the active managed version and available rollback targets.
+    Versions,
+    /// Activate one already installed managed version.
+    Rollback {
+        /// Exact installed semantic version to activate.
+        version: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -157,6 +164,12 @@ async fn main() -> Result<()> {
     if let Command::Update { version } = &cli.command {
         return update::run(version.as_deref(), cli.config.as_deref());
     }
+    if matches!(cli.command, Command::Versions) {
+        return update::run_versions();
+    }
+    if let Command::Rollback { version } = &cli.command {
+        return update::run_rollback(version, cli.config.as_deref());
+    }
 
     let (config, config_path) = Config::load(cli.config.as_deref())?;
     let tmux = Tmux::new(&config);
@@ -165,6 +178,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Doctor { .. } => unreachable!(),
         Command::Update { .. } => unreachable!(),
+        Command::Versions | Command::Rollback { .. } => unreachable!(),
         Command::Daemon {
             command: DaemonCommand::Run,
         } => daemon::run(config, paths, tmux).await,

@@ -5,64 +5,6 @@ TMUX_AGENT_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 export TMUX_AGENT_ROOT
 . "$TMUX_AGENT_ROOT/scripts/lib.sh"
 
-data_dir=$(tmux_agent_data_dir)
-
-show_versions() {
-    current_target=$(readlink "$data_dir/current" 2>/dev/null || true)
-    found=0
-    for version_dir in "$data_dir"/versions/*; do
-        [ -d "$version_dir" ] || continue
-        candidate_version=${version_dir##*/}
-        candidate_binary="$version_dir/tmux-agent"
-        [ -x "$candidate_binary" ] || continue
-        found=1
-        marker=' '
-        case "$current_target" in
-            "versions/$candidate_version/tmux-agent" | "$candidate_binary")
-                marker='*'
-                ;;
-        esac
-        printf '%s %s\n' "$marker" "$candidate_version"
-    done
-    if [ "$found" -eq 0 ]; then
-        printf '%s\n' 'no managed versions installed'
-    fi
-}
-
-rollback() {
-    requested_version=${1:-}
-    case "$requested_version" in
-        '' | *[!0-9A-Za-z.+-]*)
-            printf '%s\n' 'usage: tmux-agent plugin rollback <version>' >&2
-            exit 2
-            ;;
-    esac
-    requested_binary="$data_dir/versions/$requested_version/tmux-agent"
-    if ! tmux_agent_managed_version_compatible "$requested_version"; then
-        printf 'tmux-agent: version %s is not installed or is not compatible with this checkout\n' \
-            "$requested_version" >&2
-        exit 1
-    fi
-    if ! tmux_agent_install_lock_acquire; then
-        exit 1
-    fi
-    rollback_cleanup() {
-        tmux_agent_install_lock_release 2>/dev/null || true
-    }
-    trap rollback_cleanup EXIT HUP INT TERM
-    if ! tmux_agent_managed_version_compatible "$requested_version"; then
-        printf 'tmux-agent: version %s changed while waiting for the installation lock\n' \
-            "$requested_version" >&2
-        exit 1
-    fi
-    tmux_agent_activate_version "$requested_version"
-    tmux_agent_write_status "READY|$requested_version"
-    "$requested_binary" daemon restart >/dev/null 2>&1 || true
-    printf 'tmux-agent: rolled back to %s\n' "$requested_version"
-    rollback_cleanup
-    trap - EXIT HUP INT TERM
-}
-
 if [ "${1:-}" = plugin ]; then
     case "${2:-}" in
         versions)
@@ -70,16 +12,18 @@ if [ "${1:-}" = plugin ]; then
                 printf '%s\n' 'usage: tmux-agent plugin versions' >&2
                 exit 2
             }
-            show_versions
-            exit 0
+            if ! tmux_agent_current_binary >/dev/null 2>&1; then
+                printf '%s\n' 'no managed versions installed'
+                exit 0
+            fi
+            set -- versions
             ;;
         rollback)
             [ "$#" -eq 3 ] || {
                 printf '%s\n' 'usage: tmux-agent plugin rollback <version>' >&2
                 exit 2
             }
-            rollback "$3"
-            exit 0
+            set -- rollback "$3"
             ;;
         update)
             [ "$#" -eq 2 ] || {
@@ -100,12 +44,29 @@ fi
 
 if [ -n "${TMUX_AGENT_BINARY:-}" ]; then
     binary=$TMUX_AGENT_BINARY
+elif tmux_agent_is_management_command "$@"; then
+    binary=$(tmux_agent_manager_binary 2>/dev/null || true)
+    if [ -z "$binary" ]; then
+        if ! "$TMUX_AGENT_ROOT/scripts/bootstrap" --no-restart; then
+            printf '%s\n' \
+                'tmux-agent: no verified lifecycle controller is available' >&2
+            exit 1
+        fi
+        binary=$(tmux_agent_manager_binary 2>/dev/null || true)
+        if [ -z "$binary" ] || [ ! -x "$binary" ]; then
+            printf '%s\n' \
+                'tmux-agent: no verified lifecycle controller is available' >&2
+            exit 1
+        fi
+    fi
 else
     binary=$(tmux_agent_current_binary 2>/dev/null || true)
 fi
 
 if [ -z "$binary" ] || [ ! -x "$binary" ] ||
-    { [ -z "${TMUX_AGENT_BINARY:-}" ] && ! tmux_agent_current_binary_compatible; }; then
+    { [ -z "${TMUX_AGENT_BINARY:-}" ] &&
+        ! tmux_agent_is_management_command "$@" &&
+        ! tmux_agent_current_binary_compatible; }; then
     status=$(tmux_agent_read_status)
     case "$status" in
         INSTALLING\|*)

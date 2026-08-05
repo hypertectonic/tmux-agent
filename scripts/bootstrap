@@ -28,6 +28,7 @@ temporary_dir=
 staging_dir=
 lock_owned=0
 install_complete=0
+migration_same_version=0
 
 cleanup() {
     exit_status=$?
@@ -57,7 +58,28 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-mkdir -p "$versions_dir" "$state_dir"
+if [ -e "$data_dir" ] || [ -L "$data_dir" ]; then
+    if [ ! -d "$data_dir" ] || [ -L "$data_dir" ]; then
+        printf 'tmux-agent: managed data path is not a real directory: %s\n' \
+            "$data_dir" >&2
+        exit 1
+    fi
+else
+    mkdir -p "$data_dir"
+fi
+if [ -e "$versions_dir" ] || [ -L "$versions_dir" ]; then
+    if [ ! -d "$versions_dir" ] || [ -L "$versions_dir" ]; then
+        tmux_agent_write_status "FAILED|managed version store is not a real directory"
+        exit 1
+    fi
+else
+    if ! mkdir "$versions_dir" 2>/dev/null &&
+        { [ ! -d "$versions_dir" ] || [ -L "$versions_dir" ]; }; then
+        tmux_agent_write_status "FAILED|managed version store could not be created safely"
+        exit 1
+    fi
+fi
+mkdir -p "$state_dir"
 chmod 700 "$data_dir" "$versions_dir" "$state_dir"
 : >"$data_dir/.tmux-agent-managed"
 chmod 600 "$data_dir/.tmux-agent-managed"
@@ -69,14 +91,97 @@ fi
 lock_owned=1
 
 old_current=$(readlink "$data_dir/current" 2>/dev/null || true)
-if tmux_agent_current_binary_compatible; then
+preserve_current=0
+if [ -n "${TMUX_AGENT_MIGRATE_BINARY:-}" ]; then
+    migration_binary=$TMUX_AGENT_MIGRATE_BINARY
+    if [ -L "$migration_binary" ] || [ ! -f "$migration_binary" ] ||
+        [ ! -x "$migration_binary" ]; then
+        tmux_agent_write_status "FAILED|standalone migration source is not a regular executable"
+        exit 1
+    fi
+    migration_version=$(tmux_agent_binary_version "$migration_binary") || {
+        tmux_agent_write_status "FAILED|standalone migration source has an invalid version"
+        exit 1
+    }
+    migration_target=$(tmux_agent_target) || {
+        tmux_agent_write_status "FAILED|standalone migration platform is unsupported"
+        exit 1
+    }
+    migration_dir="$versions_dir/$migration_version"
+    migration_destination="$migration_dir/tmux-agent"
+    if [ "$migration_version" = "$version" ]; then
+        migration_same_version=1
+    elif [ -e "$migration_dir" ] || [ -L "$migration_dir" ]; then
+        migration_contract=$(tmux_agent_compatibility_contract) || {
+            tmux_agent_write_status "FAILED|checkout compatibility contract is invalid"
+            exit 1
+        }
+        migration_protocol=${migration_contract%%|*}
+        if [ ! -d "$migration_dir" ] || [ -L "$migration_dir" ] ||
+            [ ! -f "$migration_destination" ] || [ -L "$migration_destination" ] ||
+            [ ! -f "$migration_dir/COMPATIBILITY" ] ||
+            [ -L "$migration_dir/COMPATIBILITY" ] ||
+            [ ! -f "$migration_dir/TARGET" ] || [ -L "$migration_dir/TARGET" ]; then
+            tmux_agent_write_status \
+                "FAILED|existing migration target is not a real in-store version: $migration_dir"
+            exit 1
+        fi
+        migration_metadata=$(tmux_agent_version_compatibility "$migration_dir" || true)
+        migration_recorded_target=
+        IFS= read -r migration_recorded_target <"$migration_dir/TARGET" || true
+        if ! tmux_agent_binary_matches "$migration_destination" "$migration_version" ||
+            ! cmp -s "$migration_binary" "$migration_destination" ||
+            [ "${migration_metadata%%|*}" != "$migration_protocol" ] ||
+            [ "${migration_metadata#*|}" != "$migration_version" ] ||
+            [ "$migration_recorded_target" != "$migration_target" ]; then
+            tmux_agent_write_status \
+                "FAILED|existing migration target is invalid: $migration_dir"
+            exit 1
+        fi
+    else
+        staging_dir="$versions_dir/.staging-migration-${migration_version}-$$"
+        mkdir "$staging_dir"
+        chmod 700 "$staging_dir"
+        cp "$migration_binary" "$staging_dir/tmux-agent"
+        chmod 755 "$staging_dir/tmux-agent"
+        tmux_agent_write_version_compatibility "$staging_dir" "$migration_version"
+        printf '%s\n' "$migration_target" >"$staging_dir/TARGET"
+        chmod 600 "$staging_dir/TARGET"
+        if ! tmux_agent_binary_matches "$staging_dir/tmux-agent" "$migration_version"; then
+            tmux_agent_write_status "FAILED|copied migration binary changed during staging"
+            exit 1
+        fi
+        mv "$staging_dir" "$migration_dir"
+        staging_dir=
+    fi
+    if [ "$migration_same_version" -eq 0 ] && [ -z "$old_current" ]; then
+        tmux_agent_activate_version "$migration_version"
+        old_current=$(readlink "$data_dir/current" 2>/dev/null || true)
+    fi
+fi
+manager_available=0
+manager_version=
+if manager_binary=$(tmux_agent_manager_binary 2>/dev/null); then
+    manager_available=1
+    manager_version=$(tmux_agent_binary_version "$manager_binary") || {
+        tmux_agent_write_status "FAILED|managed lifecycle controller version is invalid"
+        exit 1
+    }
+elif [ -e "$data_dir/manager" ] || [ -L "$data_dir/manager" ]; then
+    tmux_agent_write_status "FAILED|managed lifecycle controller is invalid"
+    exit 1
+fi
+if [ "$migration_same_version" -eq 0 ] && tmux_agent_current_binary_compatible; then
     current_version=$(tmux_agent_current_managed_version)
-    tmux_agent_write_status "READY|$current_version"
-    install_complete=1
-    printf 'tmux-agent: compatible managed binary %s is already current\n' \
-        "$current_version"
-    printf 'tmux-agent: ready at %s\n' "$data_dir/current"
-    exit 0
+    if [ "$manager_available" -eq 1 ]; then
+        tmux_agent_write_status "READY|$current_version"
+        install_complete=1
+        printf 'tmux-agent: compatible managed binary %s is already current\n' \
+            "$current_version"
+        printf 'tmux-agent: ready at %s\n' "$data_dir/current"
+        exit 0
+    fi
+    preserve_current=1
 fi
 
 contract=$(tmux_agent_compatibility_contract) || {
@@ -97,10 +202,9 @@ target=$(tmux_agent_target) || {
 }
 archive_name="tmux-agent-v${version}-${target}.tar.gz"
 
-if tmux_agent_binary_matches "$destination_binary" "$version"; then
-    tmux_agent_write_version_compatibility "$destination_dir" "$version"
-    tmux_agent_activate_version "$version"
-    tmux_agent_write_status "READY|$version"
+if [ "$migration_same_version" -eq 0 ] &&
+    tmux_agent_managed_version_management_capable "$version"; then
+    tmux_agent_write_version_compatibility "$destination_dir" "$version" 1
 else
     tmux_agent_write_status "INSTALLING|$version"
     release_base=$(tmux_agent_release_base_url) || {
@@ -211,17 +315,32 @@ else
     }
     packaged_protocol=${packaged_compatibility%%|*}
     packaged_version=${packaged_compatibility#*|}
+    packaged_management=$(tmux_agent_version_management_protocol "$staging_dir" || true)
     required_protocol=${contract%%|*}
     if [ "$packaged_protocol" != "$required_protocol" ] ||
-        [ "$packaged_version" != "$version" ]; then
+        [ "$packaged_version" != "$version" ] ||
+        [ "$packaged_management" != 1 ]; then
         tmux_agent_write_status "FAILED|release archive compatibility metadata does not match"
         exit 1
     fi
-    tmux_agent_write_version_compatibility "$staging_dir" "$version"
+    tmux_agent_write_version_compatibility "$staging_dir" "$version" 1
 
-    if [ -e "$destination_dir" ]; then
-        if ! tmux_agent_binary_matches "$destination_binary" "$version"; then
+    if [ "$migration_same_version" -eq 1 ] &&
+        ! cmp -s "$migration_binary" "$staging_dir/tmux-agent"; then
+        tmux_agent_write_status \
+            "FAILED|same-version direct binary differs from the verified release"
+        exit 1
+    fi
+
+    if [ -e "$destination_dir" ] || [ -L "$destination_dir" ]; then
+        if ! tmux_agent_managed_version_management_capable "$version"; then
             tmux_agent_write_status "FAILED|existing version directory is invalid: $destination_dir"
+            exit 1
+        fi
+        if [ "$migration_same_version" -eq 1 ] &&
+            ! cmp -s "$staging_dir/tmux-agent" "$destination_binary"; then
+            tmux_agent_write_status \
+                "FAILED|existing same-version binary differs from the verified release"
             exit 1
         fi
         rm -rf -- "$staging_dir"
@@ -230,9 +349,20 @@ else
         mv "$staging_dir" "$destination_dir"
         staging_dir=
     fi
-    tmux_agent_activate_version "$version"
-    tmux_agent_write_status "READY|$version"
 fi
+
+if [ "$manager_available" -eq 0 ] ||
+    ! tmux_agent_version_at_least "$manager_version" "$version"; then
+    tmux_agent_activate_manager "$version"
+fi
+if [ "$preserve_current" -eq 0 ]; then
+    tmux_agent_activate_version "$version"
+fi
+ready_version=$(tmux_agent_current_managed_version) || {
+    tmux_agent_write_status "FAILED|managed current activation is invalid"
+    exit 1
+}
+tmux_agent_write_status "READY|$ready_version"
 
 new_current=$(readlink "$data_dir/current" 2>/dev/null || true)
 if [ "$restart_daemon" -eq 1 ] && [ "$old_current" != "$new_current" ]; then

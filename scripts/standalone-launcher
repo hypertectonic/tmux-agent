@@ -1,0 +1,185 @@
+#!/bin/sh
+# tmux-agent managed launcher
+# tmux-agent-standalone-launcher-protocol=1
+set -eu
+
+if [ "${1:-}" = plugin ]; then
+    case "${2:-}" in
+        versions)
+            [ "$#" -eq 2 ] || {
+                printf '%s\n' 'usage: tmux-agent plugin versions' >&2
+                exit 2
+            }
+            set -- versions
+            ;;
+        rollback)
+            [ "$#" -eq 3 ] || {
+                printf '%s\n' 'usage: tmux-agent plugin rollback <version>' >&2
+                exit 2
+            }
+            set -- rollback "$3"
+            ;;
+        update)
+            [ "$#" -eq 2 ] || {
+                printf '%s\n' 'usage: tmux-agent plugin update' >&2
+                exit 2
+            }
+            printf '%s\n' \
+                "tmux-agent: 'plugin update' is deprecated; running standalone update" >&2
+            set -- update
+            ;;
+        *)
+            printf '%s\n' \
+                'usage: tmux-agent plugin {versions|rollback <version>|update}' >&2
+            exit 2
+            ;;
+    esac
+fi
+
+if [ -n "${TMUX_AGENT_DATA_DIR:-}" ]; then
+    data_dir=$TMUX_AGENT_DATA_DIR
+elif [ -n "${XDG_DATA_HOME:-}" ]; then
+    data_dir="$XDG_DATA_HOME/tmux-agent"
+else
+    data_dir="${HOME:?HOME is required}/.local/share/tmux-agent"
+fi
+
+native_target() {
+    system_name=${TMUX_AGENT_UNAME_S:-$(uname -s)}
+    machine_name=${TMUX_AGENT_UNAME_M:-$(uname -m)}
+    case "$system_name:$machine_name" in
+        Darwin:arm64 | Darwin:aarch64) printf '%s\n' aarch64-apple-darwin ;;
+        Darwin:x86_64 | Darwin:amd64) printf '%s\n' x86_64-apple-darwin ;;
+        Linux:x86_64 | Linux:amd64) printf '%s\n' x86_64-unknown-linux-gnu ;;
+        Linux:aarch64 | Linux:arm64) printf '%s\n' aarch64-unknown-linux-gnu ;;
+        *) return 1 ;;
+    esac
+}
+
+valid_semver() {
+    awk -v version="$1" '
+        function valid_identifiers(value, reject_numeric_leading_zero,
+            identifiers, count, index_value) {
+            if (value == "") return 0
+            count = split(value, identifiers, ".")
+            for (index_value = 1; index_value <= count; index_value++) {
+                if (identifiers[index_value] !~ /^[0-9A-Za-z-][0-9A-Za-z-]*$/)
+                    return 0
+                if (reject_numeric_leading_zero &&
+                    identifiers[index_value] ~ /^0[0-9]/)
+                    return 0
+            }
+            return 1
+        }
+        BEGIN {
+            build_index = index(version, "+")
+            if (build_index > 0) {
+                build = substr(version, build_index + 1)
+                version = substr(version, 1, build_index - 1)
+                if (!valid_identifiers(build, 0)) exit 1
+            }
+            prerelease_index = index(version, "-")
+            if (prerelease_index > 0) {
+                prerelease = substr(version, prerelease_index + 1)
+                version = substr(version, 1, prerelease_index - 1)
+                if (!valid_identifiers(prerelease, 1)) exit 1
+            }
+            count = split(version, core, ".")
+            if (count != 3) exit 1
+            for (index_value = 1; index_value <= 3; index_value++) {
+                if (core[index_value] !~ /^[0-9][0-9]*$/) exit 1
+                if (core[index_value] ~ /^0[0-9]/) exit 1
+            }
+        }
+    '
+}
+
+validated_manager() {
+    manager_path="$data_dir/manager"
+    [ -L "$manager_path" ] || return 1
+    manager_target=$(readlink "$manager_path" 2>/dev/null) || return 1
+    case "$manager_target" in
+        versions/*)
+            manager_suffix=${manager_target#versions/}
+            ;;
+        "$data_dir"/versions/*)
+            manager_suffix=${manager_target#"$data_dir"/versions/}
+            ;;
+        *) return 1 ;;
+    esac
+    case "$manager_suffix" in
+        */tmux-agent) manager_version=${manager_suffix%/tmux-agent} ;;
+        *) return 1 ;;
+    esac
+    case "$manager_version" in
+        '' | */*) return 1 ;;
+    esac
+    valid_semver "$manager_version" || return 1
+    expected_relative="versions/$manager_version/tmux-agent"
+    expected_absolute="$data_dir/$expected_relative"
+    case "$manager_target" in
+        "$expected_relative" | "$expected_absolute") ;;
+        *) return 1 ;;
+    esac
+    versions_dir="$data_dir/versions"
+    version_dir="$data_dir/versions/$manager_version"
+    binary_path="$version_dir/tmux-agent"
+    metadata="$version_dir/COMPATIBILITY"
+    target_file="$version_dir/TARGET"
+    [ -d "$versions_dir" ] && [ ! -L "$versions_dir" ] || return 1
+    [ -d "$version_dir" ] && [ ! -L "$version_dir" ] || return 1
+    [ -f "$binary_path" ] && [ ! -L "$binary_path" ] &&
+        [ -x "$binary_path" ] || return 1
+    [ -f "$metadata" ] && [ ! -L "$metadata" ] || return 1
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] || return 1
+    awk -v version="$manager_version" '
+        $0 == "launcher_protocol=1" { launcher++ ; next }
+        $0 == "binary_version=" version { binary++ ; next }
+        $0 == "management_protocol=1" { management++ ; next }
+        { invalid = 1 }
+        END {
+            exit invalid || launcher != 1 || binary != 1 || management != 1
+        }
+    ' "$metadata" || return 1
+    IFS= read -r recorded_target <"$target_file" || return 1
+    [ "$recorded_target" = "$(native_target)" ] || return 1
+    reported=$("$manager_path" --version 2>/dev/null) || return 1
+    [ "$reported" = "tmux-agent $manager_version" ] || return 1
+    printf '%s\n' "$manager_path"
+}
+
+management_command=0
+expect_config_value=0
+for argument in "$@"; do
+    if [ "$expect_config_value" -eq 1 ]; then
+        expect_config_value=0
+        continue
+    fi
+    case "$argument" in
+        --config)
+            expect_config_value=1
+            ;;
+        --config=*)
+            ;;
+        update | versions | rollback)
+            management_command=1
+            break
+            ;;
+        -*)
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ "$management_command" -eq 1 ]; then
+    binary=$(validated_manager 2>/dev/null || true)
+else
+    binary="$data_dir/current"
+fi
+if [ ! -x "$binary" ]; then
+    printf 'tmux-agent: no verified managed binary at %s\n' "$binary" >&2
+    exit 1
+fi
+exec "$binary" "$@"

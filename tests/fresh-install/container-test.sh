@@ -76,13 +76,13 @@ wait_for() {
 }
 
 current_ready() {
-    [[ -x $data_dir/current ]] \
-        && [[ $($data_dir/current --version 2>/dev/null) == "tmux-agent $version" ]]
+    [[ -x $data_dir/current ]] &&
+        [[ $($data_dir/current --version 2>/dev/null) == "tmux-agent $version" ]]
 }
 
 daemon_ready() {
-    "$agent" daemon status 2>/dev/null \
-        | grep -F "running: version $version, protocol 3" >/dev/null
+    "$agent" daemon status 2>/dev/null |
+        grep -F "running: version $version, protocol 3" >/dev/null
 }
 
 client_ready() {
@@ -140,6 +140,7 @@ verify_runtime() {
 
     [[ $($agent --version) == "tmux-agent $version" ]]
     [[ $(readlink "$data_dir/current") == "versions/$version/tmux-agent" ]]
+    [[ $(readlink "$data_dir/manager") == "versions/$version/tmux-agent" ]]
     [[ $(stat -c '%a' "$data_dir") == 700 ]]
     [[ $(stat -c '%a' "$data_dir/.tmux-agent-managed") == 600 ]]
     for installed_file in README.md LICENSE THIRD_PARTY_NOTICES.md \
@@ -172,6 +173,11 @@ case "$scenario" in
         "$root/scripts/install" --no-restart >"$HOME/install.out"
         grep -F "tmux-agent: ready at $data_dir/current" \
             "$HOME/install.out" >/dev/null
+        installed_agent="$HOME/.local/bin/tmux-agent"
+        [[ -x $installed_agent ]]
+        grep -Fq '# tmux-agent managed launcher' "$installed_agent"
+        [[ $($installed_agent --version) == "tmux-agent $version" ]]
+        grep -Fx "active    $version" < <("$installed_agent" versions)
         verify_runtime
 
         "$root/scripts/install" --no-restart >"$HOME/reinstall.out"
@@ -196,13 +202,13 @@ EOF
         verify_runtime
 
         binding=$(
-            tmux -L "$socket_name" list-keys -T prefix \
-                | awk '$4 == "A" { print; exit }'
+            tmux -L "$socket_name" list-keys -T prefix |
+                awk '$4 == "A" { print; exit }'
         )
         [[ $binding == *launch-popup* ]]
         preserved=$(
-            tmux -L "$socket_name" list-keys -T prefix \
-                | awk '$4 == "B" { print; exit }'
+            tmux -L "$socket_name" list-keys -T prefix |
+                awk '$4 == "B" { print; exit }'
         )
         [[ $preserved == *preserved-binding* ]]
 
@@ -231,12 +237,12 @@ EOF
         client_pid=
 
         tmux -L "$socket_name" source-file "$HOME/.tmux.conf"
-        [[ $(tmux -L "$socket_name" list-keys -T prefix \
-            | awk '$4 == "A" { count++ } END { print count + 0 }') == 1 ]]
-        [[ $(tmux -L "$socket_name" list-windows -t "$session_name" \
-            | wc -l | tr -d ' ') == 1 ]]
-        [[ $(tmux -L "$socket_name" list-panes -a \
-            | wc -l | tr -d ' ') == 1 ]]
+        [[ $(tmux -L "$socket_name" list-keys -T prefix |
+            awk '$4 == "A" { count++ } END { print count + 0 }') == 1 ]]
+        [[ $(tmux -L "$socket_name" list-windows -t "$session_name" |
+            wc -l | tr -d ' ') == 1 ]]
+        [[ $(tmux -L "$socket_name" list-panes -a |
+            wc -l | tr -d ' ') == 1 ]]
         ;;
 esac
 

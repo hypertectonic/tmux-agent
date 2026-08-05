@@ -3,4 +3,47 @@ set -eu
 
 TMUX_AGENT_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 export TMUX_AGENT_ROOT
-exec "$TMUX_AGENT_ROOT/scripts/bootstrap" "$@"
+. "$TMUX_AGENT_ROOT/scripts/lib.sh"
+
+case "${1:-}" in
+    '' | --no-restart)
+        ;;
+    *)
+        printf 'usage: %s [--no-restart]\n' "$0" >&2
+        exit 2
+        ;;
+esac
+
+install_path=${TMUX_AGENT_INSTALL_PATH:-${HOME:?HOME is required}/.local/bin/tmux-agent}
+install_dir=${install_path%/*}
+[ "$install_dir" != "$install_path" ] || install_dir=.
+mkdir -p "$install_dir"
+
+if [ -e "$install_path" ] || [ -L "$install_path" ]; then
+    if [ -L "$install_path" ]; then
+        printf 'tmux-agent: refusing to replace symlink at %s\n' "$install_path" >&2
+        exit 1
+    fi
+    if ! tmux_agent_is_standalone_launcher "$install_path"; then
+        if [ ! -f "$install_path" ] || [ ! -x "$install_path" ]; then
+            printf 'tmux-agent: refusing to replace non-executable path at %s\n' \
+                "$install_path" >&2
+            exit 1
+        fi
+        TMUX_AGENT_MIGRATE_BINARY=$install_path
+        export TMUX_AGENT_MIGRATE_BINARY
+    fi
+fi
+
+"$TMUX_AGENT_ROOT/scripts/bootstrap" "$@"
+
+launcher_tmp="$install_dir/.tmux-agent-launcher.$$"
+cleanup() {
+    rm -f -- "$launcher_tmp"
+}
+trap cleanup EXIT HUP INT TERM
+cp "$TMUX_AGENT_ROOT/scripts/standalone-launcher" "$launcher_tmp"
+chmod 755 "$launcher_tmp"
+mv -f "$launcher_tmp" "$install_path"
+trap - EXIT HUP INT TERM
+printf 'tmux-agent: launcher installed at %s\n' "$install_path"

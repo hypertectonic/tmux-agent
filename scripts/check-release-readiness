@@ -81,6 +81,7 @@ for executable in \
     bin/tmux-agent \
     scripts/bootstrap \
     scripts/install \
+    scripts/standalone-launcher \
     scripts/launch-popup \
     scripts/lib.sh \
     scripts/doctor \

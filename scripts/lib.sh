@@ -20,6 +20,19 @@ tmux_agent_state_dir() {
     fi
 }
 
+tmux_agent_is_standalone_launcher() (
+    launcher_path=$1
+    [ -f "$launcher_path" ] && [ ! -L "$launcher_path" ] &&
+        [ -x "$launcher_path" ] || exit 1
+    awk '
+        NR == 1 && $0 != "#!/bin/sh" { exit 1 }
+        NR == 2 && $0 != "# tmux-agent managed launcher" { exit 1 }
+        NR == 3 && $0 != "# tmux-agent-standalone-launcher-protocol=1" { exit 1 }
+        NR == 3 { found = 1; exit }
+        END { if (!found) exit 1 }
+    ' "$launcher_path"
+)
+
 tmux_agent_version() {
     version_file="${TMUX_AGENT_ROOT:?TMUX_AGENT_ROOT is required}/VERSION"
     [ -r "$version_file" ] || {
@@ -196,6 +209,11 @@ tmux_agent_version_compatibility() (
             version = substr($0, index($0, "=") + 1)
             next
         }
+        /^management_protocol=[1-9][0-9]*$/ {
+            if (management != "") invalid = 1
+            management = substr($0, index($0, "=") + 1)
+            next
+        }
         { invalid = 1 }
         END {
             if (invalid || protocol == "" || version == "") exit 1
@@ -207,6 +225,7 @@ tmux_agent_version_compatibility() (
 tmux_agent_write_version_compatibility() (
     version_dir=$1
     binary_version=$2
+    management_protocol=${3:-}
     contract=$(tmux_agent_compatibility_contract) || exit 1
     launcher_protocol=${contract%%|*}
     metadata_tmp="$version_dir/.compatibility.$$"
@@ -214,11 +233,114 @@ tmux_agent_write_version_compatibility() (
     {
         printf 'launcher_protocol=%s\n' "$launcher_protocol"
         printf 'binary_version=%s\n' "$binary_version"
+        if [ -n "$management_protocol" ]; then
+            printf 'management_protocol=%s\n' "$management_protocol"
+        fi
     } >"$metadata_tmp"
     chmod 600 "$metadata_tmp"
     mv -f "$metadata_tmp" "$version_dir/COMPATIBILITY"
     trap - EXIT HUP INT TERM
 )
+
+tmux_agent_version_management_protocol() (
+    version_dir=$1
+    metadata_file="$version_dir/COMPATIBILITY"
+    [ -f "$metadata_file" ] && [ ! -L "$metadata_file" ] || exit 1
+    management=$(awk -F= '
+        /^management_protocol=[1-9][0-9]*$/ {
+            if (found) exit 1
+            found = 1
+            print $2
+        }
+        END { if (!found) exit 1 }
+    ' "$metadata_file") || exit 1
+    printf '%s\n' "$management"
+)
+
+tmux_agent_managed_version_management_capable() (
+    candidate_version=$1
+    tmux_agent_version_at_least "$candidate_version" "$candidate_version" || exit 1
+    data_dir=$(tmux_agent_data_dir)
+    versions_dir="$data_dir/versions"
+    version_dir="$data_dir/versions/$candidate_version"
+    binary_path="$version_dir/tmux-agent"
+    [ -d "$versions_dir" ] && [ ! -L "$versions_dir" ] || exit 1
+    [ -d "$version_dir" ] && [ ! -L "$version_dir" ] || exit 1
+    [ -f "$binary_path" ] && [ ! -L "$binary_path" ] &&
+        [ -x "$binary_path" ] || exit 1
+    metadata_file="$version_dir/COMPATIBILITY"
+    [ -f "$metadata_file" ] && [ ! -L "$metadata_file" ] || exit 1
+    metadata=$(tmux_agent_version_compatibility "$version_dir") || exit 1
+    contract=$(tmux_agent_compatibility_contract) || exit 1
+    [ "${metadata%%|*}" = "${contract%%|*}" ] || exit 1
+    [ "${metadata#*|}" = "$candidate_version" ] || exit 1
+    [ "$(tmux_agent_version_management_protocol "$version_dir")" = 1 ] || exit 1
+    target_file="$version_dir/TARGET"
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] || exit 1
+    IFS= read -r recorded_target <"$target_file" || exit 1
+    [ "$recorded_target" = "$(tmux_agent_target)" ] || exit 1
+    tmux_agent_binary_matches "$binary_path" "$candidate_version" || exit 1
+)
+
+tmux_agent_manager_binary() (
+    data_dir=$(tmux_agent_data_dir)
+    manager_path="$data_dir/manager"
+    [ -L "$manager_path" ] || exit 1
+    manager_target=$(readlink "$manager_path" 2>/dev/null) || exit 1
+    case "$manager_target" in
+        versions/*)
+            manager_suffix=${manager_target#versions/}
+            ;;
+        "$data_dir"/versions/*)
+            manager_suffix=${manager_target#"$data_dir"/versions/}
+            ;;
+        *) exit 1 ;;
+    esac
+    case "$manager_suffix" in
+        */tmux-agent) manager_version=${manager_suffix%/tmux-agent} ;;
+        *) exit 1 ;;
+    esac
+    case "$manager_version" in
+        '' | */*) exit 1 ;;
+    esac
+    tmux_agent_version_at_least "$manager_version" "$manager_version" || exit 1
+    expected_relative="versions/$manager_version/tmux-agent"
+    expected_absolute="$data_dir/$expected_relative"
+    case "$manager_target" in
+        "$expected_relative" | "$expected_absolute") ;;
+        *) exit 1 ;;
+    esac
+    tmux_agent_managed_version_management_capable "$manager_version" || exit 1
+    reported_version=$(tmux_agent_binary_version "$manager_path") || exit 1
+    [ "$reported_version" = "$manager_version" ] || exit 1
+    printf '%s\n' "$manager_path"
+)
+
+tmux_agent_is_management_command() {
+    expect_config_value=0
+    for argument in "$@"; do
+        if [ "$expect_config_value" -eq 1 ]; then
+            expect_config_value=0
+            continue
+        fi
+        case "$argument" in
+            --config)
+                expect_config_value=1
+                ;;
+            --config=*)
+                ;;
+            update | versions | rollback)
+                return 0
+                ;;
+            -*)
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    done
+    return 1
+}
 
 tmux_agent_managed_version_compatible() (
     candidate_version=$1
@@ -321,8 +443,9 @@ tmux_agent_install_lock_release() (
     rmdir "$lock_dir" 2>/dev/null
 )
 
-tmux_agent_activate_version() (
-    candidate_version=$1
+tmux_agent_activate_managed_link() (
+    link_name=$1
+    candidate_version=$2
     data_dir=$(tmux_agent_data_dir)
     lock_pid=
     if [ -r "$data_dir/.install.lock/pid" ]; then
@@ -331,12 +454,28 @@ tmux_agent_activate_version() (
     [ "$lock_pid" = "$$" ] || exit 1
     candidate_binary="$data_dir/versions/$candidate_version/tmux-agent"
     tmux_agent_binary_matches "$candidate_binary" "$candidate_version" || exit 1
-    link_tmp="$data_dir/.current.$$"
+    case "$link_name" in
+        current)
+            ;;
+        manager)
+            tmux_agent_managed_version_management_capable "$candidate_version" || exit 1
+            ;;
+        *) exit 1 ;;
+    esac
+    link_tmp="$data_dir/.${link_name}.$$"
     trap 'rm -f -- "$link_tmp"' EXIT HUP INT TERM
     ln -s "versions/$candidate_version/tmux-agent" "$link_tmp"
-    mv -f "$link_tmp" "$data_dir/current"
+    mv -f "$link_tmp" "$data_dir/$link_name"
     trap - EXIT HUP INT TERM
 )
+
+tmux_agent_activate_version() {
+    tmux_agent_activate_managed_link current "$1"
+}
+
+tmux_agent_activate_manager() {
+    tmux_agent_activate_managed_link manager "$1"
+}
 
 tmux_agent_target() {
     system_name=${TMUX_AGENT_UNAME_S:-$(uname -s)}

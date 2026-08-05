@@ -67,6 +67,7 @@ grep -F notices "$extracted/THIRD_PARTY_NOTICES.md" >/dev/null
 grep -F licenses "$extracted/THIRD_PARTY_LICENSES.html" >/dev/null
 grep -Fx 'launcher_protocol=1' "$extracted/COMPATIBILITY" >/dev/null
 grep -Fx 'binary_version=0.1.0' "$extracted/COMPATIBILITY" >/dev/null
+grep -Fx 'management_protocol=1' "$extracted/COMPATIBILITY" >/dev/null
 grep -Fx 'x86_64-unknown-linux-gnu' "$extracted/TARGET" >/dev/null
 
 wrong_binary="$test_root/wrong version"

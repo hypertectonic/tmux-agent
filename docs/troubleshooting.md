@@ -91,8 +91,15 @@ turn.
 ## Roll back
 
 ```sh
-tmux-agent plugin versions
-tmux-agent plugin rollback <version>
+tmux-agent versions
+tmux-agent rollback <version>
 ```
 
-Rollback uses an already installed, checksum-verified version.
+Rollback uses an already installed, verified native version. It refuses a
+missing, active, incompatible, symlinked, or corrupt target. If daemon restart
+fails after activation, the previously active version is restored and
+restarted. Legacy `plugin versions` and `plugin rollback` commands delegate to
+the same packaged implementation. If the launcher reports that no verified
+lifecycle controller is available, run `scripts/install` from a current trusted
+checkout; an existing malformed `manager` link is rejected rather than
+silently replaced.
