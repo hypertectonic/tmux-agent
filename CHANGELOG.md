@@ -29,6 +29,9 @@ The project uses semantic versioning.
 
 ### Fixed
 
+- Recover picker-resumed Codex root identity from its process-owned rollout
+  metadata so subagents stay attached to the correct session, while refusing
+  ambiguous or directory-only parent matches.
 - Preserve a validated metadata-absent pre-self-update TPM runtime as a native
   rollback target without moving `current` or granting it lifecycle-controller
   capability; ambiguous and partially published layouts fail closed.

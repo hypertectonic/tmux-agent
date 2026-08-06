@@ -27,6 +27,7 @@ pub struct Scanner {
     codex_threads: ThreadTracker,
     finished_process_threads: HashMap<String, String>,
     record_starts: HashMap<String, (String, u64)>,
+    process_root_threads: HashMap<String, (String, String)>,
     revision: u64,
 }
 
@@ -71,6 +72,7 @@ impl Scanner {
             codex_threads: ThreadTracker::from_environment(),
             finished_process_threads,
             record_starts: HashMap::new(),
+            process_root_threads: HashMap::new(),
             revision: 0,
         })
     }
@@ -196,13 +198,11 @@ impl Scanner {
             };
             record_pids.insert(
                 id.clone(),
-                processes
-                    .pane_pids
-                    .get(&record.pane_id)
-                    .cloned()
-                    .unwrap_or_else(|| vec![record.pane_pid])
-                    .into_iter()
-                    .collect(),
+                pane_record_pids(
+                    record.pane_pid,
+                    processes.pane_pids.get(&record.pane_id).map(Vec::as_slice),
+                    wrapped,
+                ),
             );
             if let Some(thread_id) = codex_thread_id {
                 record_thread_ids.insert(id.clone(), thread_id);
@@ -417,6 +417,34 @@ impl Scanner {
             &self.record_starts,
             now,
         );
+        self.process_root_threads
+            .retain(|record_id, (identity, _)| {
+                next.get(record_id).is_some_and(|record| {
+                    record.agent.eq_ignore_ascii_case("codex") && record.subagent.is_none()
+                }) && self
+                    .record_starts
+                    .get(record_id)
+                    .is_some_and(|(current, _)| current == identity)
+            });
+        for (record_id, (_, thread_id)) in &self.process_root_threads {
+            record_thread_ids
+                .entry(record_id.clone())
+                .or_insert_with(|| thread_id.clone());
+        }
+        let recovered = recover_process_owned_root_thread_ids(
+            &self.tmux,
+            &next,
+            &record_pids,
+            &processes.process_args,
+            &self.codex_threads,
+            &mut record_thread_ids,
+        );
+        for (record_id, thread_id) in recovered {
+            if let Some((identity, _)) = self.record_starts.get(&record_id) {
+                self.process_root_threads
+                    .insert(record_id, (identity.clone(), thread_id));
+            }
+        }
         restore_previous_subagent_ancestry(&mut next, &self.previous, now);
         link_codex_thread_subagents(
             &mut next,
@@ -688,7 +716,6 @@ fn link_codex_thread_subagents(
                         root_rollouts
                             .get(&thread.parent_thread_id)
                             .and_then(|root| unique_root_parent(records, root, record_starts))
-                            .or_else(|| unique_cwd_parent(records, thread, record_starts))
                     })
                     .flatten()
                 });
@@ -1060,31 +1087,89 @@ fn runner_codex_thread_id(
     })
 }
 
-fn unique_cwd_parent(
-    records: &HashMap<String, AgentRecord>,
-    thread: &ThreadRollout,
-    record_starts: &HashMap<String, (String, u64)>,
-) -> Option<String> {
-    if thread.cwd.is_empty() {
-        return None;
+fn pane_record_pids(
+    pane_pid: u32,
+    pane_pids: Option<&[u32]>,
+    wrapped: Option<&RunnerState>,
+) -> HashSet<u32> {
+    let mut pids = pane_pids
+        .map(|pids| pids.iter().copied().collect())
+        .unwrap_or_else(|| HashSet::from([pane_pid]));
+    if let Some(wrapped) = wrapped {
+        pids.extend([wrapped.owner_pid, wrapped.child_pid]);
     }
-    let mut matches = records
+    pids
+}
+
+fn recover_process_owned_root_thread_ids(
+    tmux: &Tmux,
+    records: &HashMap<String, AgentRecord>,
+    record_pids: &HashMap<String, HashSet<u32>>,
+    process_args: &HashMap<u32, String>,
+    tracker: &ThreadTracker,
+    record_thread_ids: &mut HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let candidates = records
         .values()
         .filter(|record| {
             record.agent.eq_ignore_ascii_case("codex")
                 && record.subagent.is_none()
-                && matches!(
-                    record.state,
-                    AgentState::Working | AgentState::Blocked | AgentState::Unknown
-                )
-                && record_starts.get(&record.id).is_some_and(|(_, started)| {
-                    *started <= thread.started_at_ms.saturating_add(2_000)
+                && !record_thread_ids.contains_key(&record.id)
+                && record_pids.get(&record.id).is_some_and(|pids| {
+                    pids.iter()
+                        .filter_map(|pid| process_args.get(pid))
+                        .any(|args| codex::codex_program_from_processes(args))
                 })
-                && same_cwd(&record.cwd, &thread.cwd)
         })
-        .map(|record| record.id.clone());
-    let parent = matches.next()?;
-    matches.next().is_none().then_some(parent)
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    let mut candidate_pids = candidates
+        .iter()
+        .filter_map(|record_id| record_pids.get(record_id))
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    candidate_pids.sort_unstable();
+    candidate_pids.dedup();
+    let Ok(files) = tmux.process_rollout_files(&candidate_pids) else {
+        return Vec::new();
+    };
+    recover_process_owned_root_thread_ids_from_files(
+        candidates,
+        record_pids,
+        tracker,
+        record_thread_ids,
+        &files,
+    )
+}
+
+fn recover_process_owned_root_thread_ids_from_files(
+    candidates: Vec<String>,
+    record_pids: &HashMap<String, HashSet<u32>>,
+    tracker: &ThreadTracker,
+    record_thread_ids: &mut HashMap<String, String>,
+    files: &HashMap<u32, Vec<PathBuf>>,
+) -> Vec<(String, String)> {
+    let mut recovered = Vec::new();
+    for record_id in candidates {
+        let Some(pids) = record_pids.get(&record_id) else {
+            continue;
+        };
+        let mut pids = pids.iter().copied().collect::<Vec<_>>();
+        pids.sort_unstable();
+        let paths = pids
+            .iter()
+            .filter_map(|pid| files.get(pid))
+            .flatten()
+            .map(PathBuf::as_path)
+            .collect::<Vec<_>>();
+        let Ok(Some(thread_id)) = tracker.root_thread_id_from_process_rollouts(paths) else {
+            continue;
+        };
+        record_thread_ids.insert(record_id.clone(), thread_id.clone());
+        recovered.push((record_id, thread_id));
+    }
+    recovered
 }
 
 fn same_cwd(left: &str, right: &str) -> bool {
@@ -1436,6 +1521,8 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     fn old(state: AgentState, seen: bool) -> AgentRecord {
         AgentRecord {
@@ -1722,6 +1809,16 @@ mod tests {
     }
 
     #[test]
+    fn claimed_tmux_runner_owns_its_inner_codex_child_for_rollout_discovery() {
+        let runner = wrapped();
+
+        assert_eq!(
+            pane_record_pids(10, Some(&[10, runner.owner_pid]), Some(&runner)),
+            HashSet::from([10, runner.owner_pid, runner.child_pid])
+        );
+    }
+
+    #[test]
     fn runner_suppresses_outer_and_inner_terminal_duplicates() {
         let runner = wrapped();
         let outer = TerminalJob {
@@ -1951,6 +2048,96 @@ mod tests {
                 .as_ref()
                 .and_then(|subagent| subagent.name.as_deref()),
             Some("Worker")
+        );
+    }
+
+    #[test]
+    fn process_owned_roots_keep_same_cwd_children_with_their_exact_parent() {
+        let directory = tempdir().unwrap();
+        let day = directory.path().join("2026/07/26");
+        fs::create_dir_all(&day).unwrap();
+        let resumed_thread_id = "01800000-0000-7000-8000-000000000001";
+        let unrelated_thread_id = "01800000-0000-7000-8000-000000000099";
+        let resumed_rollout = day.join("rollout-resumed.jsonl");
+        let unrelated_rollout = day.join("rollout-unrelated.jsonl");
+        for (path, thread_id) in [
+            (&resumed_rollout, resumed_thread_id),
+            (&unrelated_rollout, unrelated_thread_id),
+        ] {
+            fs::write(
+                path,
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "timestamp": "2026-07-26T14:24:55.000Z",
+                        "type": "session_meta",
+                        "payload": {
+                            "id": thread_id,
+                            "thread_source": "user",
+                            "cwd": "/work",
+                            "timestamp": "2026-07-26T14:24:55.000Z",
+                            "source": "cli"
+                        }
+                    })
+                ),
+            )
+            .unwrap();
+        }
+        let mut tracker = ThreadTracker::new(Some(directory.path().to_path_buf()));
+        tracker.scan(1_785_033_103_000, 30_000);
+
+        let mut resumed = old(AgentState::Working, true);
+        resumed.id = "host/default/%1".into();
+        resumed.cwd = "/different-launch-directory".into();
+        let resumed_id = resumed.id.clone();
+        let mut unrelated = old(AgentState::Working, true);
+        unrelated.id = "host/default/%2".into();
+        unrelated.cwd = "/work".into();
+        let unrelated_id = unrelated.id.clone();
+        let mut records = HashMap::from([
+            (resumed_id.clone(), resumed),
+            (unrelated_id.clone(), unrelated),
+        ]);
+        let record_pids = HashMap::from([
+            (resumed_id.clone(), HashSet::from([101])),
+            (unrelated_id.clone(), HashSet::from([202])),
+        ]);
+        let files = HashMap::from([(101, vec![resumed_rollout]), (202, vec![unrelated_rollout])]);
+        let mut record_thread_ids = HashMap::new();
+
+        let recovered = recover_process_owned_root_thread_ids_from_files(
+            vec![resumed_id.clone(), unrelated_id.clone()],
+            &record_pids,
+            &tracker,
+            &mut record_thread_ids,
+            &files,
+        );
+        assert_eq!(recovered.len(), 2);
+
+        link_codex_thread_subagents(
+            &mut records,
+            &[codex_thread(None)],
+            tracker.root_rollouts(),
+            &record_thread_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            ("host", "default"),
+        );
+
+        let child = &records["host/codex-thread/01800000-0000-7000-8000-000000000002"];
+        assert_eq!(
+            child
+                .subagent
+                .as_ref()
+                .map(|subagent| subagent.parent_id.as_str()),
+            Some(resumed_id.as_str())
+        );
+        assert_ne!(
+            child
+                .subagent
+                .as_ref()
+                .map(|subagent| subagent.parent_id.as_str()),
+            Some(unrelated_id.as_str())
         );
     }
 
@@ -2342,7 +2529,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_thread_fallback_matches_picker_resumed_cached_root_by_cwd() {
+    fn codex_thread_fallback_matches_a_known_root_by_cwd_and_start_time() {
         let mut parent = old(AgentState::Working, true);
         parent.id = "host/default/%1".into();
         parent.cwd = "/work".into();
@@ -2400,14 +2587,13 @@ mod tests {
     }
 
     #[test]
-    fn codex_thread_fallback_uses_stable_start_across_parent_state_changes() {
+    fn codex_thread_without_a_known_root_does_not_guess_by_cwd() {
         let mut parent = old(AgentState::Working, true);
         parent.id = "host/default/%1".into();
         parent.cwd = "/work".into();
         parent.changed_at_ms = 6_000;
-        let parent_id = parent.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent)]);
-        let record_starts = HashMap::from([(parent_id.clone(), ("Codex:1".into(), 1_000))]);
+        let mut records = HashMap::from([(parent.id.clone(), parent)]);
+        let record_starts = HashMap::from([("host/default/%1".into(), ("Codex:1".into(), 1_000))]);
 
         link_codex_thread_subagents(
             &mut records,
@@ -2419,24 +2605,21 @@ mod tests {
             ("host", "default"),
         );
 
-        assert_eq!(
-            records["host/codex-thread/01800000-0000-7000-8000-000000000002"]
-                .subagent
-                .as_ref()
-                .map(|subagent| subagent.parent_id.as_str()),
-            Some(parent_id.as_str())
-        );
+        assert_eq!(records.len(), 1);
+        assert!(records.values().all(|record| record.subagent.is_none()));
     }
 
     #[test]
-    fn codex_thread_fallback_accepts_unknown_process_only_parent() {
+    fn codex_thread_without_a_known_root_does_not_claim_a_process_only_parent() {
         let mut parent = old(AgentState::Unknown, true);
         parent.id = "host/terminal/ttys001/10".into();
         parent.cwd = "/work".into();
         parent.origin = AgentOrigin::Terminal;
-        let parent_id = parent.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent)]);
-        let record_starts = HashMap::from([(parent_id.clone(), ("Codex:10".into(), 1_000))]);
+        let mut records = HashMap::from([(parent.id.clone(), parent)]);
+        let record_starts = HashMap::from([(
+            "host/terminal/ttys001/10".into(),
+            ("Codex:10".into(), 1_000),
+        )]);
 
         link_codex_thread_subagents(
             &mut records,
@@ -2448,13 +2631,8 @@ mod tests {
             ("host", "default"),
         );
 
-        assert_eq!(
-            records["host/codex-thread/01800000-0000-7000-8000-000000000002"]
-                .subagent
-                .as_ref()
-                .map(|subagent| subagent.parent_id.as_str()),
-            Some(parent_id.as_str())
-        );
+        assert_eq!(records.len(), 1);
+        assert!(records.values().all(|record| record.subagent.is_none()));
     }
 
     #[test]
