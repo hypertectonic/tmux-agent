@@ -278,6 +278,42 @@ impl ThreadTracker {
         &self.root_rollouts
     }
 
+    pub fn root_thread_id_from_process_rollouts<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<Option<String>> {
+        let sessions = self
+            .sessions
+            .as_deref()
+            .context("Codex sessions directory is unavailable")?
+            .canonicalize()
+            .context("resolve Codex sessions directory")?;
+        let mut thread_ids = HashSet::new();
+        for path in paths {
+            let path = path
+                .canonicalize()
+                .with_context(|| format!("resolve open Codex rollout {}", path.display()))?;
+            if !path.starts_with(&sessions) || !is_rollout_file(&path) {
+                continue;
+            }
+            let metadata = read_metadata(&path)?;
+            if metadata.parent_thread_id.is_some() {
+                continue;
+            }
+            let Some(thread_id) = metadata
+                .thread_id
+                .filter(|thread_id| self.root_rollouts.contains_key(thread_id))
+            else {
+                continue;
+            };
+            thread_ids.insert(thread_id);
+            if thread_ids.len() > 1 {
+                return Ok(None);
+            }
+        }
+        Ok(thread_ids.into_iter().next())
+    }
+
     fn discover(&mut self, path: PathBuf, now_ms: u64, retention_ms: u64) {
         if self.rollouts.contains_key(&path) {
             return;
@@ -524,19 +560,33 @@ pub fn resume_thread_id_from_processes(processes: &str) -> Option<String> {
         .then_some(thread_id)
 }
 
+pub fn codex_program_from_processes(processes: &str) -> bool {
+    processes.lines().any(|process| {
+        process
+            .split_whitespace()
+            .map(|value| value.trim_matches(|character| matches!(character, '\'' | '"')))
+            .any(is_codex_program)
+    })
+}
+
 fn resume_thread_id<'a>(arguments: impl Iterator<Item = &'a str>) -> Option<String> {
     let arguments = arguments.collect::<Vec<_>>();
-    let codex = arguments
-        .iter()
-        .position(|argument| is_codex_program(argument))?;
-    let resume = codex_subcommand(&arguments, codex + 1)?;
-    if arguments.get(resume).copied() != Some("resume") {
-        return None;
-    }
+    let resume = resume_subcommand(&arguments)?;
     arguments[resume + 1..]
         .iter()
         .find(|argument| is_uuid(argument))
         .map(|argument| argument.to_string())
+}
+
+fn resume_subcommand(arguments: &[&str]) -> Option<usize> {
+    let codex = arguments
+        .iter()
+        .position(|argument| is_codex_program(argument))?;
+    let resume = codex_subcommand(arguments, codex + 1)?;
+    if arguments.get(resume).copied() != Some("resume") {
+        return None;
+    }
+    Some(resume)
 }
 
 fn codex_subcommand(arguments: &[&str], mut index: usize) -> Option<usize> {
@@ -720,6 +770,28 @@ mod tests {
         path
     }
 
+    fn write_root_rollout(root: &Path, id: &str) -> PathBuf {
+        let day = root.join("2026/07/26");
+        fs::create_dir_all(&day).unwrap();
+        let path = day.join(format!("rollout-{id}.jsonl"));
+        let mut file = File::create(&path).unwrap();
+        write_event(
+            &mut file,
+            serde_json::json!({
+                "timestamp": "2026-07-26T14:24:55.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "thread_source": "user",
+                    "cwd": "/work",
+                    "timestamp": "2026-07-26T14:24:55.000Z",
+                    "source": "cli"
+                }
+            }),
+        );
+        path
+    }
+
     #[test]
     fn parses_nested_thread_spawn_metadata() {
         let directory = tempdir().unwrap();
@@ -787,24 +859,7 @@ mod tests {
     #[test]
     fn tracker_remembers_recent_root_rollout_identity() {
         let directory = tempdir().unwrap();
-        let day = directory.path().join("2026/07/26");
-        fs::create_dir_all(&day).unwrap();
-        let path = day.join("rollout-root.jsonl");
-        let mut file = File::create(path).unwrap();
-        write_event(
-            &mut file,
-            serde_json::json!({
-                "timestamp": "2026-07-26T14:24:55.000Z",
-                "type": "session_meta",
-                "payload": {
-                    "id": "root",
-                    "thread_source": "user",
-                    "cwd": "/work",
-                    "timestamp": "2026-07-26T14:24:55.000Z",
-                    "source": "cli"
-                }
-            }),
-        );
+        write_root_rollout(directory.path(), "root");
         let now = parse_rfc3339_ms("2026-07-26T14:25:03.000Z").unwrap();
         let mut tracker = ThreadTracker::new(Some(directory.path().to_path_buf()));
 
@@ -815,6 +870,63 @@ mod tests {
                 cwd: "/work".into(),
                 started_at_ms: parse_rfc3339_ms("2026-07-26T14:24:55.000Z").unwrap(),
             })
+        );
+    }
+
+    #[test]
+    fn process_owned_rollout_recovers_only_a_known_root_identity() {
+        let directory = tempdir().unwrap();
+        let known = write_root_rollout(directory.path(), "known-root");
+        let child = write_thread_rollout(directory.path(), "child", "known-root");
+        let now = parse_rfc3339_ms("2026-07-26T14:25:03.000Z").unwrap();
+        let mut tracker = ThreadTracker::new(Some(directory.path().to_path_buf()));
+        tracker.scan(now, 30_000);
+        let unknown = write_root_rollout(directory.path(), "unknown-root");
+
+        assert_eq!(
+            tracker
+                .root_thread_id_from_process_rollouts([
+                    child.as_path(),
+                    unknown.as_path(),
+                    known.as_path(),
+                ])
+                .unwrap()
+                .as_deref(),
+            Some("known-root")
+        );
+    }
+
+    #[test]
+    fn process_owned_rollouts_refuse_multiple_known_root_identities() {
+        let directory = tempdir().unwrap();
+        let first = write_root_rollout(directory.path(), "first-root");
+        let second = write_root_rollout(directory.path(), "second-root");
+        let now = parse_rfc3339_ms("2026-07-26T14:25:03.000Z").unwrap();
+        let mut tracker = ThreadTracker::new(Some(directory.path().to_path_buf()));
+        tracker.scan(now, 30_000);
+
+        assert_eq!(
+            tracker
+                .root_thread_id_from_process_rollouts([first.as_path(), second.as_path()])
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn process_owned_rollouts_fail_closed_on_invalid_session_metadata() {
+        let directory = tempdir().unwrap();
+        let known = write_root_rollout(directory.path(), "known-root");
+        let now = parse_rfc3339_ms("2026-07-26T14:25:03.000Z").unwrap();
+        let mut tracker = ThreadTracker::new(Some(directory.path().to_path_buf()));
+        tracker.scan(now, 30_000);
+        let invalid = directory.path().join("2026/07/26/rollout-invalid.jsonl");
+        fs::write(&invalid, "{}\n").unwrap();
+
+        assert!(
+            tracker
+                .root_thread_id_from_process_rollouts([known.as_path(), invalid.as_path()])
+                .is_err()
         );
     }
 
@@ -1145,5 +1257,16 @@ mod tests {
             .as_deref(),
             Some(id)
         );
+    }
+
+    #[test]
+    fn recognizes_codex_program_without_parsing_flattened_option_values() {
+        assert!(codex_program_from_processes(
+            "codex --config instructions=a multi word value resume"
+        ));
+        assert!(codex_program_from_processes(
+            "node /opt/bin/codex --profile=work resume --last"
+        ));
+        assert!(!codex_program_from_processes("node /opt/bin/pi"));
     }
 }
