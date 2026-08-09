@@ -36,10 +36,29 @@ if [ -n "${GITHUB_REF_NAME:-}" ]; then
     case "$GITHUB_REF_NAME" in
         v*)
             tag_version=${GITHUB_REF_NAME#v}
-            if [ "$tag_version" != "$version" ]; then
-                printf 'tag %s does not match version %s\n' "$GITHUB_REF_NAME" "$version" >&2
-                exit 1
-            fi
+            case "$tag_version" in
+                "$version") ;;
+                "$version"-rc.*)
+                    candidate_number=${tag_version#"$version"-rc.}
+                    case "$candidate_number" in
+                        '' | *[!0-9]*)
+                            printf 'tag %s does not match version %s\n' \
+                                "$GITHUB_REF_NAME" "$version" >&2
+                            exit 1
+                            ;;
+                    esac
+                    [ "$candidate_number" -gt 0 ] || {
+                        printf 'tag %s does not match version %s\n' \
+                            "$GITHUB_REF_NAME" "$version" >&2
+                        exit 1
+                    }
+                    ;;
+                *)
+                    printf 'tag %s does not match version %s\n' \
+                        "$GITHUB_REF_NAME" "$version" >&2
+                    exit 1
+                    ;;
+            esac
             ;;
     esac
 fi

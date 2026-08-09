@@ -6,6 +6,8 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+## [0.4.0] - 2026-08-09
+
 ### Added
 
 - A checkout-independent `tmux-agent update` command with anonymous stable

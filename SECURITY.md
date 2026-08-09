@@ -8,8 +8,8 @@ reports are treated as high priority.
 
 | Version | Supported |
 | --- | --- |
-| 0.3.x | Yes |
-| 0.2.x | No |
+| 0.4.x | Yes |
+| 0.3.x and earlier | No |
 
 Security fixes are prepared on the active development branch and released from
 the stable release line.

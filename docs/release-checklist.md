@@ -16,6 +16,11 @@ the signed tag and draft-release workflow; it does not authorize a release.
 - [ ] No updater behavior grants automatic-update or remote-execution
   authority.
 
+A draft candidate tag may append `-rc.N` to the final `VERSION`, for example
+`v0.4.0-rc.1` for `VERSION` `0.4.0`. The workflow keeps that Release private,
+builds archives with the final version, and exercises the exact commit that
+will receive the final tag. Candidate tags are never moved or published.
+
 ## Lifecycle coverage contract
 
 | Gate | Required evidence |
