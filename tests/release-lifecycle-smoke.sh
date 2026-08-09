@@ -149,7 +149,7 @@ trap cleanup EXIT
 native_bin="$test_root/native-bin"
 mkdir "$native_bin"
 for native_tool in \
-    awk bash cat chmod cmp cp curl cut date dirname env grep head hostname kill ln lsof \
+    awk bash cat chmod cmp cp curl cut date dirname env grep gzip head hostname kill ln lsof \
     mkdir mktemp mv pgrep ps readlink rm rmdir sed sh shasum sha256sum sleep \
     sort stat tail tar tmux tr uname wc wget xargs; do
     native_tool_path=$(command -v "$native_tool" 2>/dev/null || true)
@@ -158,7 +158,7 @@ for native_tool in \
     esac
 done
 for required_native_tool in \
-    awk bash chmod cp curl dirname env grep hostname ln mkdir mktemp mv ps \
+    awk bash chmod cp curl dirname env grep gzip hostname ln mkdir mktemp mv ps \
     readlink rm rmdir sh sleep tar tmux uname; do
     [[ -x $native_bin/$required_native_tool ]] || {
         printf 'release lifecycle runtime tool is unavailable: %s\n' \
