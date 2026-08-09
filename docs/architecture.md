@@ -69,6 +69,94 @@ version, protocol, and capabilities. It intentionally has no freshness
 timestamp because snapshots are emitted on state changes, not as connection
 heartbeats.
 
+## Plugin and managed-binary compatibility
+
+The TPM checkout owns compatibility repair and fallback installation; the
+packaged binary owns update, version listing, and rollback, while the managed
+binary store owns executable versions. `COMPATIBILITY` defines the launcher
+protocol and minimum binary version required by a checkout. Every published
+managed version directory records its binary version and launcher protocol in
+its own `COMPATIBILITY` metadata. Management-capable packages additionally
+record management protocol `1`. The store has two independently atomic
+selections: `current` is the runtime binary, while `manager` is the verified
+lifecycle controller used only for update, version listing, and rollback.
+Compatibility requires all of the following:
+
+- `current` names the verified binary in its immutable `versions/<version>`
+  directory;
+- the binary reports the same semantic version as that directory and metadata;
+- the installed and checkout launcher protocols are equal; and
+- the binary version is at or above the checkout's minimum.
+
+`manager` must use the same constrained relative or data-directory-absolute
+target shape as `current`, name a native installed package with management
+protocol `1`, and pass the same binary and metadata validation. Rollback changes
+only `current`; keeping `manager` on a management-capable package ensures that
+an older runtime without lifecycle subcommands cannot strand the installation.
+Controller selection is monotonic: bootstrap and packaged update keep an
+already verified `manager` when its semantic version is equal to or newer than
+the candidate.
+
+Bootstrap holds `~/.local/share/tmux-agent/.install.lock` (under the configured
+data directory) while it rechecks compatibility, publishes a complete version
+directory, and atomically renames a relative `current` symlink. Rollback uses
+the same lock and Rust activation/restart-recovery operation as update. Under
+that lock, bootstrap can add native target and launcher metadata to the exact
+pre-self-update TPM layout: an in-store, metadata-absent `current` runtime with
+no `manager`. It publishes `TARGET` first and `COMPATIBILITY` as the commit
+point, so an exact `TARGET`-only interruption is rerunnable without granting
+the legacy runtime management capability. Other partial or ambiguous layouts
+fail closed. The
+packaged `tmux-agent update`
+command also uses this contract without reading a checkout: mutable GitHub
+metadata is used only to discover and validate the latest stable semantic
+version, while archive and `SHA256SUMS` downloads use immutable version-pinned
+URLs. Release archives carry explicit target and launcher compatibility
+metadata in addition to the binary version. All entries must be regular files
+from a fixed allowlist and remain within transfer and expansion bounds before
+an immutable version directory is published. Binary-version probes are also
+time- and output-bounded.
+
+The standalone installer publishes a small checkout-independent launcher that
+routes runtime commands to `current` and lifecycle commands to `manager`. When it
+finds a direct binary at the launcher path, bootstrap imports that binary under
+the shared lock, records its native target and launcher protocol, and preserves
+it as a recovery version before the launcher path is atomically replaced. The
+same-version case is deferred until a checksum-verified package has been staged;
+the direct binary must be byte-identical to that package. Store and version
+directory collisions must be real in-store directories whose binary and
+metadata files are regular non-symlinks. The launcher's exact versioned header
+distinguishes an older official launcher, which can be replaced atomically
+without treating it as a direct binary. The same header is required before
+uninstall removes a configured standalone launcher path. The
+checkout launcher retains compatibility repair for TPM, but its legacy version
+listing and rollback commands delegate to `manager`. Normal daemon, UI, and
+agent commands continue to execute `current`.
+
+Thus an older checkout treats a newer binary with the same launcher protocol
+as current and cannot replace it with the checkout-pinned fallback. A missing,
+below-minimum, corrupt, or protocol-incompatible managed binary is repaired
+from that pinned fallback. Self-update activates only a completely verified
+version, restarts the daemon afterward, and restores the previous activation
+if the restart fails. Managed listing and rollback fail closed when a selected
+directory, binary, platform record, or compatibility record is missing,
+incompatible, symlinked, or corrupt.
+
+This launcher protocol is separate from the daemon federation protocol. TPM's
+`prefix + U` continues to update the plugin checkout; it is not a managed-binary
+update command.
+
+The release lifecycle gate combines these component contracts without giving
+one component another's authority. Rust tests exercise update discovery,
+downgrade prevention, locking, verification, atomic activation, daemon restart
+recovery, version selection, and rollback. Shell integration tests exercise
+bootstrap and both launchers. The release workflow then uses the checksum-pinned
+public v0.3.0 packages and a genuinely newer candidate package to exercise
+fresh and upgrade layouts in standalone and TPM modes on every supported
+release target. The v0.3.0 runtime remains `current` during TPM checkout
+migration while the candidate becomes `manager`; lifecycle commands therefore
+remain available after rolling back to a runtime that predates them.
+
 ## SSH federation
 
 A structured machine produces a hardened command equivalent to:
@@ -83,6 +171,11 @@ The central daemon verifies protocol compatibility, namespaces remote IDs with
 the configured alias, merges derived records, and removes them when the stream
 fails. SSH provides encryption, authentication, host keys, and routing. There
 is no application TCP listener or shared application credential.
+
+Remote lifecycle changes remain outside the federation protocol. A user may
+run `tmux-agent update`, `versions`, or `rollback` through an ordinary explicit
+SSH command, but neither the central daemon nor a configured peer can initiate
+that command.
 
 Federation snapshots never include captured pane contents, screen buffers,
 prompts, reasoning, rollout events, goal objectives, or raw process command

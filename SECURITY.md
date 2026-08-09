@@ -8,8 +8,8 @@ reports are treated as high priority.
 
 | Version | Supported |
 | --- | --- |
-| 0.3.x | Yes |
-| 0.2.x | No |
+| 0.4.x | Yes |
+| 0.3.x and earlier | No |
 
 Security fixes are prepared on the active development branch and released from
 the stable release line.
@@ -40,6 +40,36 @@ reproduction.
 - Remote transcript content is transmitted only through an explicitly opened
   read-only SSH viewer and is not persisted on the central machine.
 - The project does not install aliases or replace provider executables.
+- Packaged updates discover only a validated stable semantic version from the
+  canonical public repository, download assets through immutable version-pinned
+  HTTPS URLs, and verify their checksum, file allowlist, platform metadata,
+  launcher protocol, and embedded binary version before atomic activation.
+  Implicit curl/wget configuration and netrc credentials are disabled, and
+  transfer, extraction, and binary-version probes have explicit bounds.
+- Update failures preserve the previous usable binary; a daemon restart
+  failure restores the previous activation.
+- Managed rollback revalidates the installed binary, native target, and
+  compatibility metadata under the shared installation lock, and restores the
+  prior activation on restart failure. Standalone migration preserves a
+  locally installed direct binary before atomically replacing its path with
+  the checkout-independent launcher; migration failure leaves that path
+  untouched. A direct binary with the checkout version must byte-match the
+  checksum-verified release before publication, and existing store collisions
+  must be real directories with regular, non-symlink metadata and binaries.
+- The `manager` selection is a separately validated native, management-capable
+  package used only for update, listing, and rollback. Rollback changes only
+  `current`, so selecting a legacy runtime cannot make lifecycle recovery depend
+  on that runtime. Bootstrap and update never replace a verified controller with
+  an older candidate. Invalid controller links or metadata fail closed.
+- Legacy TPM metadata migration accepts only a canonical, executable in-store
+  `current` runtime at or above the checkout compatibility floor when `manager`
+  and both metadata files are absent. An exact native `TARGET`-only state is the
+  sole resumable interruption; other partial, symlinked, or ambiguous states
+  fail closed, and migrated runtimes are not marked management-capable.
+- The standalone launcher's exact three-line format marker is the ownership
+  boundary for in-place launcher upgrades and removal. Uninstall leaves
+  unrelated executables and every symlink at the configured launcher path
+  untouched.
 
 These boundaries are security invariants. Changes that weaken them require
 explicit design review and documentation.

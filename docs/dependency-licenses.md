@@ -22,15 +22,15 @@ below and requires a fresh audit and generated report.
 
 ## Current candidate evidence
 
-Audit date: 2026-07-31
+Audit date: 2026-08-09
 
 `Cargo.lock` SHA-256:
 
 ```text
-a2f4726991ffe7e023e3c2fcf26b5d76c3875e2a9c83fdbeeee3b071d2d802ab
+ce3236775338facc8591f11231e879b9be21dc6f863a2cb675e932dae02a3150
 ```
 
-`cargo-audit` 0.22.2 loaded 1,175 RustSec advisories and scanned 227 locked
+`cargo-audit` 0.22.2 loaded 1,198 RustSec advisories and scanned 235 locked
 crate dependencies with no known vulnerability reported.
 
 `cargo-license` 0.7.0 reported no dependency with an unknown license. The

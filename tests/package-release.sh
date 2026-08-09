@@ -27,6 +27,10 @@ printf '%s\n' readme >"$fixture/README.md"
 printf '%s\n' license >"$fixture/LICENSE"
 printf '%s\n' notices >"$fixture/THIRD_PARTY_NOTICES.md"
 printf '%s\n' licenses >"$fixture/THIRD_PARTY_LICENSES.html"
+cat >"$fixture/COMPATIBILITY" <<'EOF'
+launcher_protocol=1
+minimum_binary_version=0.1.0
+EOF
 
 make_binary() {
     local path=$1
@@ -49,8 +53,8 @@ archive=$(
 
 contents=$(tar -tzf "$archive" | sed 's#^\./##' | sort)
 expected=$(
-    printf '%s\n' LICENSE README.md THIRD_PARTY_LICENSES.html \
-        THIRD_PARTY_NOTICES.md tmux-agent | sort
+    printf '%s\n' COMPATIBILITY LICENSE README.md TARGET \
+        THIRD_PARTY_LICENSES.html THIRD_PARTY_NOTICES.md tmux-agent | sort
 )
 [[ $contents == "$expected" ]]
 
@@ -61,6 +65,10 @@ tar -xzf "$archive" -C "$extracted"
 grep -F license "$extracted/LICENSE" >/dev/null
 grep -F notices "$extracted/THIRD_PARTY_NOTICES.md" >/dev/null
 grep -F licenses "$extracted/THIRD_PARTY_LICENSES.html" >/dev/null
+grep -Fx 'launcher_protocol=1' "$extracted/COMPATIBILITY" >/dev/null
+grep -Fx 'binary_version=0.1.0' "$extracted/COMPATIBILITY" >/dev/null
+grep -Fx 'management_protocol=1' "$extracted/COMPATIBILITY" >/dev/null
+grep -Fx 'x86_64-unknown-linux-gnu' "$extracted/TARGET" >/dev/null
 
 wrong_binary="$test_root/wrong version"
 make_binary "$wrong_binary" 9.9.9

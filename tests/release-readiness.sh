@@ -24,11 +24,13 @@ for file in \
     CONTRIBUTING.md \
     SECURITY.md \
     VERSION \
+    COMPATIBILITY \
     Cargo.lock \
     docs/installation.md \
     docs/remote-machines.md \
     docs/troubleshooting.md \
     docs/architecture.md \
+    docs/release-checklist.md \
     docs/dependency-licenses.md \
     docs/assets/ui-overview.svg \
     .github/ISSUE_TEMPLATE/feature.yml \
@@ -36,6 +38,8 @@ for file in \
     .github/workflows/ci.yml; do
     printf '%s\n' fixture >"$fixture/$file"
 done
+printf '%s\n' 0.4.0 >"$fixture/VERSION"
+printf '%s\n' '## [0.4.0] - 2026-08-09' >"$fixture/CHANGELOG.md"
 cat >"$fixture/.github/ISSUE_TEMPLATE/bug.yml" <<'EOF'
 description: Paste `tmux-agent doctor --json` after reviewing it. Do not paste terminal transcripts.
 EOF
@@ -51,11 +55,21 @@ permissions:
   contents: read
 steps:
   - run: git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+  - run: gh release download v0.3.0
+  - run: tests/release-lifecycle-smoke.sh
   - run: gh release create "$TAG" --draft --notes-file RELEASE_NOTES.md
+# target: aarch64-apple-darwin
+# target: x86_64-apple-darwin
+# target: x86_64-unknown-linux-gnu
+# target: aarch64-unknown-linux-gnu
 EOF
 cat >"$fixture/.github/workflows/ci.yml" <<'EOF'
 permissions:
   contents: read
+# target: aarch64-apple-darwin
+# target: x86_64-apple-darwin
+# target: x86_64-unknown-linux-gnu
+# target: aarch64-unknown-linux-gnu
 EOF
 cat >"$fixture/Cargo.toml" <<'EOF'
 [package]
@@ -86,7 +100,17 @@ Follow the deterministic installation procedure.
 
 Licensed under MIT.
 EOF
-printf '%s\n' 'tmux-agent vfixture' >"$fixture/RELEASE_NOTES.md"
+printf '%s\n' 'tmux-agent v0.4.0' >"$fixture/RELEASE_NOTES.md"
+cat >"$fixture/docs/release-checklist.md" <<'EOF'
+The v0.3.0 cross-version gate rejects a same-version fixture.
+
+tmux-agent update
+tmux-agent versions
+tmux-agent rollback <version>
+EOF
+cat >"$fixture/docs/remote-machines.md" <<'EOF'
+ssh -T agent@build-host.example.ts.net 'tmux-agent update'
+EOF
 
 cat >"$test_root/pass" <<'EOF'
 #!/bin/sh
@@ -98,6 +122,7 @@ for executable in \
     bin/tmux-agent \
     scripts/bootstrap \
     scripts/install \
+    scripts/standalone-launcher \
     scripts/launch-popup \
     scripts/lib.sh \
     scripts/doctor \
@@ -109,11 +134,37 @@ for executable in \
     scripts/check-release-readiness \
     scripts/export-public-snapshot \
     scripts/package-release \
+    tests/release-lifecycle-smoke.sh \
     tests/run-shell-tests; do
     cp "$test_root/pass" "$fixture/$executable"
 done
 
 "$source_root/scripts/check-release-readiness" "$fixture" >/dev/null
+
+printf '%s\n' 0.3.0 >"$fixture/VERSION"
+if "$source_root/scripts/check-release-readiness" "$fixture" \
+    >"$test_root/old-version.out" 2>"$test_root/old-version.err"; then
+    printf '%s\n' 'historical release version should fail readiness' >&2
+    exit 1
+fi
+grep -F 'candidate version must be newer than v0.3.0' \
+    "$test_root/old-version.err" >/dev/null
+printf '%s\n' 0.4.0 >"$fixture/VERSION"
+
+cp "$fixture/.github/workflows/release.yml" \
+    "$test_root/release-workflow.original"
+sed -i.bak '/tests\/release-lifecycle-smoke\.sh/d' \
+    "$fixture/.github/workflows/release.yml"
+rm -f "$fixture/.github/workflows/release.yml.bak"
+if "$source_root/scripts/check-release-readiness" "$fixture" \
+    >"$test_root/lifecycle.out" 2>"$test_root/lifecycle.err"; then
+    printf '%s\n' 'missing lifecycle smoke should fail release readiness' >&2
+    exit 1
+fi
+grep -F 'release workflow does not run the cross-version lifecycle smoke test' \
+    "$test_root/lifecycle.err" >/dev/null
+cp "$test_root/release-workflow.original" \
+    "$fixture/.github/workflows/release.yml"
 
 printf '%s\n' '<github-owner>' >>"$fixture/README.md"
 if "$source_root/scripts/check-release-readiness" "$fixture" \
@@ -153,5 +204,34 @@ if "$export_source/scripts/export-public-snapshot" "$test_root/exported" \
 fi
 grep -F 'public-tree check failed: exported synthetic marker found' \
     "$test_root/export.err" >/dev/null
+
+version_fixture="$test_root/version-source"
+mkdir -p "$version_fixture/scripts"
+cp "$source_root/scripts/check-version" "$version_fixture/scripts/"
+printf '%s\n' 0.4.0 >"$version_fixture/VERSION"
+cat >"$version_fixture/Cargo.toml" <<'EOF'
+[package]
+name = "tmux-agent"
+version = "0.4.0"
+EOF
+cat >"$version_fixture/Cargo.lock" <<'EOF'
+version = 4
+
+[[package]]
+name = "tmux-agent"
+version = "0.4.0"
+EOF
+GITHUB_REF_NAME=v0.4.0-rc.1 \
+    "$version_fixture/scripts/check-version" >/dev/null
+if GITHUB_REF_NAME=v0.4.0-rc.0 \
+    "$version_fixture/scripts/check-version" >/dev/null 2>&1; then
+    printf '%s\n' 'zero release-candidate number should fail' >&2
+    exit 1
+fi
+if GITHUB_REF_NAME=v0.4.1-rc.1 \
+    "$version_fixture/scripts/check-version" >/dev/null 2>&1; then
+    printf '%s\n' 'release-candidate tag with a different base should fail' >&2
+    exit 1
+fi
 
 printf '%s\n' 'release readiness tests passed'

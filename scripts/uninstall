@@ -20,6 +20,7 @@ esac
 
 data_dir=$(tmux_agent_data_dir)
 state_dir=$(tmux_agent_state_dir)
+install_path=${TMUX_AGENT_INSTALL_PATH:-${HOME:?HOME is required}/.local/bin/tmux-agent}
 if binary=$(tmux_agent_current_binary 2>/dev/null); then
     "$binary" daemon stop >/dev/null 2>&1 || true
 fi
@@ -31,6 +32,15 @@ if [ -e "$data_dir" ]; then
     fi
     rm -rf -- "$data_dir"
     printf 'removed %s\n' "$data_dir"
+fi
+
+if [ -e "$install_path" ] || [ -L "$install_path" ]; then
+    if tmux_agent_is_standalone_launcher "$install_path"; then
+        rm -f -- "$install_path"
+        printf 'removed %s\n' "$install_path"
+    else
+        printf 'kept unrelated launcher path %s\n' "$install_path"
+    fi
 fi
 
 if [ "$purge" -eq 1 ]; then

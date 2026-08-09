@@ -57,12 +57,14 @@ for required in \
     CONTRIBUTING.md \
     SECURITY.md \
     VERSION \
+    COMPATIBILITY \
     Cargo.toml \
     Cargo.lock \
     docs/installation.md \
     docs/remote-machines.md \
     docs/troubleshooting.md \
     docs/architecture.md \
+    docs/release-checklist.md \
     docs/dependency-licenses.md \
     docs/assets/ui-overview.svg \
     .github/CODEOWNERS \
@@ -80,6 +82,7 @@ for executable in \
     bin/tmux-agent \
     scripts/bootstrap \
     scripts/install \
+    scripts/standalone-launcher \
     scripts/launch-popup \
     scripts/lib.sh \
     scripts/doctor \
@@ -91,6 +94,7 @@ for executable in \
     scripts/check-release-readiness \
     scripts/export-public-snapshot \
     scripts/package-release \
+    tests/release-lifecycle-smoke.sh \
     tests/run-shell-tests; do
     require_executable "$executable"
 done
@@ -185,13 +189,75 @@ version=$(tr -d '\n' <"$root/VERSION")
 if ! rg -Fq "tmux-agent v$version" "$root/RELEASE_NOTES.md"; then
     fail 'curated release notes do not match VERSION'
 fi
+if ! awk -v candidate="$version" 'BEGIN {
+    split(candidate, release, /[-+]/)
+    count = split(release[1], part, ".")
+    if (count != 3 || part[1] !~ /^[0-9]+$/ ||
+        part[2] !~ /^[0-9]+$/ || part[3] !~ /^[0-9]+$/) {
+        exit 1
+    }
+    if (part[1] > 0 || part[2] > 3 ||
+        (part[2] == 3 && part[3] > 0)) {
+        exit 0
+    }
+    exit 1
+}'; then
+    fail 'candidate version must be newer than v0.3.0'
+fi
+if ! rg -Fq "## [$version] - " "$root/CHANGELOG.md"; then
+    fail 'CHANGELOG does not contain the candidate version'
+fi
 if ! rg -Fq 'merge-base --is-ancestor' "$root/.github/workflows/release.yml"; then
     fail 'release workflow does not require the tagged commit on main'
+fi
+if ! rg -Fq 'tests/release-lifecycle-smoke.sh' \
+    "$root/.github/workflows/release.yml"; then
+    fail 'release workflow does not run the cross-version lifecycle smoke test'
+fi
+if ! rg -Fq 'gh release download v0.3.0' \
+    "$root/.github/workflows/release.yml"; then
+    fail 'release workflow does not fetch the immutable v0.3.0 lifecycle baseline'
+fi
+for target in \
+    aarch64-apple-darwin \
+    x86_64-apple-darwin \
+    x86_64-unknown-linux-gnu \
+    aarch64-unknown-linux-gnu; do
+    if ! rg -Fq "target: $target" "$root/.github/workflows/ci.yml" ||
+        ! rg -Fq "target: $target" "$root/.github/workflows/release.yml"; then
+        fail "supported release target is missing from CI or release smoke: $target"
+    fi
+done
+for command in 'tmux-agent update' 'tmux-agent versions' 'tmux-agent rollback'; do
+    if ! rg -Fq "$command" "$root/docs/release-checklist.md"; then
+        fail "release checklist does not cover $command"
+    fi
+done
+if ! rg -Fq 'same-version' "$root/docs/release-checklist.md" ||
+    ! rg -Fq 'v0.3.0' "$root/docs/release-checklist.md"; then
+    fail 'release checklist does not distinguish the historical upgrade gate'
+fi
+if ! rg -Fq 'ssh -T agent@build-host.example.ts.net' \
+    "$root/docs/remote-machines.md"; then
+    fail 'remote guide does not use explicit user-controlled SSH lifecycle commands'
 fi
 if rg -n 'releases/(latest|download/latest)|/latest/' \
     "$root/scripts/bootstrap" "$root/scripts/install" "$root/scripts/lib.sh" \
     "$root/scripts/launch-popup" "$root/bin" "$root/tmux-agent.tmux"; then
     fail 'plugin installation contains an unpinned latest-release URL'
+fi
+if [ -f "$root/src/update.rs" ]; then
+    if ! rg -Fq \
+        'https://api.github.com/repos/hypertectonic/tmux-agent/releases/latest' \
+        "$root/src/update.rs" ||
+        ! rg -Fq \
+            'https://github.com/hypertectonic/tmux-agent/releases/download' \
+            "$root/src/update.rs"; then
+        fail 'self-update does not use the canonical GitHub release endpoints'
+    fi
+    if rg -n 'releases/(latest/download|download/latest)' "$root/src/update.rs"; then
+        fail 'self-update contains a mutable latest-release asset URL'
+    fi
 fi
 
 "$root/scripts/check-version" >/dev/null || failed=1

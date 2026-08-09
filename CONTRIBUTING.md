@@ -51,3 +51,5 @@ Shell behavior changes should include isolated launcher, installer, or tmux
 integration coverage. Regenerate `THIRD_PARTY_LICENSES.html` with
 `scripts/generate-third-party-licenses` whenever `Cargo.lock` changes. Run
 `scripts/check-release-readiness` and `cargo audit` before a release candidate.
+The cross-version and supported-target release gates are defined in
+[the release checklist](docs/release-checklist.md).

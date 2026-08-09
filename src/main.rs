@@ -11,6 +11,7 @@ mod store;
 mod tmux;
 mod transcript;
 mod ui;
+mod update;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -124,6 +125,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Install and activate a verified tmux-agent release.
+    Update {
+        /// Install one exact version; prereleases must be requested this way.
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+    },
+    /// List the active managed version and available rollback targets.
+    Versions,
+    /// Activate one already installed managed version.
+    Rollback {
+        /// Exact installed semantic version to activate.
+        version: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -147,6 +161,15 @@ async fn main() -> Result<()> {
     if let Command::Doctor { json } = &cli.command {
         return doctor::run(cli.config.as_deref(), *json).await;
     }
+    if let Command::Update { version } = &cli.command {
+        return update::run(version.as_deref(), cli.config.as_deref());
+    }
+    if matches!(cli.command, Command::Versions) {
+        return update::run_versions();
+    }
+    if let Command::Rollback { version } = &cli.command {
+        return update::run_rollback(version, cli.config.as_deref());
+    }
 
     let (config, config_path) = Config::load(cli.config.as_deref())?;
     let tmux = Tmux::new(&config);
@@ -154,6 +177,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Doctor { .. } => unreachable!(),
+        Command::Update { .. } => unreachable!(),
+        Command::Versions | Command::Rollback { .. } => unreachable!(),
         Command::Daemon {
             command: DaemonCommand::Run,
         } => daemon::run(config, paths, tmux).await,

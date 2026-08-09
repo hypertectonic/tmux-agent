@@ -30,11 +30,19 @@ interactive operations but should not start a background collector.
 
 ## Setup order
 
-1. Install the new version on remote machines.
-2. Verify each remote directly:
+1. From a user-controlled shell, update each remote explicitly with ordinary
+   SSH. tmux-agent does not issue this command or orchestrate remote updates:
 
    ```sh
-   ssh agent@build-host.example.ts.net \
+   ssh -T agent@build-host.example.ts.net \
+     '/home/agent/.local/bin/tmux-agent update'
+   ```
+2. Inspect the remote managed versions, then verify the selected binary:
+
+   ```sh
+   ssh -T agent@build-host.example.ts.net \
+     '/home/agent/.local/bin/tmux-agent versions'
+   ssh -T agent@build-host.example.ts.net \
      '/home/agent/.local/bin/tmux-agent --version'
    ```
 
@@ -54,6 +62,18 @@ interactive operations but should not start a background collector.
 
 Federation protocol changes require all machines to be updated together.
 Protocol mismatches are rejected with both the received and required version.
+
+If a remote update needs to be reversed, choose a version from that host's
+`versions` output and explicitly run:
+
+```sh
+ssh -T agent@build-host.example.ts.net \
+  '/home/agent/.local/bin/tmux-agent rollback <version>'
+```
+
+These are ordinary SSH commands initiated and authorized by the user. Remote
+configuration grants federation read access only; it never grants tmux-agent
+authority to run lifecycle commands on another machine.
 
 ## What crosses SSH
 
