@@ -189,6 +189,24 @@ version=$(tr -d '\n' <"$root/VERSION")
 if ! rg -Fq "tmux-agent v$version" "$root/RELEASE_NOTES.md"; then
     fail 'curated release notes do not match VERSION'
 fi
+if ! awk -v candidate="$version" 'BEGIN {
+    split(candidate, release, /[-+]/)
+    count = split(release[1], part, ".")
+    if (count != 3 || part[1] !~ /^[0-9]+$/ ||
+        part[2] !~ /^[0-9]+$/ || part[3] !~ /^[0-9]+$/) {
+        exit 1
+    }
+    if (part[1] > 0 || part[2] > 3 ||
+        (part[2] == 3 && part[3] > 0)) {
+        exit 0
+    }
+    exit 1
+}'; then
+    fail 'candidate version must be newer than v0.3.0'
+fi
+if ! rg -Fq "## [$version] - " "$root/CHANGELOG.md"; then
+    fail 'CHANGELOG does not contain the candidate version'
+fi
 if ! rg -Fq 'merge-base --is-ancestor' "$root/.github/workflows/release.yml"; then
     fail 'release workflow does not require the tagged commit on main'
 fi

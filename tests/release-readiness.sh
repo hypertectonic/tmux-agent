@@ -38,6 +38,8 @@ for file in \
     .github/workflows/ci.yml; do
     printf '%s\n' fixture >"$fixture/$file"
 done
+printf '%s\n' 0.4.0 >"$fixture/VERSION"
+printf '%s\n' '## [0.4.0] - 2026-08-09' >"$fixture/CHANGELOG.md"
 cat >"$fixture/.github/ISSUE_TEMPLATE/bug.yml" <<'EOF'
 description: Paste `tmux-agent doctor --json` after reviewing it. Do not paste terminal transcripts.
 EOF
@@ -98,7 +100,7 @@ Follow the deterministic installation procedure.
 
 Licensed under MIT.
 EOF
-printf '%s\n' 'tmux-agent vfixture' >"$fixture/RELEASE_NOTES.md"
+printf '%s\n' 'tmux-agent v0.4.0' >"$fixture/RELEASE_NOTES.md"
 cat >"$fixture/docs/release-checklist.md" <<'EOF'
 The v0.3.0 cross-version gate rejects a same-version fixture.
 
@@ -138,6 +140,16 @@ for executable in \
 done
 
 "$source_root/scripts/check-release-readiness" "$fixture" >/dev/null
+
+printf '%s\n' 0.3.0 >"$fixture/VERSION"
+if "$source_root/scripts/check-release-readiness" "$fixture" \
+    >"$test_root/old-version.out" 2>"$test_root/old-version.err"; then
+    printf '%s\n' 'historical release version should fail readiness' >&2
+    exit 1
+fi
+grep -F 'candidate version must be newer than v0.3.0' \
+    "$test_root/old-version.err" >/dev/null
+printf '%s\n' 0.4.0 >"$fixture/VERSION"
 
 cp "$fixture/.github/workflows/release.yml" \
     "$test_root/release-workflow.original"
@@ -192,5 +204,34 @@ if "$export_source/scripts/export-public-snapshot" "$test_root/exported" \
 fi
 grep -F 'public-tree check failed: exported synthetic marker found' \
     "$test_root/export.err" >/dev/null
+
+version_fixture="$test_root/version-source"
+mkdir -p "$version_fixture/scripts"
+cp "$source_root/scripts/check-version" "$version_fixture/scripts/"
+printf '%s\n' 0.4.0 >"$version_fixture/VERSION"
+cat >"$version_fixture/Cargo.toml" <<'EOF'
+[package]
+name = "tmux-agent"
+version = "0.4.0"
+EOF
+cat >"$version_fixture/Cargo.lock" <<'EOF'
+version = 4
+
+[[package]]
+name = "tmux-agent"
+version = "0.4.0"
+EOF
+GITHUB_REF_NAME=v0.4.0-rc.1 \
+    "$version_fixture/scripts/check-version" >/dev/null
+if GITHUB_REF_NAME=v0.4.0-rc.0 \
+    "$version_fixture/scripts/check-version" >/dev/null 2>&1; then
+    printf '%s\n' 'zero release-candidate number should fail' >&2
+    exit 1
+fi
+if GITHUB_REF_NAME=v0.4.1-rc.1 \
+    "$version_fixture/scripts/check-version" >/dev/null 2>&1; then
+    printf '%s\n' 'release-candidate tag with a different base should fail' >&2
+    exit 1
+fi
 
 printf '%s\n' 'release readiness tests passed'
