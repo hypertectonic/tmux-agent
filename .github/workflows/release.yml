@@ -164,7 +164,7 @@ jobs:
           ref: ${{ github.ref }}
       - name: Install runtime requirements on Linux
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lsof tmux
+        run: sudo apt-get update && sudo apt-get install -y gzip lsof tmux
       - name: Install runtime requirements on macOS
         if: runner.os == 'macOS'
         run: brew install tmux
