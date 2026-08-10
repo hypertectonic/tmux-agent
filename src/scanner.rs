@@ -432,7 +432,6 @@ impl Scanner {
                 .or_insert_with(|| thread_id.clone());
         }
         let recovered = recover_process_owned_root_thread_ids(
-            &self.tmux,
             &next,
             &record_pids,
             &processes.process_args,
@@ -1102,7 +1101,6 @@ fn pane_record_pids(
 }
 
 fn recover_process_owned_root_thread_ids(
-    tmux: &Tmux,
     records: &HashMap<String, AgentRecord>,
     record_pids: &HashMap<String, HashSet<u32>>,
     process_args: &HashMap<u32, String>,
@@ -1131,7 +1129,7 @@ fn recover_process_owned_root_thread_ids(
         .collect::<Vec<_>>();
     candidate_pids.sort_unstable();
     candidate_pids.dedup();
-    let Ok(files) = tmux.process_rollout_files(&candidate_pids) else {
+    let Ok(files) = codex::process_rollout_files(&candidate_pids) else {
         return Vec::new();
     };
     recover_process_owned_root_thread_ids_from_files(
