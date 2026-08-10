@@ -6,6 +6,22 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+## [0.4.1] - 2026-08-10
+
+### Changed
+
+- Isolate process-owned Codex rollout discovery behind the Codex evidence
+  boundary instead of the generic tmux adapter.
+- Move Codex subagent ownership state and reconciliation policy behind a
+  focused deterministic module while keeping provider-neutral process linking,
+  ancestry restoration, and completion retention shared.
+
+### Reliability
+
+- Preserve exact and resumed identity precedence, retained root bindings,
+  nesting, process/in-process deduplication, completion suppression, and
+  fail-closed ambiguity at a focused test seam.
+
 ## [0.4.0] - 2026-08-09
 
 ### Added
