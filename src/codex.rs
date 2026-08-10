@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 mod evidence;
+mod ownership;
 
 pub(crate) use evidence::process_rollout_files;
+pub(crate) use ownership::{CodexOwnership, ReconciliationFrame};
 
 const DISCOVERY_INTERVAL_MS: u64 = 1_000;
 const RECENT_SESSION_DAYS: usize = 7;

@@ -48,6 +48,15 @@ files. Only thread identity, parent identity, nickname, working directory, and
 lifecycle timestamps participate in discovery. Rollout content never enters a
 snapshot.
 
+The scanner owns provider-neutral process-tree linking, ancestry restoration,
+and the 30-second finished-child retention window. Rollout discovery and
+metadata parsing stay on the Codex side of the scanner boundary, with open-file
+inspection isolated in the Codex evidence adapter. A focused, deterministic
+Codex ownership reconciler then applies exact thread identity, recovered root
+bindings, process/in-process deduplication, nesting, and fail-closed ambiguity
+rules. It owns the short-lived Codex binding state but performs no tmux,
+process-table, `lsof`, or filesystem I/O.
+
 Nested parent identity is retained while visible children are active. Finished
 children remain visible for 30 seconds.
 
