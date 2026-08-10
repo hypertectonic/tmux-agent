@@ -1,4 +1,4 @@
-use crate::codex::{self, RootRollout, ThreadRollout, ThreadTracker};
+use crate::codex::{self, CodexOwnership, ReconciliationFrame, ThreadTracker};
 use crate::config::Config;
 use crate::detect;
 use crate::detect::stabilize::StateTracker;
@@ -25,9 +25,8 @@ pub struct Scanner {
     terminal_cwds: HashMap<u32, String>,
     runner_directory: PathBuf,
     codex_threads: ThreadTracker,
-    finished_process_threads: HashMap<String, String>,
+    codex_ownership: CodexOwnership,
     record_starts: HashMap<String, (String, u64)>,
-    process_root_threads: HashMap<String, (String, String)>,
     revision: u64,
 }
 
@@ -59,8 +58,7 @@ impl Scanner {
                     .collect()
             })
             .unwrap_or_default();
-        let mut finished_process_threads = HashMap::new();
-        remember_finished_process_threads(&previous, &host, &mut finished_process_threads);
+        let codex_ownership = CodexOwnership::new(&previous, &host, &server);
         Ok(Self {
             tmux,
             host,
@@ -70,9 +68,8 @@ impl Scanner {
             terminal_cwds: HashMap::new(),
             runner_directory,
             codex_threads: ThreadTracker::from_environment(),
-            finished_process_threads,
+            codex_ownership,
             record_starts: HashMap::new(),
-            process_root_threads: HashMap::new(),
             revision: 0,
         })
     }
@@ -401,12 +398,12 @@ impl Scanner {
 
         let thread_rollouts = self.codex_threads.scan(now, SUBAGENT_RETENTION_MS);
         let root_rollouts = self.codex_threads.root_rollouts().clone();
-        suppress_finished_process_threads(
-            &mut next,
-            &mut record_pids,
-            &mut self.finished_process_threads,
-            &thread_rollouts,
-        );
+        self.codex_ownership
+            .suppress_finished_processes_before_linking(
+                &mut next,
+                &mut record_pids,
+                &thread_rollouts,
+            );
 
         link_subagents(
             &mut next,
@@ -417,45 +414,24 @@ impl Scanner {
             &self.record_starts,
             now,
         );
-        self.process_root_threads
-            .retain(|record_id, (identity, _)| {
-                next.get(record_id).is_some_and(|record| {
-                    record.agent.eq_ignore_ascii_case("codex") && record.subagent.is_none()
-                }) && self
-                    .record_starts
-                    .get(record_id)
-                    .is_some_and(|(current, _)| current == identity)
-            });
-        for (record_id, (_, thread_id)) in &self.process_root_threads {
-            record_thread_ids
-                .entry(record_id.clone())
-                .or_insert_with(|| thread_id.clone());
-        }
-        let recovered = recover_process_owned_root_thread_ids(
-            &self.tmux,
+        let recovered_root_threads = collect_process_owned_root_thread_evidence(
             &next,
             &record_pids,
             &processes.process_args,
             &self.codex_threads,
-            &mut record_thread_ids,
-        );
-        for (record_id, thread_id) in recovered {
-            if let Some((identity, _)) = self.record_starts.get(&record_id) {
-                self.process_root_threads
-                    .insert(record_id, (identity.clone(), thread_id));
-            }
-        }
-        restore_previous_subagent_ancestry(&mut next, &self.previous, now);
-        link_codex_thread_subagents(
-            &mut next,
-            &thread_rollouts,
-            &root_rollouts,
             &record_thread_ids,
-            &self.record_starts,
-            &self.previous,
-            (&self.host, &self.server),
         );
-        remember_finished_process_threads(&next, &self.host, &mut self.finished_process_threads);
+        restore_previous_subagent_ancestry(&mut next, &self.previous, now);
+        self.codex_ownership
+            .reconcile_after_process_linking(ReconciliationFrame {
+                records: &mut next,
+                record_thread_ids: &mut record_thread_ids,
+                record_starts: &self.record_starts,
+                previous: &self.previous,
+                threads: &thread_rollouts,
+                root_rollouts: &root_rollouts,
+                recovered_root_threads: &recovered_root_threads,
+            });
         retain_finished_subagents(&mut next, &self.previous, now);
         self.previous = next;
         self.record_starts
@@ -674,85 +650,6 @@ fn find_parent_agent(
     None
 }
 
-fn link_codex_thread_subagents(
-    records: &mut HashMap<String, AgentRecord>,
-    threads: &[ThreadRollout],
-    root_rollouts: &HashMap<String, RootRollout>,
-    record_thread_ids: &HashMap<String, String>,
-    record_starts: &HashMap<String, (String, u64)>,
-    previous: &HashMap<String, AgentRecord>,
-    location: (&str, &str),
-) {
-    let (host, server) = location;
-    let explicit_parents = unambiguous_thread_parents(record_thread_ids);
-    let thread_ids = threads
-        .iter()
-        .map(|thread| thread.thread_id.as_str())
-        .collect::<HashSet<_>>();
-    let mut linked_threads = records
-        .values()
-        .filter_map(|record| {
-            record
-                .subagent
-                .as_ref()
-                .and_then(|subagent| subagent.thread_id.as_ref())
-                .map(|thread_id| (thread_id.clone(), record.id.clone()))
-        })
-        .collect::<HashMap<_, _>>();
-    let mut pending = threads.iter().collect::<Vec<_>>();
-    pending.sort_by_key(|thread| (thread.depth.unwrap_or(1), thread.started_at_ms));
-    loop {
-        let mut progress = false;
-        let mut remaining = Vec::new();
-        for thread in pending {
-            let parent_id = explicit_parents
-                .get(&thread.parent_thread_id)
-                .or_else(|| linked_threads.get(&thread.parent_thread_id))
-                .cloned()
-                .or_else(|| {
-                    (thread.depth.unwrap_or(1) <= 1
-                        && !thread_ids.contains(thread.parent_thread_id.as_str()))
-                    .then(|| {
-                        root_rollouts
-                            .get(&thread.parent_thread_id)
-                            .and_then(|root| unique_root_parent(records, root, record_starts))
-                    })
-                    .flatten()
-                });
-            let Some(parent_id) = parent_id else {
-                remaining.push(thread);
-                continue;
-            };
-            if let Some(record_id) =
-                attach_thread_to_process_child(records, threads, thread, &parent_id, previous)
-            {
-                reparent_agent_path_process_child(records, threads, thread, &parent_id, &record_id);
-                linked_threads.insert(thread.thread_id.clone(), record_id);
-                progress = true;
-                continue;
-            }
-            let synthetic_id = format!("{host}/codex-thread/{}", thread.thread_id);
-            if insert_synthetic_thread(records, thread, &parent_id, &synthetic_id, server) {
-                reparent_agent_path_process_child(
-                    records,
-                    threads,
-                    thread,
-                    &parent_id,
-                    &synthetic_id,
-                );
-                linked_threads.insert(thread.thread_id.clone(), synthetic_id);
-                progress = true;
-            } else {
-                remaining.push(thread);
-            }
-        }
-        if !progress || remaining.is_empty() {
-            break;
-        }
-        pending = remaining;
-    }
-}
-
 fn restore_previous_subagent_ancestry(
     records: &mut HashMap<String, AgentRecord>,
     previous: &HashMap<String, AgentRecord>,
@@ -819,262 +716,6 @@ fn restore_previous_subagent_ancestry(
     }
 }
 
-fn reparent_agent_path_process_child(
-    records: &mut HashMap<String, AgentRecord>,
-    threads: &[ThreadRollout],
-    thread: &ThreadRollout,
-    root_parent_id: &str,
-    thread_record_id: &str,
-) {
-    if thread.process_backed {
-        return;
-    }
-    let mut matches = records.values().filter(|record| {
-        record.id != thread_record_id
-            && record.agent.eq_ignore_ascii_case("codex")
-            && same_cwd(&record.cwd, &thread.cwd)
-            && record.subagent.as_ref().is_some_and(|subagent| {
-                subagent.parent_id == root_parent_id
-                    && subagent.thread_id.is_none()
-                    && subagent
-                        .name
-                        .as_deref()
-                        .map(codex::normalize_name)
-                        .is_some_and(|name| {
-                            preferred_agent_path_owner(
-                                threads,
-                                thread,
-                                &name,
-                                subagent.started_at_ms,
-                            )
-                        })
-            })
-    });
-    let Some(child_id) = matches.next().map(|record| record.id.clone()) else {
-        return;
-    };
-    if matches.next().is_some() {
-        return;
-    }
-    if let Some(subagent) = records
-        .get_mut(&child_id)
-        .and_then(|record| record.subagent.as_mut())
-    {
-        subagent.parent_id = thread_record_id.to_string();
-    }
-}
-
-fn preferred_agent_path_owner(
-    threads: &[ThreadRollout],
-    thread: &ThreadRollout,
-    process_name: &str,
-    process_started_at_ms: u64,
-) -> bool {
-    let mut candidates = threads
-        .iter()
-        .filter(|candidate| {
-            !candidate.process_backed
-                && candidate.parent_thread_id == thread.parent_thread_id
-                && same_cwd(&candidate.cwd, &thread.cwd)
-                && candidate.started_at_ms <= process_started_at_ms
-                && candidate
-                    .finished_at_ms
-                    .is_none_or(|finished_at_ms| process_started_at_ms <= finished_at_ms)
-        })
-        .filter_map(|candidate| {
-            agent_path_match_score(candidate, process_name)
-                .map(|score| (candidate, (candidate.started_at_ms, score)))
-        });
-    let Some((best, score)) = candidates.next() else {
-        return false;
-    };
-    let mut best_thread_id = best.thread_id.as_str();
-    let mut best_score = score;
-    let mut tied = false;
-    for (candidate, score) in candidates {
-        if score > best_score {
-            best_thread_id = candidate.thread_id.as_str();
-            best_score = score;
-            tied = false;
-        } else if score == best_score {
-            tied = true;
-        }
-    }
-    !tied && best_thread_id == thread.thread_id
-}
-
-fn agent_path_match_score(thread: &ThreadRollout, process_name: &str) -> Option<u8> {
-    let path_name = thread
-        .agent_path
-        .as_deref()?
-        .rsplit('/')
-        .find(|component| !component.is_empty())
-        .map(codex::normalize_name)?;
-    let expected_name = path_name.strip_prefix("codex-").unwrap_or(&path_name);
-    if expected_name == process_name {
-        Some(1)
-    } else {
-        expected_name
-            .strip_suffix(process_name)
-            .filter(|prefix| prefix.ends_with('-'))
-            .map(|_| 0)
-    }
-}
-
-fn unique_root_parent(
-    records: &HashMap<String, AgentRecord>,
-    root: &RootRollout,
-    record_starts: &HashMap<String, (String, u64)>,
-) -> Option<String> {
-    const ROOT_START_TOLERANCE_MS: u64 = 10_000;
-
-    let mut matches = records
-        .values()
-        .filter(|record| {
-            record.agent.eq_ignore_ascii_case("codex")
-                && record.subagent.is_none()
-                && matches!(
-                    record.state,
-                    AgentState::Working
-                        | AgentState::Blocked
-                        | AgentState::Idle
-                        | AgentState::Unknown
-                )
-                && same_cwd(&record.cwd, &root.cwd)
-                && record_starts.get(&record.id).is_some_and(|(_, started)| {
-                    started.abs_diff(root.started_at_ms) <= ROOT_START_TOLERANCE_MS
-                })
-        })
-        .map(|record| record.id.clone());
-    let parent = matches.next()?;
-    matches.next().is_none().then_some(parent)
-}
-
-fn suppress_finished_process_threads(
-    records: &mut HashMap<String, AgentRecord>,
-    record_pids: &mut HashMap<String, HashSet<u32>>,
-    finished_process_threads: &mut HashMap<String, String>,
-    threads: &[ThreadRollout],
-) {
-    let active_thread_ids = threads
-        .iter()
-        .filter(|thread| thread.finished_at_ms.is_none())
-        .map(|thread| thread.thread_id.as_str())
-        .collect::<HashSet<_>>();
-    finished_process_threads.retain(|record_id, thread_id| {
-        records.contains_key(record_id) && !active_thread_ids.contains(thread_id.as_str())
-    });
-    for record_id in finished_process_threads.keys() {
-        records.remove(record_id);
-        record_pids.remove(record_id);
-    }
-}
-
-fn remember_finished_process_threads(
-    records: &HashMap<String, AgentRecord>,
-    host: &str,
-    finished_process_threads: &mut HashMap<String, String>,
-) {
-    let synthetic_prefix = format!("{host}/codex-thread/");
-    for record in records.values() {
-        let Some(subagent) = record
-            .subagent
-            .as_ref()
-            .filter(|subagent| subagent.finished_at_ms.is_some())
-        else {
-            continue;
-        };
-        if !record.id.starts_with(&synthetic_prefix)
-            && let Some(thread_id) = &subagent.thread_id
-        {
-            finished_process_threads.insert(record.id.clone(), thread_id.clone());
-        }
-    }
-}
-
-fn insert_synthetic_thread(
-    records: &mut HashMap<String, AgentRecord>,
-    thread: &ThreadRollout,
-    parent_id: &str,
-    synthetic_id: &str,
-    server: &str,
-) -> bool {
-    let Some(parent) = records.get(parent_id).cloned() else {
-        return false;
-    };
-    let finished = thread.finished_at_ms;
-    let state = if finished.is_some() {
-        AgentState::Idle
-    } else {
-        AgentState::Working
-    };
-    let attention = if finished.is_some() {
-        Attention::Done
-    } else {
-        Attention::Working
-    };
-    let name = thread.name.clone();
-    records.insert(
-        synthetic_id.to_string(),
-        AgentRecord {
-            id: synthetic_id.to_string(),
-            host: parent.host,
-            server: server.to_string(),
-            pane_id: parent.pane_id,
-            pane_pid: parent.pane_pid,
-            session_id: parent.session_id,
-            session_name: parent.session_name,
-            window_id: parent.window_id,
-            window_index: parent.window_index,
-            window_name: parent.window_name,
-            pane_index: parent.pane_index,
-            agent: "Codex".into(),
-            state,
-            attention,
-            source: EvidenceSource::Process,
-            title: name.clone().unwrap_or_else(|| "subagent".into()),
-            label: None,
-            cwd: thread.cwd.clone(),
-            visible: false,
-            seen: false,
-            changed_at_ms: finished.unwrap_or(thread.started_at_ms),
-            origin: parent.origin,
-            terminal: parent.terminal,
-            remote_alias: None,
-            ssh_connection: parent.ssh_connection,
-            focus_target: None,
-            goal: None,
-            subagent: Some(SubagentInfo {
-                parent_id: parent_id.to_string(),
-                started_at_ms: thread.started_at_ms,
-                finished_at_ms: finished,
-                name,
-                thread_id: Some(thread.thread_id.clone()),
-            }),
-            detection: None,
-        },
-    );
-    true
-}
-
-fn unambiguous_thread_parents(
-    record_thread_ids: &HashMap<String, String>,
-) -> HashMap<String, String> {
-    let mut candidates = HashMap::<String, Vec<String>>::new();
-    for (record_id, thread_id) in record_thread_ids {
-        candidates
-            .entry(thread_id.clone())
-            .or_default()
-            .push(record_id.clone());
-    }
-    candidates
-        .into_iter()
-        .filter_map(|(thread_id, records)| {
-            (records.len() == 1).then(|| (thread_id, records[0].clone()))
-        })
-        .collect()
-}
-
 fn runner_codex_thread_id(
     runner: &RunnerState,
     process_args: &HashMap<u32, String>,
@@ -1101,14 +742,13 @@ fn pane_record_pids(
     pids
 }
 
-fn recover_process_owned_root_thread_ids(
-    tmux: &Tmux,
+fn collect_process_owned_root_thread_evidence(
     records: &HashMap<String, AgentRecord>,
     record_pids: &HashMap<String, HashSet<u32>>,
     process_args: &HashMap<u32, String>,
     tracker: &ThreadTracker,
-    record_thread_ids: &mut HashMap<String, String>,
-) -> Vec<(String, String)> {
+    record_thread_ids: &HashMap<String, String>,
+) -> HashMap<String, String> {
     let candidates = records
         .values()
         .filter(|record| {
@@ -1131,26 +771,19 @@ fn recover_process_owned_root_thread_ids(
         .collect::<Vec<_>>();
     candidate_pids.sort_unstable();
     candidate_pids.dedup();
-    let Ok(files) = tmux.process_rollout_files(&candidate_pids) else {
-        return Vec::new();
+    let Ok(files) = codex::process_rollout_files(&candidate_pids) else {
+        return HashMap::new();
     };
-    recover_process_owned_root_thread_ids_from_files(
-        candidates,
-        record_pids,
-        tracker,
-        record_thread_ids,
-        &files,
-    )
+    collect_process_owned_root_thread_evidence_from_files(candidates, record_pids, tracker, &files)
 }
 
-fn recover_process_owned_root_thread_ids_from_files(
+fn collect_process_owned_root_thread_evidence_from_files(
     candidates: Vec<String>,
     record_pids: &HashMap<String, HashSet<u32>>,
     tracker: &ThreadTracker,
-    record_thread_ids: &mut HashMap<String, String>,
     files: &HashMap<u32, Vec<PathBuf>>,
-) -> Vec<(String, String)> {
-    let mut recovered = Vec::new();
+) -> HashMap<String, String> {
+    let mut recovered = HashMap::new();
     for record_id in candidates {
         let Some(pids) = record_pids.get(&record_id) else {
             continue;
@@ -1166,209 +799,9 @@ fn recover_process_owned_root_thread_ids_from_files(
         let Ok(Some(thread_id)) = tracker.root_thread_id_from_process_rollouts(paths) else {
             continue;
         };
-        record_thread_ids.insert(record_id.clone(), thread_id.clone());
-        recovered.push((record_id, thread_id));
+        recovered.insert(record_id, thread_id);
     }
     recovered
-}
-
-fn same_cwd(left: &str, right: &str) -> bool {
-    left.trim_end_matches('/') == right.trim_end_matches('/')
-}
-
-fn attach_thread_to_process_child(
-    records: &mut HashMap<String, AgentRecord>,
-    threads: &[ThreadRollout],
-    thread: &ThreadRollout,
-    parent_id: &str,
-    previous: &HashMap<String, AgentRecord>,
-) -> Option<String> {
-    let base_candidate = |record: &AgentRecord| {
-        record.agent.eq_ignore_ascii_case("codex")
-            && record
-                .subagent
-                .as_ref()
-                .is_some_and(|subagent| subagent.parent_id == parent_id)
-    };
-    let mut exact = records
-        .iter()
-        .filter(|(_, record)| {
-            record.agent.eq_ignore_ascii_case("codex")
-                && is_subagent_descendant_of(records, record, parent_id)
-                && record
-                    .subagent
-                    .as_ref()
-                    .and_then(|subagent| subagent.thread_id.as_deref())
-                    == Some(thread.thread_id.as_str())
-        })
-        .map(|(id, _)| id.clone());
-    if let Some(candidate) = exact.next() {
-        if exact.next().is_none() {
-            return update_process_child(records, thread, candidate);
-        }
-        return None;
-    }
-    let mut candidates = records
-        .iter()
-        .filter(|(record_id, record)| {
-            if !base_candidate(record) || !same_cwd(&record.cwd, &thread.cwd) {
-                return false;
-            }
-            heuristic_process_match(record_id, record, thread, parent_id, previous)
-                && threads
-                    .iter()
-                    .filter(|candidate_thread| {
-                        candidate_thread.parent_thread_id == thread.parent_thread_id
-                            && heuristic_process_match(
-                                record_id,
-                                record,
-                                candidate_thread,
-                                parent_id,
-                                previous,
-                            )
-                    })
-                    .take(2)
-                    .count()
-                    == 1
-        })
-        .map(|(id, _)| id.clone());
-    if let Some(candidate) = candidates.next() {
-        if candidates.next().is_some() {
-            return None;
-        }
-        return update_process_child(records, thread, candidate);
-    }
-
-    let mut nested_candidates = records
-        .iter()
-        .filter(|(record_id, record)| {
-            heuristic_nested_process_match(records, record_id, record, thread, parent_id)
-                && threads
-                    .iter()
-                    .filter(|candidate_thread| {
-                        candidate_thread.parent_thread_id == thread.parent_thread_id
-                            && heuristic_nested_process_match(
-                                records,
-                                record_id,
-                                record,
-                                candidate_thread,
-                                parent_id,
-                            )
-                    })
-                    .take(2)
-                    .count()
-                    == 1
-        })
-        .map(|(id, _)| id.clone());
-    let candidate = nested_candidates.next()?;
-    if nested_candidates.next().is_some() {
-        return None;
-    }
-    update_process_child(records, thread, candidate)
-}
-
-fn heuristic_process_match(
-    _record_id: &str,
-    record: &AgentRecord,
-    thread: &ThreadRollout,
-    parent_id: &str,
-    _previous: &HashMap<String, AgentRecord>,
-) -> bool {
-    if !thread.process_backed {
-        return false;
-    }
-    let Some(subagent) = &record.subagent else {
-        return false;
-    };
-    if !record.agent.eq_ignore_ascii_case("codex")
-        || subagent.parent_id != parent_id
-        || !same_cwd(&record.cwd, &thread.cwd)
-        || subagent.thread_id.is_some()
-    {
-        return false;
-    }
-    let expected_name = thread.name.as_deref().map(codex::normalize_name);
-    let candidate_name = subagent.name.as_deref().map(codex::normalize_name);
-    (subagent.started_at_ms.abs_diff(thread.started_at_ms) <= 120_000)
-        && (expected_name.is_none() || candidate_name.is_none() || expected_name == candidate_name)
-}
-
-fn heuristic_nested_process_match(
-    records: &HashMap<String, AgentRecord>,
-    _record_id: &str,
-    record: &AgentRecord,
-    thread: &ThreadRollout,
-    parent_id: &str,
-) -> bool {
-    if !thread.process_backed || !is_subagent_descendant_of(records, record, parent_id) {
-        return false;
-    }
-    let Some(subagent) = &record.subagent else {
-        return false;
-    };
-    if subagent.parent_id == parent_id
-        || !record.agent.eq_ignore_ascii_case("codex")
-        || !same_cwd(&record.cwd, &thread.cwd)
-        || subagent.thread_id.is_some()
-    {
-        return false;
-    }
-    let expected_name = thread.name.as_deref().map(codex::normalize_name);
-    let candidate_name = subagent.name.as_deref().map(codex::normalize_name);
-    (subagent.started_at_ms.abs_diff(thread.started_at_ms) <= 120_000)
-        && (expected_name.is_none() || candidate_name.is_none() || expected_name == candidate_name)
-}
-
-fn is_subagent_descendant_of(
-    records: &HashMap<String, AgentRecord>,
-    record: &AgentRecord,
-    ancestor_id: &str,
-) -> bool {
-    let Some(mut parent_id) = record
-        .subagent
-        .as_ref()
-        .map(|subagent| subagent.parent_id.as_str())
-    else {
-        return false;
-    };
-    let mut visited = HashSet::new();
-    loop {
-        if parent_id == ancestor_id {
-            return true;
-        }
-        if !visited.insert(parent_id.to_string()) {
-            return false;
-        }
-        let Some(parent) = records.get(parent_id) else {
-            return false;
-        };
-        let Some(subagent) = &parent.subagent else {
-            return false;
-        };
-        parent_id = &subagent.parent_id;
-    }
-}
-
-fn update_process_child(
-    records: &mut HashMap<String, AgentRecord>,
-    thread: &ThreadRollout,
-    candidate: String,
-) -> Option<String> {
-    let record = records.get_mut(&candidate)?;
-    let subagent = record.subagent.as_mut()?;
-    subagent.thread_id = Some(thread.thread_id.clone());
-    subagent.started_at_ms = thread.started_at_ms;
-    if subagent.name.is_none() {
-        subagent.name = thread.name.clone();
-    }
-    if let Some(finished_at_ms) = thread.finished_at_ms {
-        subagent.finished_at_ms = Some(finished_at_ms);
-        record.state = AgentState::Idle;
-        record.attention = Attention::Done;
-        record.seen = false;
-        record.changed_at_ms = finished_at_ms;
-    }
-    Some(candidate)
 }
 
 fn remember_record_start(
@@ -1521,6 +954,7 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex::{RootRollout, ThreadRollout};
     use std::fs;
     use tempfile::tempdir;
 
@@ -2010,45 +1444,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resumed_codex_thread_links_by_exact_id_despite_wrapper_cwd() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/wrapper-home".into();
-        parent.origin = AgentOrigin::Terminal;
-        let parent_id = parent.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent)]);
-        let thread_ids = HashMap::from([(
-            parent_id.clone(),
-            "01800000-0000-7000-8000-000000000001".into(),
-        )]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(None)],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        let child = &records["host/codex-thread/01800000-0000-7000-8000-000000000002"];
-        assert_eq!(child.attention, Attention::Working);
-        assert_eq!(
-            child
-                .subagent
-                .as_ref()
-                .map(|subagent| subagent.parent_id.as_str()),
-            Some(parent_id.as_str())
-        );
-        assert_eq!(
-            child
-                .subagent
-                .as_ref()
-                .and_then(|subagent| subagent.name.as_deref()),
-            Some("Worker")
-        );
+    fn reconcile_codex_ownership(
+        records: &mut HashMap<String, AgentRecord>,
+        threads: &[ThreadRollout],
+        root_rollouts: &HashMap<String, RootRollout>,
+        record_thread_ids: &HashMap<String, String>,
+        record_starts: &HashMap<String, (String, u64)>,
+        previous: &HashMap<String, AgentRecord>,
+        recovered_root_threads: &HashMap<String, String>,
+    ) {
+        let mut ownership = CodexOwnership::new(previous, "host", "default");
+        let mut record_thread_ids = record_thread_ids.clone();
+        ownership.reconcile_after_process_linking(ReconciliationFrame {
+            records,
+            record_thread_ids: &mut record_thread_ids,
+            record_starts,
+            previous,
+            threads,
+            root_rollouts,
+            recovered_root_threads,
+        });
     }
 
     #[test]
@@ -2103,25 +1518,22 @@ mod tests {
             (unrelated_id.clone(), HashSet::from([202])),
         ]);
         let files = HashMap::from([(101, vec![resumed_rollout]), (202, vec![unrelated_rollout])]);
-        let mut record_thread_ids = HashMap::new();
-
-        let recovered = recover_process_owned_root_thread_ids_from_files(
+        let recovered = collect_process_owned_root_thread_evidence_from_files(
             vec![resumed_id.clone(), unrelated_id.clone()],
             &record_pids,
             &tracker,
-            &mut record_thread_ids,
             &files,
         );
         assert_eq!(recovered.len(), 2);
 
-        link_codex_thread_subagents(
+        reconcile_codex_ownership(
             &mut records,
             &[codex_thread(None)],
             tracker.root_rollouts(),
-            &record_thread_ids,
             &HashMap::new(),
             &HashMap::new(),
-            ("host", "default"),
+            &HashMap::new(),
+            &recovered,
         );
 
         let child = &records["host/codex-thread/01800000-0000-7000-8000-000000000002"];
@@ -2138,252 +1550,6 @@ mod tests {
                 .as_ref()
                 .map(|subagent| subagent.parent_id.as_str()),
             Some(unrelated_id.as_str())
-        );
-    }
-
-    #[test]
-    fn agent_path_nests_process_child_under_in_process_thread() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let parent_id = parent.id.clone();
-        let mut review = old(AgentState::Unknown, true);
-        review.id = "host/terminal/ttys002/70".into();
-        review.cwd = "/work".into();
-        review.origin = AgentOrigin::Terminal;
-        review.subagent = Some(SubagentInfo {
-            parent_id: parent_id.clone(),
-            started_at_ms: 5_500,
-            finished_at_ms: None,
-            name: Some("review".into()),
-            thread_id: None,
-        });
-        let review_id = review.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent), (review_id.clone(), review)]);
-        let thread_ids =
-            HashMap::from([(parent_id, "01800000-0000-7000-8000-000000000001".into())]);
-        let mut thread = codex_thread(None);
-        thread.agent_path = Some("/root/codex_review".into());
-        thread.process_backed = false;
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[thread],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        let synthetic_id = "host/codex-thread/01800000-0000-7000-8000-000000000002";
-        let worker = &records[synthetic_id];
-        assert_eq!(
-            worker
-                .subagent
-                .as_ref()
-                .map(|subagent| subagent.parent_id.as_str()),
-            Some("host/run/main")
-        );
-        assert_eq!(
-            records[&review_id]
-                .subagent
-                .as_ref()
-                .map(|subagent| subagent.parent_id.as_str()),
-            Some(synthetic_id)
-        );
-    }
-
-    #[test]
-    fn task_specific_agent_path_nests_role_process_child() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let parent_id = parent.id.clone();
-        let mut review = old(AgentState::Unknown, true);
-        review.id = "host/terminal/ttys002/70".into();
-        review.cwd = "/work".into();
-        review.origin = AgentOrigin::Terminal;
-        review.subagent = Some(SubagentInfo {
-            parent_id: parent_id.clone(),
-            started_at_ms: 5_500,
-            finished_at_ms: None,
-            name: Some("review".into()),
-            thread_id: None,
-        });
-        let review_id = review.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent), (review_id.clone(), review)]);
-        let thread_ids =
-            HashMap::from([(parent_id, "01800000-0000-7000-8000-000000000001".into())]);
-        let mut thread = codex_thread(None);
-        thread.agent_path = Some("/root/final_memory_recovery_review".into());
-        thread.process_backed = false;
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[thread],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        let synthetic_id = "host/codex-thread/01800000-0000-7000-8000-000000000002";
-        assert_eq!(
-            records[&review_id]
-                .subagent
-                .as_ref()
-                .map(|subagent| subagent.parent_id.as_str()),
-            Some(synthetic_id)
-        );
-    }
-
-    #[test]
-    fn task_specific_agent_path_does_not_reparent_older_process_child() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let parent_id = parent.id.clone();
-        let mut review = old(AgentState::Unknown, true);
-        review.id = "host/terminal/ttys002/70".into();
-        review.cwd = "/work".into();
-        review.origin = AgentOrigin::Terminal;
-        review.subagent = Some(SubagentInfo {
-            parent_id: parent_id.clone(),
-            started_at_ms: 4_500,
-            finished_at_ms: None,
-            name: Some("review".into()),
-            thread_id: None,
-        });
-        let review_id = review.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent), (review_id.clone(), review)]);
-        let thread_ids = HashMap::from([(
-            parent_id.clone(),
-            "01800000-0000-7000-8000-000000000001".into(),
-        )]);
-        let mut thread = codex_thread(None);
-        thread.agent_path = Some("/root/final_memory_recovery_review".into());
-        thread.process_backed = false;
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[thread],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(
-            records[&review_id]
-                .subagent
-                .as_ref()
-                .map(|subagent| subagent.parent_id.as_str()),
-            Some(parent_id.as_str())
-        );
-    }
-
-    #[test]
-    fn completed_role_thread_does_not_claim_later_process_child() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let parent_id = parent.id.clone();
-        let mut review = old(AgentState::Unknown, true);
-        review.id = "host/terminal/ttys002/70".into();
-        review.cwd = "/work".into();
-        review.origin = AgentOrigin::Terminal;
-        review.subagent = Some(SubagentInfo {
-            parent_id: parent_id.clone(),
-            started_at_ms: 6_600,
-            finished_at_ms: None,
-            name: Some("review".into()),
-            thread_id: None,
-        });
-        let review_id = review.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent), (review_id.clone(), review)]);
-        let thread_ids = HashMap::from([(parent_id, "root-thread".into())]);
-        let mut completed = codex_thread(Some(6_000));
-        completed.thread_id = "completed-review".into();
-        completed.parent_thread_id = "root-thread".into();
-        completed.agent_path = Some("/root/first_task_review".into());
-        completed.process_backed = false;
-        let mut active = codex_thread(None);
-        active.thread_id = "active-review".into();
-        active.parent_thread_id = "root-thread".into();
-        active.started_at_ms = 6_500;
-        active.agent_path = Some("/root/second_task_review".into());
-        active.process_backed = false;
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[completed, active],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(
-            records[&review_id]
-                .subagent
-                .as_ref()
-                .map(|subagent| subagent.parent_id.as_str()),
-            Some("host/codex-thread/active-review")
-        );
-    }
-
-    #[test]
-    fn latest_overlapping_role_thread_claims_process_child() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let parent_id = parent.id.clone();
-        let mut review = old(AgentState::Unknown, true);
-        review.id = "host/terminal/ttys002/70".into();
-        review.cwd = "/work".into();
-        review.origin = AgentOrigin::Terminal;
-        review.subagent = Some(SubagentInfo {
-            parent_id: parent_id.clone(),
-            started_at_ms: 6_600,
-            finished_at_ms: None,
-            name: Some("review".into()),
-            thread_id: None,
-        });
-        let review_id = review.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent), (review_id.clone(), review)]);
-        let thread_ids = HashMap::from([(parent_id, "root-thread".into())]);
-        let mut first = codex_thread(None);
-        first.thread_id = "first-review".into();
-        first.parent_thread_id = "root-thread".into();
-        first.agent_path = Some("/root/first_task_review".into());
-        first.process_backed = false;
-        let mut second = codex_thread(None);
-        second.thread_id = "second-review".into();
-        second.parent_thread_id = "root-thread".into();
-        second.started_at_ms = 6_500;
-        second.agent_path = Some("/root/second_task_review".into());
-        second.process_backed = false;
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[first, second],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(
-            records[&review_id]
-                .subagent
-                .as_ref()
-                .map(|subagent| subagent.parent_id.as_str()),
-            Some("host/codex-thread/second-review")
         );
     }
 
@@ -2410,7 +1576,18 @@ mod tests {
         thread.process_backed = false;
         let synthetic_id = "host/codex-thread/01800000-0000-7000-8000-000000000002".to_string();
         let mut previous = HashMap::from([(parent_id.clone(), parent.clone())]);
-        insert_synthetic_thread(&mut previous, &thread, &parent_id, &synthetic_id, "default");
+        reconcile_codex_ownership(
+            &mut previous,
+            &[thread],
+            &HashMap::new(),
+            &HashMap::from([(
+                parent_id.clone(),
+                "01800000-0000-7000-8000-000000000001".into(),
+            )]),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         review.subagent.as_mut().unwrap().parent_id = synthetic_id.clone();
         previous.insert(review_id.clone(), review.clone());
         review.subagent.as_mut().unwrap().parent_id = parent_id.clone();
@@ -2437,635 +1614,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_thread_fallback_refuses_ambiguous_same_cwd_parents() {
-        let mut first = old(AgentState::Working, true);
-        first.id = "host/default/%1".into();
-        first.cwd = "/work".into();
-        let mut second = old(AgentState::Working, true);
-        second.id = "host/default/%2".into();
-        second.cwd = "/work".into();
-        let mut records = HashMap::from([(first.id.clone(), first), (second.id.clone(), second)]);
-        let record_starts = HashMap::from([
-            ("host/default/%1".into(), ("Codex:1".into(), 1_000)),
-            ("host/default/%2".into(), ("Codex:2".into(), 1_000)),
-        ]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(None)],
-            &HashMap::new(),
-            &HashMap::new(),
-            &record_starts,
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(records.len(), 2);
-        assert!(records.values().all(|record| record.subagent.is_none()));
-    }
-
-    #[test]
-    fn codex_thread_fallback_rejects_a_different_known_root_session() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/default/%1".into();
-        parent.cwd = "/work".into();
-        let mut records = HashMap::from([(parent.id.clone(), parent)]);
-        let record_starts = HashMap::from([("host/default/%1".into(), ("Codex:1".into(), 50_000))]);
-        let root_rollouts = HashMap::from([(
-            "01800000-0000-7000-8000-000000000001".into(),
-            RootRollout {
-                cwd: "/work".into(),
-                started_at_ms: 1_000,
-            },
-        )]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(None)],
-            &root_rollouts,
-            &HashMap::new(),
-            &record_starts,
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(records.len(), 1);
-        assert!(records.values().all(|record| record.subagent.is_none()));
-    }
-
-    #[test]
-    fn codex_thread_fallback_matches_a_fresh_known_root_session_by_start_time() {
-        let mut parent = old(AgentState::Idle, true);
-        parent.id = "host/default/%1".into();
-        parent.cwd = "/work".into();
-        let parent_id = parent.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent)]);
-        let record_starts = HashMap::from([(parent_id.clone(), ("Codex:1".into(), 1_500))]);
-        let root_rollouts = HashMap::from([(
-            "01800000-0000-7000-8000-000000000001".into(),
-            RootRollout {
-                cwd: "/work".into(),
-                started_at_ms: 1_000,
-            },
-        )]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(None)],
-            &root_rollouts,
-            &HashMap::new(),
-            &record_starts,
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(
-            records["host/codex-thread/01800000-0000-7000-8000-000000000002"]
-                .subagent
-                .as_ref()
-                .map(|subagent| subagent.parent_id.as_str()),
-            Some(parent_id.as_str())
-        );
-    }
-
-    #[test]
-    fn codex_thread_fallback_matches_a_known_root_by_cwd_and_start_time() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/default/%1".into();
-        parent.cwd = "/work".into();
-        let parent_id = parent.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent)]);
-        let record_starts = HashMap::from([(parent_id.clone(), ("Codex:1".into(), 4_000))]);
-        let root_rollouts = HashMap::from([(
-            "01800000-0000-7000-8000-000000000001".into(),
-            RootRollout {
-                cwd: "/work".into(),
-                started_at_ms: 1_000,
-            },
-        )]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(None)],
-            &root_rollouts,
-            &HashMap::new(),
-            &record_starts,
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(
-            records["host/codex-thread/01800000-0000-7000-8000-000000000002"]
-                .subagent
-                .as_ref()
-                .map(|subagent| subagent.parent_id.as_str()),
-            Some(parent_id.as_str())
-        );
-    }
-
-    #[test]
-    fn codex_thread_fallback_refuses_parent_started_after_thread() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/default/%1".into();
-        parent.cwd = "/work".into();
-        parent.changed_at_ms = 6_000;
-        let mut records = HashMap::from([(parent.id.clone(), parent)]);
-        let record_starts = HashMap::from([("host/default/%1".into(), ("Codex:1".into(), 8_000))]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(None)],
-            &HashMap::new(),
-            &HashMap::new(),
-            &record_starts,
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(records.len(), 1);
-        assert!(records.values().all(|record| record.subagent.is_none()));
-    }
-
-    #[test]
-    fn codex_thread_without_a_known_root_does_not_guess_by_cwd() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/default/%1".into();
-        parent.cwd = "/work".into();
-        parent.changed_at_ms = 6_000;
-        let mut records = HashMap::from([(parent.id.clone(), parent)]);
-        let record_starts = HashMap::from([("host/default/%1".into(), ("Codex:1".into(), 1_000))]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(None)],
-            &HashMap::new(),
-            &HashMap::new(),
-            &record_starts,
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(records.len(), 1);
-        assert!(records.values().all(|record| record.subagent.is_none()));
-    }
-
-    #[test]
-    fn codex_thread_without_a_known_root_does_not_claim_a_process_only_parent() {
-        let mut parent = old(AgentState::Unknown, true);
-        parent.id = "host/terminal/ttys001/10".into();
-        parent.cwd = "/work".into();
-        parent.origin = AgentOrigin::Terminal;
-        let mut records = HashMap::from([(parent.id.clone(), parent)]);
-        let record_starts = HashMap::from([(
-            "host/terminal/ttys001/10".into(),
-            ("Codex:10".into(), 1_000),
-        )]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(None)],
-            &HashMap::new(),
-            &HashMap::new(),
-            &record_starts,
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(records.len(), 1);
-        assert!(records.values().all(|record| record.subagent.is_none()));
-    }
-
-    #[test]
-    fn rollout_identity_enriches_process_child_without_duplication() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let mut child = old(AgentState::Unknown, true);
-        child.id = "host/terminal/ttys002/70".into();
-        child.cwd = "/work".into();
-        child.origin = AgentOrigin::Terminal;
-        child.subagent = Some(SubagentInfo {
-            parent_id: parent.id.clone(),
-            started_at_ms: 5_010,
-            finished_at_ms: None,
-            name: None,
-            thread_id: None,
-        });
-        let parent_id = parent.id.clone();
-        let child_id = child.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent), (child_id.clone(), child)]);
-        let thread_ids =
-            HashMap::from([(parent_id, "01800000-0000-7000-8000-000000000001".into())]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(Some(9_000))],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(records.len(), 2);
-        let child = &records[&child_id];
-        assert_eq!(child.attention, Attention::Done);
-        assert_eq!(
-            child
-                .subagent
-                .as_ref()
-                .and_then(|subagent| subagent.thread_id.as_deref()),
-            Some("01800000-0000-7000-8000-000000000002")
-        );
-        assert_eq!(
-            child
-                .subagent
-                .as_ref()
-                .and_then(|subagent| subagent.name.as_deref()),
-            Some("Worker")
-        );
-    }
-
-    #[test]
-    fn process_backed_rollout_enriches_child_nested_under_in_process_thread() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let parent_id = parent.id.clone();
-        let mut delegated = old(AgentState::Idle, true);
-        delegated.id = "host/codex-thread/delegated".into();
-        delegated.cwd = "/work".into();
-        delegated.subagent = Some(SubagentInfo {
-            parent_id: parent_id.clone(),
-            started_at_ms: 4_000,
-            finished_at_ms: Some(6_000),
-            name: Some("Banach".into()),
-            thread_id: Some("delegated".into()),
-        });
-        let delegated_id = delegated.id.clone();
-        let mut review = old(AgentState::Unknown, true);
-        review.id = "host/terminal/ttys002/70".into();
-        review.cwd = "/work".into();
-        review.origin = AgentOrigin::Terminal;
-        review.subagent = Some(SubagentInfo {
-            parent_id: delegated_id,
-            started_at_ms: 5_010,
-            finished_at_ms: None,
-            name: Some("Worker".into()),
-            thread_id: None,
-        });
-        let review_id = review.id.clone();
-        let mut records = HashMap::from([
-            (parent_id.clone(), parent),
-            (delegated.id.clone(), delegated),
-            (review_id.clone(), review),
-        ]);
-        let thread_ids =
-            HashMap::from([(parent_id, "01800000-0000-7000-8000-000000000001".into())]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(None)],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(records.len(), 3);
-        assert_eq!(
-            records[&review_id]
-                .subagent
-                .as_ref()
-                .and_then(|subagent| subagent.thread_id.as_deref()),
-            Some("01800000-0000-7000-8000-000000000002")
-        );
-        assert!(!records.contains_key("host/codex-thread/01800000-0000-7000-8000-000000000002"));
-    }
-
-    #[test]
-    fn in_process_thread_does_not_replace_a_separate_process_child() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let parent_id = parent.id.clone();
-        let mut child = old(AgentState::Unknown, true);
-        child.id = "host/terminal/ttys002/70".into();
-        child.cwd = "/work".into();
-        child.origin = AgentOrigin::Terminal;
-        child.subagent = Some(SubagentInfo {
-            parent_id: parent_id.clone(),
-            started_at_ms: 5_010,
-            finished_at_ms: None,
-            name: Some("Worker".into()),
-            thread_id: None,
-        });
-        let child_id = child.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent), (child_id.clone(), child)]);
-        let thread_ids =
-            HashMap::from([(parent_id, "01800000-0000-7000-8000-000000000001".into())]);
-        let mut thread = codex_thread(None);
-        thread.process_backed = false;
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[thread],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(records.len(), 3);
-        assert!(
-            records[&child_id]
-                .subagent
-                .as_ref()
-                .and_then(|subagent| subagent.thread_id.as_ref())
-                .is_none()
-        );
-        assert!(records.contains_key("host/codex-thread/01800000-0000-7000-8000-000000000002"));
-    }
-
-    #[test]
-    fn rollout_identity_rejects_new_process_child_with_mismatched_start_time() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let mut child = old(AgentState::Unknown, true);
-        child.id = "host/terminal/ttys002/70".into();
-        child.cwd = "/work".into();
-        child.origin = AgentOrigin::Terminal;
-        child.subagent = Some(SubagentInfo {
-            parent_id: parent.id.clone(),
-            started_at_ms: 500_000,
-            finished_at_ms: None,
-            name: Some("Worker".into()),
-            thread_id: None,
-        });
-        let parent_id = parent.id.clone();
-        let child_id = child.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent), (child_id.clone(), child)]);
-        let thread_ids =
-            HashMap::from([(parent_id, "01800000-0000-7000-8000-000000000001".into())]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(None)],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(records.len(), 3);
-        assert!(
-            records[&child_id]
-                .subagent
-                .as_ref()
-                .and_then(|subagent| subagent.thread_id.as_ref())
-                .is_none()
-        );
-        assert!(records.contains_key("host/codex-thread/01800000-0000-7000-8000-000000000002"));
-    }
-
-    #[test]
-    fn rollout_identity_does_not_overwrite_process_child_bound_to_another_thread() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let mut child = old(AgentState::Unknown, true);
-        child.id = "host/terminal/ttys002/70".into();
-        child.cwd = "/work".into();
-        child.origin = AgentOrigin::Terminal;
-        child.subagent = Some(SubagentInfo {
-            parent_id: parent.id.clone(),
-            started_at_ms: 5_000,
-            finished_at_ms: None,
-            name: None,
-            thread_id: Some("already-bound".into()),
-        });
-        let parent_id = parent.id.clone();
-        let child_id = child.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent), (child_id.clone(), child)]);
-        let thread_ids =
-            HashMap::from([(parent_id, "01800000-0000-7000-8000-000000000001".into())]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(None)],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(
-            records[&child_id]
-                .subagent
-                .as_ref()
-                .and_then(|subagent| subagent.thread_id.as_deref()),
-            Some("already-bound")
-        );
-        assert!(records.contains_key("host/codex-thread/01800000-0000-7000-8000-000000000002"));
-    }
-
-    #[test]
-    fn rollout_identity_does_not_enrich_a_non_codex_process_child() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let mut child = old(AgentState::Unknown, true);
-        child.id = "host/terminal/ttys002/70".into();
-        child.agent = "Claude".into();
-        child.cwd = "/work".into();
-        child.origin = AgentOrigin::Terminal;
-        child.subagent = Some(SubagentInfo {
-            parent_id: parent.id.clone(),
-            started_at_ms: 5_000,
-            finished_at_ms: None,
-            name: None,
-            thread_id: None,
-        });
-        let parent_id = parent.id.clone();
-        let child_id = child.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent), (child_id.clone(), child)]);
-        let thread_ids =
-            HashMap::from([(parent_id, "01800000-0000-7000-8000-000000000001".into())]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(None)],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert!(
-            records[&child_id]
-                .subagent
-                .as_ref()
-                .and_then(|subagent| subagent.thread_id.as_ref())
-                .is_none()
-        );
-        assert!(records.contains_key("host/codex-thread/01800000-0000-7000-8000-000000000002"));
-    }
-
-    #[test]
-    fn exact_thread_binding_outranks_an_unbound_process_child() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let parent_id = parent.id.clone();
-        let mut exact = old(AgentState::Unknown, true);
-        exact.id = "host/terminal/ttys002/70".into();
-        exact.cwd = "/work".into();
-        exact.origin = AgentOrigin::Terminal;
-        exact.subagent = Some(SubagentInfo {
-            parent_id: parent_id.clone(),
-            started_at_ms: 5_000,
-            finished_at_ms: None,
-            name: None,
-            thread_id: Some("01800000-0000-7000-8000-000000000002".into()),
-        });
-        let exact_id = exact.id.clone();
-        let mut unbound = exact.clone();
-        unbound.id = "host/terminal/ttys003/80".into();
-        unbound.subagent.as_mut().unwrap().thread_id = None;
-        let unbound_id = unbound.id.clone();
-        let mut records = HashMap::from([
-            (parent_id.clone(), parent),
-            (exact_id.clone(), exact),
-            (unbound_id.clone(), unbound),
-        ]);
-        let thread_ids =
-            HashMap::from([(parent_id, "01800000-0000-7000-8000-000000000001".into())]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(Some(9_000))],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(
-            records[&exact_id]
-                .subagent
-                .as_ref()
-                .and_then(|subagent| subagent.finished_at_ms),
-            Some(9_000)
-        );
-        assert!(
-            records[&unbound_id]
-                .subagent
-                .as_ref()
-                .and_then(|subagent| subagent.thread_id.as_ref())
-                .is_none()
-        );
-        assert!(!records.contains_key("host/codex-thread/01800000-0000-7000-8000-000000000002"));
-    }
-
-    #[test]
-    fn exact_thread_binding_does_not_require_matching_cwd() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let parent_id = parent.id.clone();
-        let mut child = old(AgentState::Unknown, true);
-        child.id = "host/terminal/ttys002/70".into();
-        child.cwd = "/work-before-runner-refresh".into();
-        child.origin = AgentOrigin::Terminal;
-        child.subagent = Some(SubagentInfo {
-            parent_id: parent_id.clone(),
-            started_at_ms: 5_000,
-            finished_at_ms: None,
-            name: None,
-            thread_id: Some("01800000-0000-7000-8000-000000000002".into()),
-        });
-        let child_id = child.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent), (child_id.clone(), child)]);
-        let thread_ids =
-            HashMap::from([(parent_id, "01800000-0000-7000-8000-000000000001".into())]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[codex_thread(Some(9_000))],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(
-            records[&child_id]
-                .subagent
-                .as_ref()
-                .and_then(|subagent| subagent.finished_at_ms),
-            Some(9_000)
-        );
-        assert!(!records.contains_key("host/codex-thread/01800000-0000-7000-8000-000000000002"));
-    }
-
-    #[test]
-    fn competing_rollouts_do_not_claim_one_unbound_process_child() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let parent_id = parent.id.clone();
-        let mut child = old(AgentState::Unknown, true);
-        child.id = "host/terminal/ttys002/70".into();
-        child.cwd = "/work".into();
-        child.origin = AgentOrigin::Terminal;
-        child.subagent = Some(SubagentInfo {
-            parent_id: parent_id.clone(),
-            started_at_ms: 5_000,
-            finished_at_ms: None,
-            name: None,
-            thread_id: None,
-        });
-        let child_id = child.id.clone();
-        let mut first = codex_thread(None);
-        first.thread_id = "first-thread".into();
-        first.name = None;
-        let mut second = codex_thread(None);
-        second.thread_id = "second-thread".into();
-        second.name = None;
-        let mut records = HashMap::from([(parent_id.clone(), parent), (child_id.clone(), child)]);
-        let thread_ids =
-            HashMap::from([(parent_id, "01800000-0000-7000-8000-000000000001".into())]);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[second, first],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert!(
-            records[&child_id]
-                .subagent
-                .as_ref()
-                .and_then(|subagent| subagent.thread_id.as_ref())
-                .is_none()
-        );
-        assert!(records.contains_key("host/codex-thread/first-thread"));
-        assert!(records.contains_key("host/codex-thread/second-thread"));
-    }
-
-    #[test]
     fn active_rollout_replaces_a_disappeared_process_child_without_done_duplicate() {
         let mut parent = old(AgentState::Working, true);
         parent.id = "host/run/main".into();
@@ -3087,96 +1635,19 @@ mod tests {
         let thread_ids =
             HashMap::from([(parent_id, "01800000-0000-7000-8000-000000000001".into())]);
 
-        link_codex_thread_subagents(
+        reconcile_codex_ownership(
             &mut records,
             &[codex_thread(None)],
             &HashMap::new(),
             &thread_ids,
             &HashMap::new(),
             &previous,
-            ("host", "default"),
+            &HashMap::new(),
         );
         retain_finished_subagents(&mut records, &previous, 10_000);
 
         assert!(records.contains_key("host/codex-thread/01800000-0000-7000-8000-000000000002"));
         assert!(!records.contains_key("host/terminal/ttys002/70"));
-    }
-
-    #[test]
-    fn completed_process_thread_stays_suppressed_until_reactivation() {
-        let mut child = old(AgentState::Idle, false);
-        child.id = "host/terminal/ttys002/70".into();
-        child.origin = AgentOrigin::Terminal;
-        child.subagent = Some(SubagentInfo {
-            parent_id: "host/run/main".into(),
-            started_at_ms: 5_000,
-            finished_at_ms: Some(10_000),
-            name: Some("Worker".into()),
-            thread_id: Some("01800000-0000-7000-8000-000000000002".into()),
-        });
-        let previous = HashMap::from([(child.id.clone(), child.clone())]);
-        let mut tombstones = HashMap::new();
-        remember_finished_process_threads(&previous, "host", &mut tombstones);
-
-        let mut records = HashMap::from([(child.id.clone(), child.clone())]);
-        let mut record_pids = HashMap::from([(child.id.clone(), HashSet::from([70]))]);
-        suppress_finished_process_threads(&mut records, &mut record_pids, &mut tombstones, &[]);
-        retain_finished_subagents(&mut records, &previous, 40_000);
-        assert!(records.is_empty());
-        assert!(record_pids.is_empty());
-        assert_eq!(
-            tombstones.get(&child.id).map(String::as_str),
-            Some("01800000-0000-7000-8000-000000000002")
-        );
-
-        let mut reactivated_records = HashMap::from([(child.id.clone(), child)]);
-        let mut reactivated_pids =
-            HashMap::from([("host/terminal/ttys002/70".into(), HashSet::from([70]))]);
-        suppress_finished_process_threads(
-            &mut reactivated_records,
-            &mut reactivated_pids,
-            &mut tombstones,
-            &[codex_thread(None)],
-        );
-        assert!(reactivated_records.contains_key("host/terminal/ttys002/70"));
-        assert!(tombstones.is_empty());
-    }
-
-    #[test]
-    fn nested_codex_thread_links_to_its_synthetic_thread_parent() {
-        let mut parent = old(AgentState::Working, true);
-        parent.id = "host/run/main".into();
-        parent.cwd = "/work".into();
-        let parent_id = parent.id.clone();
-        let mut records = HashMap::from([(parent_id.clone(), parent)]);
-        let thread_ids =
-            HashMap::from([(parent_id, "01800000-0000-7000-8000-000000000001".into())]);
-        let mut first = codex_thread(None);
-        first.thread_id = "first-thread".into();
-        first.name = Some("First".into());
-        let mut nested = codex_thread(None);
-        nested.thread_id = "nested-thread".into();
-        nested.parent_thread_id = first.thread_id.clone();
-        nested.name = Some("Nested".into());
-        nested.depth = Some(2);
-
-        link_codex_thread_subagents(
-            &mut records,
-            &[nested, first],
-            &HashMap::new(),
-            &thread_ids,
-            &HashMap::new(),
-            &HashMap::new(),
-            ("host", "default"),
-        );
-
-        assert_eq!(
-            records["host/codex-thread/nested-thread"]
-                .subagent
-                .as_ref()
-                .map(|subagent| subagent.parent_id.as_str()),
-            Some("host/codex-thread/first-thread")
-        );
     }
 
     #[test]
