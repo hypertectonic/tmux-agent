@@ -922,7 +922,17 @@ fn location_breadcrumb(agent: &AgentRecord) -> String {
 }
 
 fn display_title(agent: &AgentRecord) -> String {
-    let title = trim_braille_activity_prefix(&agent.title);
+    let title = agent
+        .agent
+        .eq_ignore_ascii_case("grok")
+        .then(|| {
+            Path::new(&agent.cwd)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+        })
+        .flatten()
+        .unwrap_or_else(|| trim_braille_activity_prefix(&agent.title));
     let title = if title.is_empty() {
         trim_braille_activity_prefix(&agent.window_name)
     } else {
@@ -1460,6 +1470,17 @@ mod tests {
 
         agent.title = "⠹".into();
         assert_eq!(display_title(&agent), "work");
+    }
+
+    #[test]
+    fn display_title_keeps_grok_working_directory_stable() {
+        let mut agent = test_agent("Grok", Attention::Working, AgentOrigin::Tmux);
+        agent.cwd = "/work/sample-project".into();
+        agent.title = "⠦ Analyzing changes - grok".into();
+        assert_eq!(display_title(&agent), "sample-project");
+
+        agent.title = "⠸ Running cargo test - grok".into();
+        assert_eq!(display_title(&agent), "sample-project");
     }
 
     #[test]
