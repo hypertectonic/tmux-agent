@@ -6,6 +6,11 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+### Fixed
+
+- Keep Grok rows stable by showing the working-directory name instead of the
+  changing terminal activity title.
+
 ## [0.4.1] - 2026-08-10
 
 ### Changed
