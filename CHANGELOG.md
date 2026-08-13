@@ -6,6 +6,11 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+### Added
+
+- Filter UI sessions as you type with `/` while preserving the existing
+  single-key navigation controls outside search mode.
+
 ### Fixed
 
 - Keep Grok rows stable by showing the working-directory name instead of the

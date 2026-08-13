@@ -7,8 +7,8 @@ use crate::model::{
 use crate::tmux::{Tmux, is_focus_target_missing};
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-    MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use ratatui::Frame;
@@ -69,13 +69,21 @@ struct RenderTopology {
 }
 
 impl RenderTopology {
+    #[cfg(test)]
     fn from_snapshot(snapshot: &Snapshot) -> Self {
+        let visible_indices = (0..snapshot.agents.len()).collect::<Vec<_>>();
+        Self::from_visible(snapshot, &visible_indices)
+    }
+
+    fn from_visible(snapshot: &Snapshot, visible_indices: &[usize]) -> Self {
         Self {
             has_peers: !snapshot.peers.is_empty(),
-            rows: snapshot
-                .agents
+            rows: visible_indices
                 .iter()
-                .map(|agent| (agent.id.clone(), agent_row_height(agent)))
+                .map(|index| {
+                    let agent = &snapshot.agents[*index];
+                    (agent.id.clone(), agent_row_height(agent))
+                })
                 .collect(),
         }
     }
@@ -145,6 +153,189 @@ impl UiMessage {
     }
 }
 
+#[derive(Debug, Default)]
+struct AgentListState {
+    searching: bool,
+    query: String,
+    selected_id: Option<String>,
+    selected_position: usize,
+}
+
+impl AgentListState {
+    fn enter_search(&mut self) {
+        self.searching = true;
+    }
+
+    fn push_query(&mut self, character: char) {
+        self.query.push(character);
+    }
+
+    fn visible_indices(&self, agents: &[AgentRecord]) -> Vec<usize> {
+        let query = self.query.to_lowercase();
+        agents
+            .iter()
+            .enumerate()
+            .filter_map(|(index, agent)| agent_matches_query(agent, &query).then_some(index))
+            .collect()
+    }
+
+    fn reconcile_selection(&mut self, agents: &[AgentRecord]) {
+        let visible = self.visible_indices(agents);
+        if visible.is_empty() {
+            return;
+        }
+        if let Some(position) = self.selected_id.as_deref().and_then(|selected_id| {
+            visible
+                .iter()
+                .position(|index| agents[*index].id == selected_id)
+        }) {
+            self.selected_position = position;
+            return;
+        }
+        self.selected_position = self.selected_position.min(visible.len() - 1);
+        self.selected_id = Some(agents[visible[self.selected_position]].id.clone());
+    }
+
+    fn selected_visible_index(&self, agents: &[AgentRecord]) -> Option<usize> {
+        let selected_id = self.selected_id.as_deref()?;
+        self.visible_indices(agents)
+            .iter()
+            .position(|index| agents[*index].id == selected_id)
+    }
+
+    fn select_visible(&mut self, agents: &[AgentRecord], visible_index: usize) {
+        let visible = self.visible_indices(agents);
+        if let Some(index) = visible.get(visible_index) {
+            self.selected_id = Some(agents[*index].id.clone());
+            self.selected_position = visible_index;
+        }
+    }
+
+    fn select_snapshot(&mut self, agents: &[AgentRecord], snapshot_index: usize) {
+        if let Some(agent) = agents.get(snapshot_index) {
+            self.selected_id = Some(agent.id.clone());
+            if let Some(position) = self
+                .visible_indices(agents)
+                .iter()
+                .position(|index| *index == snapshot_index)
+            {
+                self.selected_position = position;
+            }
+        }
+    }
+
+    fn move_selection(&mut self, agents: &[AgentRecord], direction: isize) {
+        let visible = self.visible_indices(agents);
+        if visible.is_empty() {
+            return;
+        }
+        let current = self.selected_visible_index(agents).unwrap_or_default();
+        let next = if direction < 0 {
+            current.saturating_sub(1)
+        } else {
+            current.saturating_add(1).min(visible.len() - 1)
+        };
+        self.selected_id = Some(agents[visible[next]].id.clone());
+        self.selected_position = next;
+    }
+
+    fn selected_snapshot_index(&self, agents: &[AgentRecord]) -> Option<usize> {
+        let selected_id = self.selected_id.as_deref()?;
+        self.visible_indices(agents)
+            .into_iter()
+            .find(|index| agents[*index].id == selected_id)
+    }
+
+    fn leave_search(&mut self) {
+        self.searching = false;
+        self.query.clear();
+    }
+}
+
+fn agent_matches_query(agent: &AgentRecord, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let title = display_title(agent);
+    let location = location_breadcrumb(agent);
+    [
+        agent.agent.as_str(),
+        title.as_str(),
+        agent.label.as_deref().unwrap_or_default(),
+        agent.host.as_str(),
+        agent.session_name.as_str(),
+        agent.window_name.as_str(),
+        agent.cwd.as_str(),
+        location.as_str(),
+        attention_label(agent.attention),
+    ]
+    .into_iter()
+    .any(|value| value.to_lowercase().contains(query))
+        || agent.subagent.as_ref().is_some_and(|subagent| {
+            subagent
+                .name
+                .as_deref()
+                .is_some_and(|name| name.to_lowercase().contains(query))
+                || subagent_state_label(subagent.finished_at_ms).contains(query)
+        })
+}
+
+fn subagent_state_label(finished_at_ms: Option<u64>) -> &'static str {
+    if finished_at_ms.is_some() {
+        "done"
+    } else {
+        "running"
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListAction {
+    None,
+    Close,
+    Activate,
+    Refresh,
+}
+
+fn handle_list_key(key: KeyEvent, list: &mut AgentListState, agents: &[AgentRecord]) -> ListAction {
+    let action = if list.searching {
+        match key.code {
+            KeyCode::Esc => list.leave_search(),
+            KeyCode::Enter => return ListAction::Activate,
+            KeyCode::Down => list.move_selection(agents, 1),
+            KeyCode::Up => list.move_selection(agents, -1),
+            KeyCode::Backspace => {
+                list.query.pop();
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                list.push_query(character);
+            }
+            _ => {}
+        }
+        ListAction::None
+    } else {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return ListAction::Close,
+            KeyCode::Char('j') | KeyCode::Down => list.move_selection(agents, 1),
+            KeyCode::Char('k') | KeyCode::Up => list.move_selection(agents, -1),
+            KeyCode::Char('g') | KeyCode::Home => list.select_visible(agents, 0),
+            KeyCode::Char('G') | KeyCode::End => {
+                list.select_visible(agents, list.visible_indices(agents).len().saturating_sub(1));
+            }
+            KeyCode::Enter => return ListAction::Activate,
+            KeyCode::Char('r') => return ListAction::Refresh,
+            KeyCode::Char('/') => list.enter_search(),
+            _ => {}
+        }
+        ListAction::None
+    };
+    list.reconcile_selection(agents);
+    action
+}
+
 async fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
     paths: &RuntimePaths,
@@ -161,7 +352,8 @@ async fn run_loop(
         exit_after_focus,
     };
     let mut snapshot = ipc::snapshot(&paths.socket, false).await?;
-    let mut selected = 0usize;
+    let mut list = AgentListState::default();
+    list.reconcile_selection(&snapshot.agents);
     let mut message = UiMessage::default();
     let mut last_refresh = Instant::now();
     let animation_started = Instant::now();
@@ -169,72 +361,72 @@ async fn run_loop(
 
     loop {
         message.expire(Instant::now());
-        if selected >= snapshot.agents.len() && !snapshot.agents.is_empty() {
-            selected = snapshot.agents.len() - 1;
-        }
+        list.reconcile_selection(&snapshot.agents);
+        let visible_indices = list.visible_indices(&snapshot.agents);
         let spinner_frame = spinner_frame(animation_started.elapsed());
-        let topology = RenderTopology::from_snapshot(&snapshot);
+        let topology = RenderTopology::from_visible(&snapshot, &visible_indices);
         if redraw.needs_full_redraw(&topology) {
             terminal.clear().context("clear terminal for full redraw")?;
         }
-        terminal.draw(|frame| render(frame, &snapshot, selected, message.text(), spinner_frame))?;
+        terminal.draw(|frame| {
+            render_agent_list(frame, &snapshot, &list, message.text(), spinner_frame)
+        })?;
         redraw.mark_rendered(topology);
         if event::poll(Duration::from_millis(100)).context("poll terminal input")? {
             match event::read().context("read terminal input")? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(LoopExit::Close),
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if selected + 1 < snapshot.agents.len() {
-                            selected += 1;
-                        }
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        selected = selected.saturating_sub(1);
-                    }
-                    KeyCode::Char('g') | KeyCode::Home => selected = 0,
-                    KeyCode::Char('G') | KeyCode::End => {
-                        selected = snapshot.agents.len().saturating_sub(1)
-                    }
-                    KeyCode::Enter => {
-                        match activate_record(
-                            &activation_context,
-                            &mut snapshot,
-                            selected,
-                            &mut message,
-                        )
-                        .await?
-                        {
-                            Activation::Continue => {}
-                            Activation::Close => return Ok(LoopExit::Close),
-                            Activation::RunInCurrentTerminal(command) => {
-                                return Ok(LoopExit::RunInCurrentTerminal(command));
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    match handle_list_key(key, &mut list, &snapshot.agents) {
+                        ListAction::None => {}
+                        ListAction::Close => return Ok(LoopExit::Close),
+                        ListAction::Activate => {
+                            let Some(selected) = list.selected_snapshot_index(&snapshot.agents)
+                            else {
+                                continue;
+                            };
+                            match activate_record(
+                                &activation_context,
+                                &mut snapshot,
+                                selected,
+                                &mut message,
+                            )
+                            .await?
+                            {
+                                Activation::Continue => {}
+                                Activation::Close => return Ok(LoopExit::Close),
+                                Activation::RunInCurrentTerminal(command) => {
+                                    return Ok(LoopExit::RunInCurrentTerminal(command));
+                                }
                             }
                         }
+                        ListAction::Refresh => {
+                            snapshot = ipc::snapshot(&paths.socket, false).await?;
+                            last_refresh = Instant::now();
+                            message.set_transient("refreshed", Instant::now());
+                            redraw.force();
+                        }
                     }
-                    KeyCode::Char('r') => {
-                        snapshot = ipc::snapshot(&paths.socket, false).await?;
-                        last_refresh = Instant::now();
-                        message.set_transient("refreshed", Instant::now());
-                        redraw.force();
-                    }
-                    _ => {}
-                },
+                }
                 Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                     let (width, height) =
                         crossterm::terminal::size().context("read terminal size")?;
-                    if let Some(index) = agent_at_mouse(
+                    let visible_indices = list.visible_indices(&snapshot.agents);
+                    let selected = list
+                        .selected_visible_index(&snapshot.agents)
+                        .unwrap_or_default();
+                    if let Some(index) = agent_at_mouse_filtered(
                         Rect::new(0, 0, width, height),
                         !snapshot.peers.is_empty(),
                         selected,
                         &snapshot.agents,
+                        &visible_indices,
                         mouse.column,
                         mouse.row,
                     ) {
-                        selected = index;
+                        list.select_snapshot(&snapshot.agents, index);
                         match activate_record(
                             &activation_context,
                             &mut snapshot,
-                            selected,
+                            index,
                             &mut message,
                         )
                         .await?
@@ -441,6 +633,7 @@ async fn acknowledge_record(
     Ok(())
 }
 
+#[cfg(test)]
 fn render(
     frame: &mut Frame,
     snapshot: &Snapshot,
@@ -448,7 +641,25 @@ fn render(
     message: &str,
     spinner_frame: usize,
 ) {
+    let list = AgentListState {
+        selected_id: snapshot.agents.get(selected).map(|agent| agent.id.clone()),
+        ..AgentListState::default()
+    };
+    render_agent_list(frame, snapshot, &list, message, spinner_frame);
+}
+
+fn render_agent_list(
+    frame: &mut Frame,
+    snapshot: &Snapshot,
+    list: &AgentListState,
+    message: &str,
+    spinner_frame: usize,
+) {
     let chunks = ui_layout(frame.area(), !snapshot.peers.is_empty());
+    let visible_indices = list.visible_indices(&snapshot.agents);
+    let selected = list
+        .selected_visible_index(&snapshot.agents)
+        .unwrap_or_default();
 
     let counts = snapshot
         .agents
@@ -473,6 +684,18 @@ fn render(
             counts
         });
     let subagent_depths = subagent_depths(&snapshot.agents);
+    let search_line = if list.searching {
+        Line::from(vec![
+            Span::styled(" search ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                terminal_safe(&list.query),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("█", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::default()
+    };
     let header = Paragraph::new(vec![
         Line::default(),
         Line::from(vec![
@@ -498,20 +721,21 @@ fn render(
                 Style::default().fg(attention_color(Attention::Working)),
             ),
         ]),
+        search_line,
     ])
     .block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, chunks[0]);
 
     let list_width = chunks[1].width.saturating_sub(1) as usize;
-    let items = snapshot
-        .agents
+    let items = visible_indices
         .iter()
         .enumerate()
-        .map(|(index, agent)| {
+        .map(|(visible_index, snapshot_index)| {
+            let agent = &snapshot.agents[*snapshot_index];
             if let Some(subagent) = &agent.subagent {
                 let finished = subagent.finished_at_ms.is_some();
                 let state_color = if finished { Color::Green } else { Color::Cyan };
-                let state_label = if finished { "done" } else { "running" };
+                let state_label = subagent_state_label(subagent.finished_at_ms);
                 let end = subagent
                     .finished_at_ms
                     .unwrap_or(snapshot.generated_at_ms.max(subagent.started_at_ms));
@@ -589,7 +813,7 @@ fn render(
                 .max(1);
             let location_width = list_width.saturating_sub(2 + PROVIDER_WIDTH + 2).max(1);
             let (provider, provider_style) = provider_badge(&agent.agent);
-            let row_style = agent_row_style(agent.attention, index == selected);
+            let row_style = agent_row_style(agent.attention, visible_index == selected);
             let glyph = attention_glyph(agent.attention, spinner_frame);
             let glyph_color = if agent.attention == Attention::Working {
                 provider_style.fg.unwrap_or(color)
@@ -644,7 +868,13 @@ fn render(
             .style(row_style)
         })
         .collect::<Vec<_>>();
-    let list = List::new(items)
+    if visible_indices.is_empty() && list.searching && !list.query.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" no sessions match").style(Style::default().fg(Color::DarkGray)),
+            chunks[1],
+        );
+    }
+    let agent_list = List::new(items)
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol(Line::from(Span::styled(
             "▌",
@@ -653,10 +883,10 @@ fn render(
         .highlight_spacing(HighlightSpacing::Always)
         .repeat_highlight_symbol(true);
     let mut list_state = ListState::default();
-    if !snapshot.agents.is_empty() {
+    if !visible_indices.is_empty() {
         list_state.select(Some(selected));
     }
-    frame.render_stateful_widget(list, chunks[1], &mut list_state);
+    frame.render_stateful_widget(agent_list, chunks[1], &mut list_state);
 
     if !snapshot.peers.is_empty() {
         let mut peers = Vec::new();
@@ -691,15 +921,16 @@ fn render(
         }
         frame.render_widget(Paragraph::new(Line::from(peers)), chunks[2]);
     }
-    let safe_message = terminal_safe(message);
-    let footer = if message.is_empty() {
-        "j/k move  enter focus/view  r refresh  q close"
+    let footer = if !message.is_empty() {
+        terminal_safe(message)
+    } else if list.searching {
+        "↑/↓ move  enter focus/view  backspace edit  esc clear".to_string()
     } else {
-        safe_message.as_str()
+        "j/k move  / search  enter focus/view  r refresh  q close".to_string()
     };
     frame.render_widget(
         Paragraph::new(truncate(
-            footer,
+            &footer,
             frame.area().width.saturating_sub(1) as usize,
         ))
         .style(Style::default().fg(Color::DarkGray)),
@@ -753,11 +984,33 @@ fn agent_row_height(agent: &AgentRecord) -> usize {
     if agent.subagent.is_some() { 1 } else { 2 }
 }
 
+#[cfg(test)]
 fn agent_at_mouse(
     area: Rect,
     has_peers: bool,
     selected: usize,
     agents: &[AgentRecord],
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let visible_indices = (0..agents.len()).collect::<Vec<_>>();
+    agent_at_mouse_filtered(
+        area,
+        has_peers,
+        selected,
+        agents,
+        &visible_indices,
+        column,
+        row,
+    )
+}
+
+fn agent_at_mouse_filtered(
+    area: Rect,
+    has_peers: bool,
+    selected: usize,
+    agents: &[AgentRecord],
+    visible_indices: &[usize],
     column: u16,
     row: u16,
 ) -> Option<usize> {
@@ -769,7 +1022,10 @@ fn agent_at_mouse(
     {
         return None;
     }
-    let heights = agents.iter().map(agent_row_height).collect::<Vec<_>>();
+    let heights = visible_indices
+        .iter()
+        .map(|index| agent_row_height(&agents[*index]))
+        .collect::<Vec<_>>();
     let offset = visible_list_offset(&heights, selected, usize::from(list.height));
     let mut relative_row = usize::from(row - list.y);
     let mut rendered_height = 0usize;
@@ -778,7 +1034,7 @@ fn agent_at_mouse(
             break;
         }
         if relative_row < height {
-            return Some(index);
+            return visible_indices.get(index).copied();
         }
         relative_row = relative_row.saturating_sub(height);
         rendered_height += height;
@@ -1145,7 +1401,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             row_text(&terminal, footer_row),
-            "j/k move  enter focus/view  r refresh  q close"
+            "j/k move  / search  enter focus/view  r refresh  q close"
         );
     }
 
@@ -1497,6 +1753,281 @@ mod tests {
 
         agent.label = Some("sample-project".into());
         assert_eq!(display_title(&agent), "sample-project");
+    }
+
+    #[test]
+    fn search_filters_agents_by_visible_text_case_insensitively() {
+        let mut codex = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        codex.title = "Payment API".into();
+        let mut claude = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        claude.title = "Documentation".into();
+        let agents = vec![codex, claude];
+        let mut list = AgentListState::default();
+
+        list.enter_search();
+        for character in "PAYMENT".chars() {
+            list.push_query(character);
+        }
+
+        assert_eq!(list.visible_indices(&agents), vec![0]);
+    }
+
+    #[test]
+    fn search_matches_provider_label_location_and_working_directory() {
+        let mut codex = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        codex.id = "local/default/payment".into();
+        codex.title = "Payment API".into();
+        codex.label = Some("priority work".into());
+        codex.host = "build-host".into();
+        codex.session_name = "backend".into();
+        codex.cwd = "/work/services/payments".into();
+        let mut claude = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        claude.id = "local/default/docs".into();
+        claude.title = "Documentation".into();
+        let agents = vec![codex, claude];
+
+        for query in ["codex", "priority", "build-host", "backend", "payments"] {
+            let mut list = AgentListState::default();
+            list.enter_search();
+            for character in query.chars() {
+                list.push_query(character);
+            }
+            assert_eq!(list.visible_indices(&agents), vec![0], "query {query:?}");
+        }
+    }
+
+    #[test]
+    fn search_matches_the_state_displayed_for_subagents() {
+        let mut running = test_agent("Codex", Attention::Working, AgentOrigin::Terminal);
+        running.subagent = Some(SubagentInfo {
+            parent_id: "local/default/parent".into(),
+            started_at_ms: 1,
+            finished_at_ms: None,
+            name: Some("review".into()),
+            thread_id: None,
+        });
+        let mut done = running.clone();
+        done.id = "local/default/done".into();
+        done.subagent.as_mut().unwrap().finished_at_ms = Some(2);
+        let agents = vec![running, done];
+
+        let mut list = AgentListState::default();
+        list.enter_search();
+        for character in "running".chars() {
+            list.push_query(character);
+        }
+        assert_eq!(list.visible_indices(&agents), vec![0]);
+
+        list.query = "done".into();
+        assert_eq!(list.visible_indices(&agents), vec![1]);
+    }
+
+    #[test]
+    fn search_mode_treats_navigation_commands_as_query_text() {
+        let agents = vec![test_agent("Codex", Attention::Working, AgentOrigin::Tmux)];
+        let mut list = AgentListState::default();
+        list.reconcile_selection(&agents);
+
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::Close
+        );
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::None
+        );
+        assert!(list.searching);
+
+        for character in ['j', 'k', 'r', 'q'] {
+            assert_eq!(
+                handle_list_key(
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                    &mut list,
+                    &agents,
+                ),
+                ListAction::None
+            );
+        }
+        assert_eq!(list.query, "jkrq");
+
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::None
+        );
+        assert!(!list.searching);
+        assert!(list.query.is_empty());
+    }
+
+    #[test]
+    fn search_renders_only_matching_rows_and_an_active_prompt() {
+        let mut payment = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        payment.id = "local/default/payment".into();
+        payment.title = "Payment API".into();
+        let mut docs = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        docs.id = "local/default/docs".into();
+        docs.title = "Documentation".into();
+        let snapshot = Snapshot {
+            agents: vec![payment, docs],
+            ..Snapshot::default()
+        };
+        let mut list = AgentListState::default();
+        list.enter_search();
+        for character in "doc".chars() {
+            list.push_query(character);
+        }
+        list.reconcile_selection(&snapshot.agents);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+
+        terminal
+            .draw(|frame| render_agent_list(frame, &snapshot, &list, "", 0))
+            .unwrap();
+
+        let screen = (0..12)
+            .map(|row| row_text(&terminal, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Documentation"));
+        assert!(!screen.contains("Payment API"));
+        assert!(screen.contains("search doc█"));
+    }
+
+    #[test]
+    fn search_keeps_operational_messages_visible() {
+        let snapshot = Snapshot::default();
+        let mut list = AgentListState::default();
+        list.enter_search();
+        for character in "doc".chars() {
+            list.push_query(character);
+        }
+        let area = Rect::new(0, 0, 80, 10);
+        let search_row = 2;
+        let footer_row = ui_layout(area, false)[3].y;
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+
+        terminal
+            .draw(|frame| render_agent_list(frame, &snapshot, &list, "focus failed", 0))
+            .unwrap();
+
+        let footer = row_text(&terminal, footer_row);
+        assert!(footer.contains("focus failed"));
+        assert!(row_text(&terminal, search_row).contains("search doc█"));
+    }
+
+    #[test]
+    fn filtered_selection_and_mouse_activation_use_snapshot_indices() {
+        let mut payment = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        payment.id = "local/default/payment".into();
+        payment.title = "Payment API".into();
+        let mut docs = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        docs.id = "local/default/docs".into();
+        docs.title = "Documentation".into();
+        let agents = vec![payment, docs];
+        let mut list = AgentListState::default();
+        list.enter_search();
+        for character in "doc".chars() {
+            list.push_query(character);
+        }
+        list.reconcile_selection(&agents);
+        let visible = list.visible_indices(&agents);
+
+        assert_eq!(visible, vec![1]);
+        assert_eq!(list.selected_snapshot_index(&agents), Some(1));
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::Activate
+        );
+        assert_eq!(
+            agent_at_mouse_filtered(Rect::new(0, 0, 80, 12), false, 0, &agents, &visible, 4, 4),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn search_keeps_selection_by_agent_id_across_snapshot_refreshes() {
+        let mut payment = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        payment.id = "local/default/payment".into();
+        payment.title = "Payment API".into();
+        let mut docs = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        docs.id = "local/default/docs".into();
+        docs.title = "Documentation".into();
+        let mut agents = vec![payment, docs];
+        let mut list = AgentListState::default();
+        list.reconcile_selection(&agents);
+        list.move_selection(&agents, 1);
+        assert_eq!(list.selected_snapshot_index(&agents), Some(1));
+
+        agents.swap(0, 1);
+        list.reconcile_selection(&agents);
+
+        assert_eq!(list.selected_snapshot_index(&agents), Some(0));
+        assert_eq!(list.selected_id.as_deref(), Some("local/default/docs"));
+    }
+
+    #[test]
+    fn selection_keeps_its_position_when_the_selected_agent_disappears() {
+        let mut agents = ["one", "two", "three", "four"]
+            .into_iter()
+            .map(|id| {
+                let mut agent = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
+                agent.id = format!("local/default/{id}");
+                agent
+            })
+            .collect::<Vec<_>>();
+        let mut list = AgentListState::default();
+        list.reconcile_selection(&agents);
+        list.select_visible(&agents, 2);
+
+        agents.remove(2);
+        list.reconcile_selection(&agents);
+
+        assert_eq!(list.selected_snapshot_index(&agents), Some(2));
+        assert_eq!(list.selected_id.as_deref(), Some("local/default/four"));
+    }
+
+    #[test]
+    fn search_with_no_matches_cannot_activate_a_hidden_session() {
+        let agents = vec![test_agent("Codex", Attention::Working, AgentOrigin::Tmux)];
+        let mut list = AgentListState::default();
+        list.reconcile_selection(&agents);
+        list.enter_search();
+        for character in "missing".chars() {
+            list.push_query(character);
+        }
+        list.reconcile_selection(&agents);
+
+        assert!(list.visible_indices(&agents).is_empty());
+        assert_eq!(list.selected_snapshot_index(&agents), None);
+    }
+
+    #[test]
+    fn redraws_when_search_changes_the_visible_rows() {
+        let snapshot = Snapshot {
+            agents: vec![
+                test_agent("Codex", Attention::Working, AgentOrigin::Tmux),
+                test_agent("Claude", Attention::Idle, AgentOrigin::Tmux),
+            ],
+            ..Snapshot::default()
+        };
+        let mut redraw = RedrawTracker::default();
+        redraw.mark_rendered(RenderTopology::from_snapshot(&snapshot));
+
+        assert!(redraw.needs_full_redraw(&RenderTopology::from_visible(&snapshot, &[1])));
     }
 
     #[test]
