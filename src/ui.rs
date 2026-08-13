@@ -158,6 +158,7 @@ struct AgentListState {
     searching: bool,
     query: String,
     selected_id: Option<String>,
+    selected_position: usize,
 }
 
 impl AgentListState {
@@ -180,14 +181,19 @@ impl AgentListState {
 
     fn reconcile_selection(&mut self, agents: &[AgentRecord]) {
         let visible = self.visible_indices(agents);
-        if visible.is_empty()
-            || self.selected_id.as_deref().is_some_and(|selected_id| {
-                visible.iter().any(|index| agents[*index].id == selected_id)
-            })
-        {
+        if visible.is_empty() {
             return;
         }
-        self.selected_id = visible.first().map(|index| agents[*index].id.clone());
+        if let Some(position) = self.selected_id.as_deref().and_then(|selected_id| {
+            visible
+                .iter()
+                .position(|index| agents[*index].id == selected_id)
+        }) {
+            self.selected_position = position;
+            return;
+        }
+        self.selected_position = self.selected_position.min(visible.len() - 1);
+        self.selected_id = Some(agents[visible[self.selected_position]].id.clone());
     }
 
     fn selected_visible_index(&self, agents: &[AgentRecord]) -> Option<usize> {
@@ -201,12 +207,20 @@ impl AgentListState {
         let visible = self.visible_indices(agents);
         if let Some(index) = visible.get(visible_index) {
             self.selected_id = Some(agents[*index].id.clone());
+            self.selected_position = visible_index;
         }
     }
 
     fn select_snapshot(&mut self, agents: &[AgentRecord], snapshot_index: usize) {
         if let Some(agent) = agents.get(snapshot_index) {
             self.selected_id = Some(agent.id.clone());
+            if let Some(position) = self
+                .visible_indices(agents)
+                .iter()
+                .position(|index| *index == snapshot_index)
+            {
+                self.selected_position = position;
+            }
         }
     }
 
@@ -222,6 +236,7 @@ impl AgentListState {
             current.saturating_add(1).min(visible.len() - 1)
         };
         self.selected_id = Some(agents[visible[next]].id.clone());
+        self.selected_position = next;
     }
 
     fn selected_snapshot_index(&self, agents: &[AgentRecord]) -> Option<usize> {
@@ -1962,6 +1977,27 @@ mod tests {
 
         assert_eq!(list.selected_snapshot_index(&agents), Some(0));
         assert_eq!(list.selected_id.as_deref(), Some("local/default/docs"));
+    }
+
+    #[test]
+    fn selection_keeps_its_position_when_the_selected_agent_disappears() {
+        let mut agents = ["one", "two", "three", "four"]
+            .into_iter()
+            .map(|id| {
+                let mut agent = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
+                agent.id = format!("local/default/{id}");
+                agent
+            })
+            .collect::<Vec<_>>();
+        let mut list = AgentListState::default();
+        list.reconcile_selection(&agents);
+        list.select_visible(&agents, 2);
+
+        agents.remove(2);
+        list.reconcile_selection(&agents);
+
+        assert_eq!(list.selected_snapshot_index(&agents), Some(2));
+        assert_eq!(list.selected_id.as_deref(), Some("local/default/four"));
     }
 
     #[test]
