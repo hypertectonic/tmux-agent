@@ -922,17 +922,16 @@ fn location_breadcrumb(agent: &AgentRecord) -> String {
 }
 
 fn display_title(agent: &AgentRecord) -> String {
-    let title = agent
-        .agent
-        .eq_ignore_ascii_case("grok")
-        .then(|| {
-            Path::new(&agent.cwd)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.is_empty())
-        })
-        .flatten()
-        .unwrap_or_else(|| trim_braille_activity_prefix(&agent.title));
+    let stable_grok_title = if agent.agent.eq_ignore_ascii_case("grok") {
+        Path::new(&agent.cwd)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .or_else(|| (!agent.cwd.is_empty()).then_some(agent.cwd.as_str()))
+    } else {
+        None
+    };
+    let title = stable_grok_title.unwrap_or_else(|| trim_braille_activity_prefix(&agent.title));
     let title = if title.is_empty() {
         trim_braille_activity_prefix(&agent.window_name)
     } else {
@@ -1481,6 +1480,9 @@ mod tests {
 
         agent.title = "⠸ Running cargo test - grok".into();
         assert_eq!(display_title(&agent), "sample-project");
+
+        agent.cwd = "/".into();
+        assert_eq!(display_title(&agent), "/");
     }
 
     #[test]
