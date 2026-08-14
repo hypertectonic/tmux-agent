@@ -383,19 +383,17 @@ async fn run_loop(
                             else {
                                 continue;
                             };
-                            match activate_record(
+                            let activation = activate_record(
                                 &activation_context,
                                 &mut snapshot,
                                 selected,
                                 &mut message,
                             )
-                            .await?
+                            .await?;
+                            if let Some(exit) =
+                                apply_activation_outcome(activation, &mut list, &snapshot.agents)
                             {
-                                Activation::Continue => {}
-                                Activation::Close => return Ok(LoopExit::Close),
-                                Activation::RunInCurrentTerminal(command) => {
-                                    return Ok(LoopExit::RunInCurrentTerminal(command));
-                                }
+                                return Ok(exit);
                             }
                         }
                         ListAction::Refresh => {
@@ -423,19 +421,17 @@ async fn run_loop(
                         mouse.row,
                     ) {
                         list.select_snapshot(&snapshot.agents, index);
-                        match activate_record(
+                        let activation = activate_record(
                             &activation_context,
                             &mut snapshot,
                             index,
                             &mut message,
                         )
-                        .await?
+                        .await?;
+                        if let Some(exit) =
+                            apply_activation_outcome(activation, &mut list, &snapshot.agents)
                         {
-                            Activation::Continue => {}
-                            Activation::Close => return Ok(LoopExit::Close),
-                            Activation::RunInCurrentTerminal(command) => {
-                                return Ok(LoopExit::RunInCurrentTerminal(command));
-                            }
+                            return Ok(exit);
                         }
                     }
                 }
@@ -469,9 +465,27 @@ fn apply_daemon_refresh(
 
 #[derive(Debug, PartialEq, Eq)]
 enum Activation {
-    Continue,
+    Completed,
+    Failed,
     Close,
     RunInCurrentTerminal(Vec<String>),
+}
+
+fn apply_activation_outcome(
+    activation: Activation,
+    list: &mut AgentListState,
+    agents: &[AgentRecord],
+) -> Option<LoopExit> {
+    match activation {
+        Activation::Completed => {
+            list.leave_search();
+            list.reconcile_selection(agents);
+            None
+        }
+        Activation::Failed => None,
+        Activation::Close => Some(LoopExit::Close),
+        Activation::RunInCurrentTerminal(command) => Some(LoopExit::RunInCurrentTerminal(command)),
+    }
 }
 
 struct ActivationContext<'a> {
@@ -489,19 +503,31 @@ async fn activate_record(
     message: &mut UiMessage,
 ) -> Result<Activation> {
     let Some(record) = snapshot.agents.get(selected).cloned() else {
-        return Ok(Activation::Continue);
+        return Ok(Activation::Failed);
     };
     if record.subagent.is_some() {
         let command =
-            subagent_view_command(context.config, context.config_path, snapshot, &record)?;
+            match subagent_view_command(context.config, context.config_path, snapshot, &record) {
+                Ok(command) => command,
+                Err(error) if !context.exit_after_focus => {
+                    message.set_transient(format!("{error:#}"), Instant::now());
+                    return Ok(Activation::Failed);
+                }
+                Err(error) => return Err(error),
+            };
         if context.exit_after_focus {
             return Ok(Activation::RunInCurrentTerminal(command));
         }
-        match context.tmux.display_popup(&shell_join(&command)) {
-            Ok(()) => message.set_transient("opened read-only subagent view", Instant::now()),
-            Err(error) => message.set_transient(format!("{error:#}"), Instant::now()),
-        }
-        return Ok(Activation::Continue);
+        return match context.tmux.display_popup(&shell_join(&command)) {
+            Ok(()) => {
+                message.set_transient("opened read-only subagent view", Instant::now());
+                Ok(Activation::Completed)
+            }
+            Err(error) => {
+                message.set_transient(format!("{error:#}"), Instant::now());
+                Ok(Activation::Failed)
+            }
+        };
     }
     let focus_record = &record;
     if focus_record.is_tmux() || focus_record.remote_alias.is_some() {
@@ -517,7 +543,7 @@ async fn activate_record(
                     format!("focused {}", focus_record.location()),
                     Instant::now(),
                 );
-                Ok(Activation::Continue)
+                Ok(Activation::Completed)
             }
             Err(focus_error)
                 if focus_record.remote_alias.is_some()
@@ -533,22 +559,27 @@ async fn activate_record(
                     ),
                     Instant::now(),
                 );
-                Ok(Activation::Continue)
+                Ok(Activation::Completed)
             }
             Err(error) => {
                 message.set_transient(format!("{error:#}"), Instant::now());
-                Ok(Activation::Continue)
+                Ok(Activation::Failed)
             }
         };
     }
     match acknowledge_record(context.paths, snapshot, &record.id).await {
-        Ok(()) => message.set_transient(
-            format!("acknowledged {}", record.location()),
-            Instant::now(),
-        ),
-        Err(error) => message.set_transient(format!("{error:#}"), Instant::now()),
+        Ok(()) => {
+            message.set_transient(
+                format!("acknowledged {}", record.location()),
+                Instant::now(),
+            );
+            Ok(Activation::Completed)
+        }
+        Err(error) => {
+            message.set_transient(format!("{error:#}"), Instant::now());
+            Ok(Activation::Failed)
+        }
     }
-    Ok(Activation::Continue)
 }
 
 fn activation_requires_acknowledgement(record: &AgentRecord) -> bool {
@@ -1959,6 +1990,57 @@ mod tests {
     }
 
     #[test]
+    fn successful_activation_clears_search_and_keeps_the_activated_record_selected() {
+        let mut payment = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        payment.id = "local/default/payment".into();
+        payment.title = "Payment API".into();
+        let mut docs = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        docs.id = "local/default/docs".into();
+        docs.title = "Documentation".into();
+        let agents = vec![payment, docs];
+        let mut list = AgentListState::default();
+        list.enter_search();
+        for character in "doc".chars() {
+            list.push_query(character);
+        }
+        list.reconcile_selection(&agents);
+
+        let exit = apply_activation_outcome(Activation::Completed, &mut list, &agents);
+
+        assert_eq!(exit, None);
+        assert!(!list.searching);
+        assert!(list.query.is_empty());
+        assert_eq!(list.visible_indices(&agents), vec![0, 1]);
+        assert_eq!(list.selected_snapshot_index(&agents), Some(1));
+        assert_eq!(list.selected_id.as_deref(), Some("local/default/docs"));
+    }
+
+    #[test]
+    fn failed_activation_keeps_the_active_search() {
+        let mut payment = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        payment.id = "local/default/payment".into();
+        payment.title = "Payment API".into();
+        let mut docs = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        docs.id = "local/default/docs".into();
+        docs.title = "Documentation".into();
+        let agents = vec![payment, docs];
+        let mut list = AgentListState::default();
+        list.enter_search();
+        for character in "doc".chars() {
+            list.push_query(character);
+        }
+        list.reconcile_selection(&agents);
+
+        let exit = apply_activation_outcome(Activation::Failed, &mut list, &agents);
+
+        assert_eq!(exit, None);
+        assert!(list.searching);
+        assert_eq!(list.query, "doc");
+        assert_eq!(list.visible_indices(&agents), vec![1]);
+        assert_eq!(list.selected_snapshot_index(&agents), Some(1));
+    }
+
+    #[test]
     fn search_keeps_selection_by_agent_id_across_snapshot_refreshes() {
         let mut payment = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
         payment.id = "local/default/payment".into();
@@ -2400,7 +2482,7 @@ mod tests {
         let paths = RuntimePaths::discover(&socket_name).unwrap();
         paths.ensure_dirs().unwrap();
         let listener = UnixListener::bind(&paths.socket).unwrap();
-        let mut remote = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
+        let mut remote = test_agent("Codex", Attention::Done, AgentOrigin::Tmux);
         remote.id = "remote/remote-mac/host/default/%1".into();
         remote.remote_alias = Some("remote-mac".into());
         remote.title = "completed-task".into();
@@ -2419,6 +2501,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .achievement_pending = false;
+        acknowledged_snapshot.agents[0].attention = Attention::Idle;
         let server = tokio::spawn(async move {
             let mut acknowledged = None;
             for _ in 0..2 {
@@ -2468,6 +2551,13 @@ mod tests {
             agents: vec![remote],
             ..Snapshot::default()
         };
+        let mut list = AgentListState::default();
+        list.enter_search();
+        for character in "done".chars() {
+            list.push_query(character);
+        }
+        list.reconcile_selection(&snapshot.agents);
+        assert_eq!(list.visible_indices(&snapshot.agents), vec![0]);
         let context = ActivationContext {
             paths: &paths,
             tmux: &tmux,
@@ -2485,12 +2575,26 @@ mod tests {
         let acknowledged = server.await.unwrap();
         let _ = std::fs::remove_file(&paths.socket);
         let _ = std::fs::remove_dir(&paths.runners);
-        assert_eq!(activation.unwrap(), Activation::Continue);
+        let activation = activation.unwrap();
+        assert_eq!(activation, Activation::Completed);
+        assert_eq!(
+            apply_activation_outcome(activation, &mut list, &snapshot.agents),
+            None
+        );
         assert_eq!(
             acknowledged.as_deref(),
             Some("remote/remote-mac/host/default/%1")
         );
         assert!(message.text().contains("acknowledged"));
+        assert!(message.text().contains("focus unavailable"));
+        assert!(!list.searching);
+        assert!(list.query.is_empty());
+        assert_eq!(list.visible_indices(&snapshot.agents), vec![0]);
+        assert_eq!(list.selected_snapshot_index(&snapshot.agents), Some(0));
+        assert_eq!(
+            list.selected_id.as_deref(),
+            Some("remote/remote-mac/host/default/%1")
+        );
         assert!(
             !snapshot.agents[0]
                 .goal
