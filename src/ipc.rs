@@ -1,8 +1,37 @@
 use crate::model::{IpcRequest, IpcResponse, Snapshot};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+
+pub struct SnapshotWatch {
+    lines: Lines<BufReader<OwnedReadHalf>>,
+    _writer: OwnedWriteHalf,
+}
+
+impl SnapshotWatch {
+    pub async fn connect(socket: &Path, local_only: bool) -> Result<Self> {
+        let stream = UnixStream::connect(socket)
+            .await
+            .with_context(|| format!("connect to daemon {}", socket.display()))?;
+        let (reader, mut writer) = stream.into_split();
+        write_request(&mut writer, &IpcRequest::Watch { local_only }).await?;
+        Ok(Self {
+            lines: BufReader::new(reader).lines(),
+            _writer: writer,
+        })
+    }
+
+    pub async fn next_snapshot(&mut self) -> Result<Option<Snapshot>> {
+        self.lines
+            .next_line()
+            .await
+            .context("read daemon stream")?
+            .map(|line| parse_response(&line))
+            .transpose()
+    }
+}
 
 pub async fn snapshot(socket: &Path, local_only: bool) -> Result<Snapshot> {
     let stream = UnixStream::connect(socket)
@@ -20,15 +49,9 @@ pub async fn snapshot(socket: &Path, local_only: bool) -> Result<Snapshot> {
 }
 
 pub async fn watch_jsonl(socket: &Path, local_only: bool) -> Result<()> {
-    let stream = UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("connect to daemon {}", socket.display()))?;
-    let (reader, mut writer) = stream.into_split();
-    write_request(&mut writer, &IpcRequest::Watch { local_only }).await?;
-    let mut lines = BufReader::new(reader).lines();
+    let mut watch = SnapshotWatch::connect(socket, local_only).await?;
     let mut stdout = tokio::io::stdout();
-    while let Some(line) = lines.next_line().await.context("read daemon stream")? {
-        let snapshot = parse_response(&line)?;
+    while let Some(snapshot) = watch.next_snapshot().await? {
         let encoded = serde_json::to_vec(&snapshot).context("serialize snapshot")?;
         if let Err(error) = stdout.write_all(&encoded).await {
             if error.kind() == std::io::ErrorKind::BrokenPipe {
@@ -114,5 +137,48 @@ fn parse_response(line: &str) -> Result<Snapshot> {
         IpcResponse::Snapshot { snapshot } => Ok(snapshot),
         IpcResponse::Ack => bail!("unexpected daemon acknowledgement"),
         IpcResponse::Error { message } => bail!("daemon error: {message}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn snapshot_watch_delivers_initial_and_changed_snapshots_on_one_connection() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            assert!(matches!(
+                serde_json::from_str(&request).unwrap(),
+                IpcRequest::Watch { local_only: false }
+            ));
+
+            for revision in [1, 2] {
+                let response = IpcResponse::Snapshot {
+                    snapshot: Snapshot {
+                        revision,
+                        ..Snapshot::default()
+                    },
+                };
+                let mut encoded = serde_json::to_vec(&response).unwrap();
+                encoded.push(b'\n');
+                writer.write_all(&encoded).await.unwrap();
+            }
+        });
+
+        let mut watch = SnapshotWatch::connect(&socket, false).await.unwrap();
+
+        assert_eq!(watch.next_snapshot().await.unwrap().unwrap().revision, 1);
+        assert_eq!(watch.next_snapshot().await.unwrap().unwrap().revision, 2);
+        server.await.unwrap();
     }
 }

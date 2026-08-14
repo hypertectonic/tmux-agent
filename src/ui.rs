@@ -7,25 +7,138 @@ use crate::model::{
 use crate::tmux::{Tmux, is_focus_target_missing};
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
+use futures_util::StreamExt;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph};
 use std::collections::{HashMap, HashSet};
+use std::future::pending;
 use std::io;
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_FRAME_TIME: Duration = Duration::from_millis(120);
+const ELAPSED_TIME_TICK: Duration = Duration::from_secs(1);
+const VISIBLE_VISIBILITY_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+const HIDDEN_VISIBILITY_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+const WATCH_RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
 const ACTION_MESSAGE_DURATION: Duration = Duration::from_secs(3);
 const PROVIDER_WIDTH: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiTimer {
+    AnimationFrame,
+    ElapsedTime,
+    VisibilityProbe,
+}
+
+#[derive(Debug)]
+struct UiSchedule {
+    visible: bool,
+    dirty: bool,
+    rendered_once: bool,
+    next_animation_frame: Instant,
+    next_elapsed_time: Instant,
+    next_visibility_probe: Option<Instant>,
+}
+
+impl UiSchedule {
+    fn new(visible: bool, now: Instant) -> Self {
+        Self {
+            visible,
+            dirty: true,
+            rendered_once: false,
+            next_animation_frame: now + SPINNER_FRAME_TIME,
+            next_elapsed_time: now + ELAPSED_TIME_TICK,
+            next_visibility_probe: Some(now + visibility_probe_interval(visible)),
+        }
+    }
+
+    fn always_visible(now: Instant) -> Self {
+        Self {
+            visible: true,
+            dirty: true,
+            rendered_once: false,
+            next_animation_frame: now + SPINNER_FRAME_TIME,
+            next_elapsed_time: now + ELAPSED_TIME_TICK,
+            next_visibility_probe: None,
+        }
+    }
+
+    fn should_render(&self) -> bool {
+        self.dirty && (self.visible || !self.rendered_once)
+    }
+
+    fn rendered(&mut self) {
+        self.dirty = false;
+        self.rendered_once = true;
+    }
+
+    fn view_changed(&mut self) {
+        self.dirty = true;
+    }
+
+    fn next_timer(
+        &self,
+        has_working_agents: bool,
+        has_running_subagents: bool,
+    ) -> Option<(Instant, UiTimer)> {
+        let animation = (self.visible && has_working_agents)
+            .then_some((self.next_animation_frame, UiTimer::AnimationFrame));
+        let elapsed_time = (self.visible && has_running_subagents)
+            .then_some((self.next_elapsed_time, UiTimer::ElapsedTime));
+        let visibility = self
+            .next_visibility_probe
+            .map(|deadline| (deadline, UiTimer::VisibilityProbe));
+        let mut next = animation;
+        for candidate in [elapsed_time, visibility].into_iter().flatten() {
+            if next.is_none_or(|current| candidate.0 < current.0) {
+                next = Some(candidate);
+            }
+        }
+        next
+    }
+
+    fn timer_elapsed(&mut self, timer: UiTimer, now: Instant) {
+        match timer {
+            UiTimer::AnimationFrame => {
+                self.dirty = true;
+                self.next_animation_frame = now + SPINNER_FRAME_TIME;
+            }
+            UiTimer::ElapsedTime => {
+                self.dirty = true;
+                self.next_elapsed_time = now + ELAPSED_TIME_TICK;
+            }
+            UiTimer::VisibilityProbe => {}
+        }
+    }
+
+    fn visibility_checked(&mut self, visible: bool, now: Instant) {
+        if visible && !self.visible {
+            self.dirty = true;
+            self.next_animation_frame = now + SPINNER_FRAME_TIME;
+            self.next_elapsed_time = now + ELAPSED_TIME_TICK;
+        }
+        self.visible = visible;
+        self.next_visibility_probe = Some(now + visibility_probe_interval(visible));
+    }
+}
+
+fn visibility_probe_interval(visible: bool) -> Duration {
+    if visible {
+        VISIBLE_VISIBILITY_PROBE_INTERVAL
+    } else {
+        HIDDEN_VISIBILITY_PROBE_INTERVAL
+    }
+}
 
 pub async fn run(
     paths: &RuntimePaths,
@@ -40,14 +153,23 @@ pub async fn run(
     }
     let _guard = UiMarkerGuard {
         tmux: tmux.clone(),
-        pane_id,
+        pane_id: pane_id.clone(),
     };
     let mut terminal = ratatui::init();
     if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
         ratatui::restore();
         return Err(error).context("enable mouse capture");
     }
-    let result = run_loop(&mut terminal, paths, &tmux, popup, config, config_path).await;
+    let result = run_loop(
+        &mut terminal,
+        paths,
+        &tmux,
+        popup,
+        pane_id.as_deref(),
+        config,
+        config_path,
+    )
+    .await;
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     match result? {
@@ -129,19 +251,35 @@ impl UiMessage {
         };
     }
 
-    fn set_daemon_error(&mut self, text: impl Into<String>) {
-        *self = Self::DaemonError(text.into());
+    fn set_daemon_error(&mut self, text: impl Into<String>) -> bool {
+        let text = text.into();
+        if matches!(self, Self::DaemonError(current) if current == &text) {
+            return false;
+        }
+        *self = Self::DaemonError(text);
+        true
     }
 
-    fn clear_daemon_error(&mut self) {
+    fn clear_daemon_error(&mut self) -> bool {
         if matches!(self, Self::DaemonError(_)) {
             *self = Self::None;
+            return true;
         }
+        false
     }
 
-    fn expire(&mut self, now: Instant) {
+    fn expire(&mut self, now: Instant) -> bool {
         if matches!(self, Self::Transient { expires_at, .. } if now >= *expires_at) {
             *self = Self::None;
+            return true;
+        }
+        false
+    }
+
+    fn expires_at(&self) -> Option<Instant> {
+        match self {
+            Self::Transient { expires_at, .. } => Some(*expires_at),
+            Self::None | Self::DaemonError(_) => None,
         }
     }
 
@@ -153,7 +291,7 @@ impl UiMessage {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct AgentListState {
     searching: bool,
     query: String,
@@ -341,6 +479,7 @@ async fn run_loop(
     paths: &RuntimePaths,
     tmux: &Tmux,
     exit_after_focus: bool,
+    ui_pane_id: Option<&str>,
     config: &Config,
     config_path: &Path,
 ) -> Result<LoopExit> {
@@ -351,32 +490,69 @@ async fn run_loop(
         config_path,
         exit_after_focus,
     };
-    let mut snapshot = ipc::snapshot(&paths.socket, false).await?;
+    let (initial_watch, mut snapshot) = connect_snapshot_watch(&paths.socket).await?;
+    let mut watch = Some(initial_watch);
     let mut list = AgentListState::default();
     list.reconcile_selection(&snapshot.agents);
     let mut message = UiMessage::default();
-    let mut last_refresh = Instant::now();
-    let animation_started = Instant::now();
+    let started = Instant::now();
+    let mut schedule = match ui_pane_id {
+        Some(pane_id) => UiSchedule::new(read_pane_visibility(tmux, pane_id).await?, started),
+        None => UiSchedule::always_visible(started),
+    };
+    let animation_started = started;
     let mut redraw = RedrawTracker::default();
+    let mut terminal_events = EventStream::new();
+    let mut reconnect_at = None;
 
     loop {
-        message.expire(Instant::now());
-        list.reconcile_selection(&snapshot.agents);
-        let visible_indices = list.visible_indices(&snapshot.agents);
-        let spinner_frame = spinner_frame(animation_started.elapsed());
-        let topology = RenderTopology::from_visible(&snapshot, &visible_indices);
-        if redraw.needs_full_redraw(&topology) {
-            terminal.clear().context("clear terminal for full redraw")?;
+        if schedule.should_render() {
+            list.reconcile_selection(&snapshot.agents);
+            let visible_indices = list.visible_indices(&snapshot.agents);
+            let topology = RenderTopology::from_visible(&snapshot, &visible_indices);
+            if redraw.needs_full_redraw(&topology) {
+                let area = terminal
+                    .size()
+                    .context("read terminal size for full redraw")?
+                    .into();
+                terminal
+                    .resize(area)
+                    .context("prepare terminal for full redraw")?;
+            }
+            terminal.draw(|frame| {
+                render_agent_list(
+                    frame,
+                    &snapshot,
+                    &list,
+                    message.text(),
+                    spinner_frame(animation_started.elapsed()),
+                    current_time_ms(),
+                )
+            })?;
+            redraw.mark_rendered(topology);
+            schedule.rendered();
         }
-        terminal.draw(|frame| {
-            render_agent_list(frame, &snapshot, &list, message.text(), spinner_frame)
-        })?;
-        redraw.mark_rendered(topology);
-        if event::poll(Duration::from_millis(100)).context("poll terminal input")? {
-            match event::read().context("read terminal input")? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
+
+        let visible_indices = list.visible_indices(&snapshot.agents);
+        let (has_working_agents, has_running_subagents) =
+            visible_timer_requirements(&snapshot.agents, &visible_indices);
+        let timer = next_loop_timer(
+            &schedule,
+            has_working_agents,
+            has_running_subagents,
+            message.expires_at(),
+            reconnect_at,
+        );
+        tokio::select! {
+            terminal_event = terminal_events.next() => match terminal_event {
+                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                    let previous_list = list.clone();
                     match handle_list_key(key, &mut list, &snapshot.agents) {
-                        ListAction::None => {}
+                        ListAction::None => {
+                            if list != previous_list {
+                                schedule.view_changed();
+                            }
+                        }
                         ListAction::Close => return Ok(LoopExit::Close),
                         ListAction::Activate => {
                             let Some(selected) = list.selected_snapshot_index(&snapshot.agents)
@@ -395,16 +571,24 @@ async fn run_loop(
                             {
                                 return Ok(exit);
                             }
+                            schedule.view_changed();
                         }
                         ListAction::Refresh => {
-                            snapshot = ipc::snapshot(&paths.socket, false).await?;
-                            last_refresh = Instant::now();
+                            let (next_watch, next_snapshot) =
+                                connect_snapshot_watch(&paths.socket).await?;
+                            watch = Some(next_watch);
+                            snapshot = next_snapshot;
+                            list.reconcile_selection(&snapshot.agents);
+                            reconnect_at = None;
                             message.set_transient("refreshed", Instant::now());
                             redraw.force();
+                            schedule.view_changed();
                         }
                     }
                 }
-                Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                Some(Ok(Event::Mouse(mouse)))
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
+                {
                     let (width, height) =
                         crossterm::terminal::size().context("read terminal size")?;
                     let visible_indices = list.visible_indices(&snapshot.agents);
@@ -433,20 +617,168 @@ async fn run_loop(
                         {
                             return Ok(exit);
                         }
+                        schedule.view_changed();
                     }
                 }
-                _ => {}
+                Some(Ok(Event::Resize(_, _))) => {
+                    schedule.view_changed();
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => return Err(error).context("read terminal input"),
+                None => return Ok(LoopExit::Close),
+            },
+            watched_snapshot = next_watched_snapshot(&mut watch) => {
+                match watched_snapshot {
+                    Ok(Some(next)) => {
+                        apply_daemon_refresh(&mut snapshot, &mut message, Ok(next));
+                        list.reconcile_selection(&snapshot.agents);
+                        schedule.view_changed();
+                    }
+                    Ok(None) => {
+                        if message.set_daemon_error("daemon: watch stream closed") {
+                            schedule.view_changed();
+                        }
+                        watch = None;
+                        reconnect_at = Some(Instant::now() + WATCH_RECONNECT_INTERVAL);
+                    }
+                    Err(error) => {
+                        if message.set_daemon_error(format!("daemon: {error:#}")) {
+                            schedule.view_changed();
+                        }
+                        watch = None;
+                        reconnect_at = Some(Instant::now() + WATCH_RECONNECT_INTERVAL);
+                    }
+                }
+            },
+            timer = wait_for_timer(timer) => {
+                let now = Instant::now();
+                match timer {
+                    LoopTimer::Ui(UiTimer::AnimationFrame) => {
+                        schedule.timer_elapsed(UiTimer::AnimationFrame, now);
+                    }
+                    LoopTimer::Ui(UiTimer::ElapsedTime) => {
+                        schedule.timer_elapsed(UiTimer::ElapsedTime, now);
+                    }
+                    LoopTimer::Ui(UiTimer::VisibilityProbe) => {
+                        let pane_id = ui_pane_id.context("visibility timer without a UI pane")?;
+                        let visible = read_pane_visibility(tmux, pane_id).await?;
+                        schedule.visibility_checked(visible, Instant::now());
+                    }
+                    LoopTimer::MessageExpiry => {
+                        if message.expire(now) {
+                            schedule.view_changed();
+                        }
+                    }
+                    LoopTimer::WatchReconnect => {
+                        match connect_snapshot_watch(&paths.socket).await {
+                            Ok((next_watch, next_snapshot)) => {
+                                watch = Some(next_watch);
+                                reconnect_at = None;
+                                apply_daemon_refresh(
+                                    &mut snapshot,
+                                    &mut message,
+                                    Ok(next_snapshot),
+                                );
+                                list.reconcile_selection(&snapshot.agents);
+                                schedule.view_changed();
+                            }
+                            Err(error) => {
+                                if message.set_daemon_error(format!("daemon: {error:#}")) {
+                                    schedule.view_changed();
+                                }
+                                reconnect_at =
+                                    Some(Instant::now() + WATCH_RECONNECT_INTERVAL);
+                            }
+                        }
+                    }
+                }
             }
         }
-        if last_refresh.elapsed() >= Duration::from_millis(500) {
-            apply_daemon_refresh(
-                &mut snapshot,
-                &mut message,
-                ipc::snapshot(&paths.socket, false).await,
-            );
-            last_refresh = Instant::now();
+    }
+}
+
+fn visible_timer_requirements(agents: &[AgentRecord], visible_indices: &[usize]) -> (bool, bool) {
+    visible_indices.iter().fold(
+        (false, false),
+        |(has_working_agent, has_running_subagent), index| {
+            let agent = &agents[*index];
+            match &agent.subagent {
+                Some(subagent) => (
+                    has_working_agent,
+                    has_running_subagent || subagent.finished_at_ms.is_none(),
+                ),
+                None => (
+                    has_working_agent || agent.attention == Attention::Working,
+                    has_running_subagent,
+                ),
+            }
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LoopTimer {
+    Ui(UiTimer),
+    MessageExpiry,
+    WatchReconnect,
+}
+
+fn next_loop_timer(
+    schedule: &UiSchedule,
+    has_working_agents: bool,
+    has_running_subagents: bool,
+    message_expiry: Option<Instant>,
+    reconnect_at: Option<Instant>,
+) -> Option<(Instant, LoopTimer)> {
+    let mut next = schedule
+        .next_timer(has_working_agents, has_running_subagents)
+        .map(|(deadline, timer)| (deadline, LoopTimer::Ui(timer)));
+    for candidate in [
+        message_expiry.map(|deadline| (deadline, LoopTimer::MessageExpiry)),
+        reconnect_at.map(|deadline| (deadline, LoopTimer::WatchReconnect)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if next.is_none_or(|current| candidate.0 < current.0) {
+            next = Some(candidate);
         }
     }
+    next
+}
+
+async fn wait_for_timer(timer: Option<(Instant, LoopTimer)>) -> LoopTimer {
+    match timer {
+        Some((deadline, timer)) => {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            timer
+        }
+        None => pending().await,
+    }
+}
+
+async fn next_watched_snapshot(watch: &mut Option<ipc::SnapshotWatch>) -> Result<Option<Snapshot>> {
+    match watch {
+        Some(watch) => watch.next_snapshot().await,
+        None => pending().await,
+    }
+}
+
+async fn connect_snapshot_watch(socket: &Path) -> Result<(ipc::SnapshotWatch, Snapshot)> {
+    let mut watch = ipc::SnapshotWatch::connect(socket, false).await?;
+    let snapshot = watch
+        .next_snapshot()
+        .await?
+        .context("daemon closed watch stream before its initial snapshot")?;
+    Ok((watch, snapshot))
+}
+
+async fn read_pane_visibility(tmux: &Tmux, pane_id: &str) -> Result<bool> {
+    let tmux = tmux.clone();
+    let pane_id = pane_id.to_string();
+    tokio::task::spawn_blocking(move || tmux.pane_visible(&pane_id))
+        .await
+        .context("join tmux pane visibility probe")?
 }
 
 fn apply_daemon_refresh(
@@ -459,7 +791,9 @@ fn apply_daemon_refresh(
             *snapshot = next;
             message.clear_daemon_error();
         }
-        Err(error) => message.set_daemon_error(format!("daemon: {error:#}")),
+        Err(error) => {
+            message.set_daemon_error(format!("daemon: {error:#}"));
+        }
     }
 }
 
@@ -672,11 +1006,62 @@ fn render(
     message: &str,
     spinner_frame: usize,
 ) {
+    render_at(
+        frame,
+        snapshot,
+        selected,
+        message,
+        spinner_frame,
+        snapshot.generated_at_ms,
+    );
+}
+
+#[cfg(test)]
+fn render_live(
+    frame: &mut Frame,
+    snapshot: &Snapshot,
+    selected: usize,
+    message: &str,
+    spinner_frame: usize,
+) {
+    render_at(
+        frame,
+        snapshot,
+        selected,
+        message,
+        spinner_frame,
+        current_time_ms(),
+    );
+}
+
+#[cfg(test)]
+fn render_at(
+    frame: &mut Frame,
+    snapshot: &Snapshot,
+    selected: usize,
+    message: &str,
+    spinner_frame: usize,
+    rendered_at_ms: u64,
+) {
     let list = AgentListState {
         selected_id: snapshot.agents.get(selected).map(|agent| agent.id.clone()),
         ..AgentListState::default()
     };
-    render_agent_list(frame, snapshot, &list, message, spinner_frame);
+    render_agent_list(
+        frame,
+        snapshot,
+        &list,
+        message,
+        spinner_frame,
+        rendered_at_ms,
+    );
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn render_agent_list(
@@ -685,6 +1070,7 @@ fn render_agent_list(
     list: &AgentListState,
     message: &str,
     spinner_frame: usize,
+    rendered_at_ms: u64,
 ) {
     let chunks = ui_layout(frame.area(), !snapshot.peers.is_empty());
     let visible_indices = list.visible_indices(&snapshot.agents);
@@ -769,7 +1155,7 @@ fn render_agent_list(
                 let state_label = subagent_state_label(subagent.finished_at_ms);
                 let end = subagent
                     .finished_at_ms
-                    .unwrap_or(snapshot.generated_at_ms.max(subagent.started_at_ms));
+                    .unwrap_or(rendered_at_ms.max(subagent.started_at_ms));
                 let duration = format_duration(
                     end.saturating_sub(subagent.started_at_ms)
                         .saturating_div(1_000),
@@ -1603,6 +1989,124 @@ mod tests {
     }
 
     #[test]
+    fn ui_schedule_draws_initially_and_after_changes_not_unchanged_probes() {
+        let started = Instant::now();
+        let mut schedule = UiSchedule::new(true, started);
+
+        assert!(schedule.should_render());
+        schedule.rendered();
+        assert!(!schedule.should_render());
+
+        assert_eq!(
+            schedule.next_timer(true, false),
+            Some((started + SPINNER_FRAME_TIME, UiTimer::AnimationFrame))
+        );
+        schedule.timer_elapsed(UiTimer::AnimationFrame, started + SPINNER_FRAME_TIME);
+        assert!(schedule.should_render());
+        schedule.rendered();
+
+        schedule.view_changed();
+        assert!(schedule.should_render());
+        schedule.rendered();
+
+        let (deadline, timer) = schedule.next_timer(false, false).unwrap();
+        assert_eq!(deadline, started + VISIBLE_VISIBILITY_PROBE_INTERVAL);
+        assert_eq!(timer, UiTimer::VisibilityProbe);
+        schedule.visibility_checked(true, deadline);
+        assert!(!schedule.should_render());
+    }
+
+    #[test]
+    fn visible_timer_requirements_follow_rendered_rows() {
+        let working_root = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        let idle_root = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        let mut running_subagent = test_agent("Codex", Attention::Working, AgentOrigin::Terminal);
+        running_subagent.subagent = Some(SubagentInfo {
+            parent_id: working_root.id.clone(),
+            started_at_ms: 1,
+            finished_at_ms: None,
+            name: Some("review".into()),
+            thread_id: None,
+        });
+        let agents = vec![working_root, idle_root, running_subagent];
+
+        assert_eq!(visible_timer_requirements(&agents, &[1]), (false, false));
+        assert_eq!(visible_timer_requirements(&agents, &[2]), (false, true));
+        assert_eq!(visible_timer_requirements(&agents, &[0]), (true, false));
+        assert_eq!(visible_timer_requirements(&agents, &[0, 2]), (true, true));
+    }
+
+    #[test]
+    fn hidden_schedule_defers_updates_and_animation() {
+        let started = Instant::now();
+        let mut schedule = UiSchedule::new(false, started);
+        assert!(schedule.should_render());
+        schedule.rendered();
+        schedule.view_changed();
+
+        assert!(!schedule.should_render());
+        assert_eq!(
+            schedule.next_timer(true, true),
+            Some((
+                started + HIDDEN_VISIBILITY_PROBE_INTERVAL,
+                UiTimer::VisibilityProbe
+            ))
+        );
+
+        let hidden_probe = started + HIDDEN_VISIBILITY_PROBE_INTERVAL;
+        schedule.visibility_checked(false, hidden_probe);
+        assert!(!schedule.should_render());
+
+        schedule.visibility_checked(true, hidden_probe);
+        assert!(schedule.should_render());
+    }
+
+    #[test]
+    fn running_subagent_duration_advances_without_a_new_snapshot() {
+        let now_ms = crate::scanner::now_ms();
+        let mut parent = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
+        parent.id = "local/default/parent".into();
+        let mut child = test_agent("Codex", Attention::Unknown, AgentOrigin::Terminal);
+        child.id = "local/terminal/ttys054/70".into();
+        child.subagent = Some(SubagentInfo {
+            parent_id: parent.id.clone(),
+            started_at_ms: now_ms - 2_000,
+            finished_at_ms: None,
+            name: Some("review".into()),
+            thread_id: None,
+        });
+        let mut snapshot = Snapshot {
+            generated_at_ms: now_ms,
+            agents: vec![parent, child],
+            ..Snapshot::default()
+        };
+        snapshot.sort_agents();
+        let mut terminal = Terminal::new(TestBackend::new(90, 14)).unwrap();
+
+        terminal
+            .draw(|frame| render_live(frame, &snapshot, 0, "", 0))
+            .unwrap();
+        assert!(row_text(&terminal, 6).contains("running  ·  2s"));
+
+        std::thread::sleep(Duration::from_millis(1_100));
+        terminal
+            .draw(|frame| render_live(frame, &snapshot, 0, "", 0))
+            .unwrap();
+
+        assert!(row_text(&terminal, 6).contains("running  ·  3s"));
+
+        let started = Instant::now();
+        let mut schedule = UiSchedule::always_visible(started);
+        schedule.rendered();
+        assert_eq!(
+            schedule.next_timer(false, true),
+            Some((started + Duration::from_secs(1), UiTimer::ElapsedTime))
+        );
+        schedule.timer_elapsed(UiTimer::ElapsedTime, started + Duration::from_secs(1));
+        assert!(schedule.should_render());
+    }
+
+    #[test]
     fn goal_durations_follow_codex_compact_units() {
         assert_eq!(format_goal_duration(42), "42s");
         assert_eq!(format_goal_duration(1_122), "18m 42s");
@@ -1922,7 +2426,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
 
         terminal
-            .draw(|frame| render_agent_list(frame, &snapshot, &list, "", 0))
+            .draw(|frame| {
+                render_agent_list(frame, &snapshot, &list, "", 0, snapshot.generated_at_ms)
+            })
             .unwrap();
 
         let screen = (0..12)
@@ -1948,7 +2454,16 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
 
         terminal
-            .draw(|frame| render_agent_list(frame, &snapshot, &list, "focus failed", 0))
+            .draw(|frame| {
+                render_agent_list(
+                    frame,
+                    &snapshot,
+                    &list,
+                    "focus failed",
+                    0,
+                    snapshot.generated_at_ms,
+                )
+            })
             .unwrap();
 
         let footer = row_text(&terminal, footer_row);
@@ -2341,7 +2856,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(90, 14)).unwrap();
 
         terminal
-            .draw(|frame| render(frame, &snapshot, 0, "", 5))
+            .draw(|frame| render_at(frame, &snapshot, 0, "", 5, 270_000))
             .unwrap();
 
         assert!(!row_text(&terminal, 4).contains("+1 agent"));
@@ -2349,6 +2864,11 @@ mod tests {
         let done_x = row_text(&terminal, 6).find("done").unwrap() as u16;
         assert_eq!(terminal.backend().buffer()[(done_x, 6)].fg, Color::Green);
         assert_eq!(terminal.backend().buffer()[(89, 6)].bg, Color::Reset);
+
+        terminal
+            .draw(|frame| render_at(frame, &snapshot, 0, "", 5, 330_000))
+            .unwrap();
+        assert!(row_text(&terminal, 6).contains("done  ·  4m 12s"));
     }
 
     #[test]

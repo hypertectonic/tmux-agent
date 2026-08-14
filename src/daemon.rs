@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::{RwLock, watch};
@@ -463,6 +463,7 @@ async fn serve_client(
             } else {
                 shared.changed.subscribe()
             };
+            let mut disconnect_probe = [0_u8; 1];
             loop {
                 let snapshot = shared.snapshot(local_only).await;
                 if write_response(&mut writer, &IpcResponse::Snapshot { snapshot })
@@ -471,8 +472,15 @@ async fn serve_client(
                 {
                     break;
                 }
-                if changed.changed().await.is_err() {
-                    break;
+                tokio::select! {
+                    result = changed.changed() => {
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                    // Watch clients send one request. Any later read completion
+                    // means the client closed or violated that request boundary.
+                    _ = reader.read(&mut disconnect_probe) => break,
                 }
             }
         }
@@ -849,6 +857,7 @@ pub async fn ensure_running(config_path: &Path, paths: &RuntimePaths) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::SnapshotWatch;
     use crate::model::{
         AgentOrigin, EvidenceSource, GoalInfo, SshConnection, SshTransport, TmuxTarget,
     };
@@ -909,6 +918,55 @@ mod tests {
                 pane_index: 0,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_snapshot_watch_ends_the_daemon_client_task_without_a_model_change() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let acknowledgements_path = directory.path().join("acknowledged.json");
+        let initial = Snapshot {
+            revision: 1,
+            agents: vec![agent(
+                "shared-host/default/%1",
+                AgentState::Idle,
+                Attention::Idle,
+            )],
+            ..Snapshot::default()
+        };
+        let shared = Shared::new(
+            initial.clone(),
+            &[],
+            Acknowledgements::default(),
+            acknowledgements_path,
+        )
+        .unwrap();
+        let server_shared = shared.clone();
+        let (shutdown, _) = tokio::sync::mpsc::channel(1);
+        let mut server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_client(stream, server_shared, shutdown).await
+        });
+
+        let mut watch = SnapshotWatch::connect(&socket, false).await.unwrap();
+        assert_eq!(watch.next_snapshot().await.unwrap().unwrap().revision, 1);
+
+        let mut changed = initial;
+        changed.revision = 2;
+        changed.agents[0].title = "changed".into();
+        assert!(shared.publish_local(changed).await);
+        assert_eq!(watch.next_snapshot().await.unwrap().unwrap().revision, 2);
+
+        drop(watch);
+        let completed = tokio::time::timeout(Duration::from_millis(500), &mut server).await;
+        if completed.is_err() {
+            server.abort();
+        }
+        completed
+            .expect("daemon watch task should stop when its client disconnects")
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
