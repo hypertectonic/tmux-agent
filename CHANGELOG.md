@@ -6,15 +6,27 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+## [0.5.0] - 2026-08-15
+
 ### Added
 
 - Filter UI sessions as you type with `/` while preserving the existing
   single-key navigation controls outside search mode.
 
+### Changed
+
+- Make persistent sidebars event-driven, using one daemon watch per UI and
+  redrawing only when visible state changes. In a 14-sidebar workload this
+  reduced aggregate UI CPU use from 10.15% to 2.17%, a 78.6% reduction.
+
 ### Fixed
 
 - Keep Grok rows stable by showing the working-directory name instead of the
   changing terminal activity title.
+- Clear the active search after successfully switching to a selected session,
+  so returning to the sidebar restores the full list.
+- Keep topology-changing redraws compatible with asynchronous terminal input
+  and reconnect persistent sidebars after daemon restarts.
 
 ## [0.4.1] - 2026-08-10
 
