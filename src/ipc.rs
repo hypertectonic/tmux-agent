@@ -99,24 +99,40 @@ pub async fn shutdown(socket: &Path) -> Result<()> {
 }
 
 pub async fn acknowledge(socket: &Path, target: &str) -> Result<()> {
+    request_ack(
+        socket,
+        IpcRequest::Acknowledge {
+            target: target.to_string(),
+        },
+        "acknowledge",
+    )
+    .await
+}
+
+pub async fn mark_used(socket: &Path, target: &str) -> Result<()> {
+    request_ack(
+        socket,
+        IpcRequest::MarkUsed {
+            target: target.to_string(),
+        },
+        "mark used",
+    )
+    .await
+}
+
+async fn request_ack(socket: &Path, request: IpcRequest, operation: &str) -> Result<()> {
     let stream = UnixStream::connect(socket)
         .await
         .with_context(|| format!("connect to daemon {}", socket.display()))?;
     let (reader, mut writer) = stream.into_split();
-    write_request(
-        &mut writer,
-        &IpcRequest::Acknowledge {
-            target: target.to_string(),
-        },
-    )
-    .await?;
+    write_request(&mut writer, &request).await?;
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
-    match serde_json::from_str(&line).context("parse acknowledge response")? {
+    match serde_json::from_str(&line).with_context(|| format!("parse {operation} response"))? {
         IpcResponse::Ack => Ok(()),
         IpcResponse::Error { message } => bail!("daemon error: {message}"),
-        IpcResponse::Snapshot { .. } => bail!("unexpected snapshot response to acknowledge"),
+        IpcResponse::Snapshot { .. } => bail!("unexpected snapshot response to {operation}"),
     }
 }
 

@@ -80,6 +80,7 @@ authority to run lifecycle commands on another machine.
 Normal federation snapshots contain derived metadata such as provider, state,
 attention, title, location, numeric lifecycle timestamps, goal state without
 its objective, and process relationships reduced to identifiers.
+Local last-used focus timestamps are not part of federation snapshots.
 
 Snapshots do not contain:
 

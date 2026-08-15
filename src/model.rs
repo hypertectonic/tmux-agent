@@ -302,7 +302,10 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn sort_agents(&mut self) {
-        self.agents.sort_by(sort_agent);
+        self.sort_agents_by_last_used(&HashMap::new());
+    }
+
+    pub(crate) fn sort_agents_by_last_used(&mut self, last_used_at_ms: &HashMap<String, u64>) {
         let known_ids = self
             .agents
             .iter()
@@ -325,6 +328,7 @@ impl Snapshot {
                 roots.push(agent);
             }
         }
+        roots.sort_by(|left, right| sort_agent(left, right, last_used_at_ms));
         for siblings in children.values_mut() {
             siblings.sort_by(sort_subagent);
         }
@@ -343,14 +347,31 @@ impl Snapshot {
     }
 }
 
-fn sort_agent(a: &AgentRecord, b: &AgentRecord) -> Ordering {
+fn sort_agent(
+    a: &AgentRecord,
+    b: &AgentRecord,
+    last_used_at_ms: &HashMap<String, u64>,
+) -> Ordering {
     a.attention
         .rank()
         .cmp(&b.attention.rank())
+        .then_with(|| {
+            if a.attention == Attention::Idle && b.attention == Attention::Idle {
+                idle_recency(b, last_used_at_ms).cmp(&idle_recency(a, last_used_at_ms))
+            } else {
+                Ordering::Equal
+            }
+        })
         .then_with(|| a.host.cmp(&b.host))
         .then_with(|| a.session_name.cmp(&b.session_name))
         .then_with(|| a.window_index.cmp(&b.window_index))
         .then_with(|| a.pane_index.cmp(&b.pane_index))
+}
+
+fn idle_recency(agent: &AgentRecord, last_used_at_ms: &HashMap<String, u64>) -> u64 {
+    agent
+        .changed_at_ms
+        .max(last_used_at_ms.get(&agent.id).copied().unwrap_or_default())
 }
 
 fn sort_subagent(a: &AgentRecord, b: &AgentRecord) -> Ordering {
@@ -398,6 +419,7 @@ pub enum IpcRequest {
     Snapshot { local_only: bool },
     Watch { local_only: bool },
     Acknowledge { target: String },
+    MarkUsed { target: String },
     Shutdown,
 }
 
@@ -434,6 +456,115 @@ pub struct GoalAcknowledgement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sortable_agent(
+        id: &str,
+        session_name: &str,
+        attention: Attention,
+        changed_at_ms: u64,
+    ) -> AgentRecord {
+        AgentRecord {
+            id: id.into(),
+            host: "host".into(),
+            server: "default".into(),
+            pane_id: format!("%{id}"),
+            pane_pid: 10,
+            session_id: format!("${id}"),
+            session_name: session_name.into(),
+            window_id: format!("@{id}"),
+            window_index: 1,
+            window_name: "work".into(),
+            pane_index: 0,
+            agent: "Codex".into(),
+            state: AgentState::Idle,
+            attention,
+            source: EvidenceSource::Screen,
+            title: "work".into(),
+            label: None,
+            cwd: "/tmp".into(),
+            visible: false,
+            seen: true,
+            changed_at_ms,
+            origin: AgentOrigin::Tmux,
+            terminal: None,
+            remote_alias: None,
+            ssh_connection: None,
+            focus_target: None,
+            goal: None,
+            subagent: None,
+            detection: None,
+        }
+    }
+
+    #[test]
+    fn last_used_reorders_only_idle_roots() {
+        let parent_id = "idle-parent";
+        let parent = sortable_agent(parent_id, "c-parent", Attention::Idle, 1);
+        let mut newer_child = sortable_agent("child-newer", "z-child", Attention::Idle, 1);
+        newer_child.subagent = Some(SubagentInfo {
+            parent_id: parent_id.into(),
+            started_at_ms: 20,
+            finished_at_ms: None,
+            name: None,
+            thread_id: None,
+        });
+        let mut older_child = sortable_agent("child-older", "a-child", Attention::Idle, 1);
+        older_child.subagent = Some(SubagentInfo {
+            parent_id: parent_id.into(),
+            started_at_ms: 10,
+            finished_at_ms: None,
+            name: None,
+            thread_id: None,
+        });
+        let mut snapshot = Snapshot {
+            agents: vec![
+                sortable_agent("unknown-z", "z", Attention::Unknown, 1),
+                sortable_agent("idle-a", "a-idle", Attention::Idle, 50),
+                sortable_agent("working-z", "z", Attention::Working, 1),
+                newer_child,
+                sortable_agent("done-z", "z", Attention::Done, 1),
+                sortable_agent("blocked-z", "z", Attention::Blocked, 1),
+                parent,
+                sortable_agent("idle-b", "b-idle", Attention::Idle, 1),
+                sortable_agent("blocked-a", "a", Attention::Blocked, 1),
+                sortable_agent("done-a", "a", Attention::Done, 1),
+                sortable_agent("working-a", "a", Attention::Working, 1),
+                older_child,
+                sortable_agent("unknown-a", "a", Attention::Unknown, 1),
+            ],
+            ..Snapshot::default()
+        };
+        let last_used_at_ms = HashMap::from([
+            ("idle-b".to_string(), 100),
+            ("blocked-z".to_string(), 1_000),
+            ("child-newer".to_string(), 1_000),
+        ]);
+
+        snapshot.sort_agents_by_last_used(&last_used_at_ms);
+
+        assert_eq!(
+            snapshot
+                .agents
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "blocked-a",
+                "blocked-z",
+                "done-a",
+                "done-z",
+                "working-a",
+                "working-z",
+                "idle-b",
+                "idle-a",
+                "idle-parent",
+                "child-older",
+                "child-newer",
+                "unknown-a",
+                "unknown-z",
+            ]
+        );
+    }
 
     #[test]
     fn old_agent_records_default_to_tmux_origin() {

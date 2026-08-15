@@ -39,6 +39,11 @@ blocked > done > working > idle > unknown
 `done` is derived when an active agent becomes idle while its tmux window is
 not visible. Activating the row or using `acknowledge` marks the completion
 seen. Codex goal achievements use the same explicit acknowledgement boundary.
+Within the idle bucket, top-level agents sort by the newer of their state-change
+time and their last successful focus through tmux-agent. The daemon keeps focus
+times in memory for its own tmux server and discards them when agents disappear
+or the daemon restarts. Other attention buckets and subagent ordering keep their
+existing location and lifecycle ordering.
 
 ## Subagents
 
@@ -68,10 +73,13 @@ JSON object per line:
 - `snapshot` returns the current state
 - `watch` sends the initial snapshot and later revisions
 - `acknowledge` marks a completion seen
+- `mark_used` records a successful top-level focus for local idle ordering
 - `shutdown` stops the daemon cleanly
 
 The current federation protocol version is `3`. Live federation requires equal
-protocol versions on all machines.
+protocol versions on all machines. `mark_used` is local IPC metadata: its
+timestamps are neither serialized nor included in `--local-only` federation
+snapshots, so it does not change the federation protocol.
 
 Peer status contains connection state, a bounded error message, application
 version, protocol, and capabilities. It intentionally has no freshness
@@ -95,6 +103,11 @@ Numeric shortcuts publish only their explicit selected agent ID to sibling
 persistent UIs in the same tmux server. Activation focuses first; selection
 fanout then runs in the background and wakes recipient panes concurrently.
 Ordinary navigation and tmux focus changes remain local to each UI process.
+Successful Enter, mouse, and numeric activation share the same focus seam. That
+seam reports usage on a best-effort basis only after tmux focus succeeds,
+advancing the daemon watch so every persistent UI on the same tmux server
+receives the reordered snapshot. An unavailable usage operation never turns a
+successful focus into a failed activation.
 
 ## Plugin and managed-binary compatibility
 
