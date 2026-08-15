@@ -84,10 +84,17 @@ input, resize, snapshot, message, working animation, or a visible unfinished
 subagent's one-second elapsed-time change. A user-managed sidebar checks whether
 its tmux window is active in an attached session. Hidden sidebars keep their
 latest snapshot, search, and selection but pause drawing, working animation,
-and elapsed-time ticks until the window is visible again. Visibility never
-changes search, selection, scrolling, or activation state. Popups remain
-visible for their whole lifetime, and `r` replaces the current watch with a
-freshly connected stream and its initial snapshot.
+and elapsed-time ticks until the window is visible again. An explicit numeric
+selection permits one hidden redraw so sibling pane buffers stay synchronized
+without waiting for their next visibility probe. Visibility never changes
+search, selection, scrolling, or activation state. Popups remain visible for
+their whole lifetime, and `r` replaces the current watch with a freshly
+connected stream and its initial snapshot.
+
+Numeric shortcuts publish only their explicit selected agent ID to sibling
+persistent UIs in the same tmux server. Activation focuses first; selection
+fanout then runs in the background and wakes recipient panes concurrently.
+Ordinary navigation and tmux focus changes remain local to each UI process.
 
 ## Plugin and managed-binary compatibility
 

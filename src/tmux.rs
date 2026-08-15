@@ -13,6 +13,46 @@ use std::process::Command;
 
 const SEPARATOR: char = '\u{1f}';
 const ESCAPED_SEPARATOR: &str = r"\037";
+const UI_SELECTION_OPTION: &str = "@tmux_agent_selection";
+// CSI 34~ is an otherwise unused F17 key that wakes every persistent UI after
+// an explicit numeric selection without introducing polling or focus tracking.
+const UI_SELECTION_WAKE_HEX: [&str; 5] = ["1b", "5b", "33", "34", "7e"];
+
+fn selection_broadcast_panes(panes: &[Pane]) -> Vec<String> {
+    panes
+        .iter()
+        .filter(|pane| pane.is_agent_ui && !pane.dead)
+        .map(|pane| pane.pane_id.clone())
+        .collect()
+}
+
+fn wake_ui_panes<F>(pane_ids: &[String], wake: F) -> Result<()>
+where
+    F: Fn(&str) -> Result<()> + Sync,
+{
+    let results = std::thread::scope(|scope| {
+        pane_ids
+            .iter()
+            .map(|pane_id| scope.spawn(|| wake(pane_id)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|task| task.join().expect("UI wake worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    let mut first_error = None;
+    for (pane_id, result) in pane_ids.iter().zip(results) {
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error.context(format!("wake tmux-agent UI pane {pane_id}")));
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Pane {
     pub pane_id: String,
@@ -399,6 +439,26 @@ impl Tmux {
     pub fn set_ui_marker(&self, pane_id: &str, enabled: bool) -> Result<()> {
         let value = if enabled { "1" } else { "" };
         self.status(&["set-option", "-p", "-t", pane_id, "@tmux_agent_ui", value])
+    }
+
+    pub fn broadcast_ui_selection(&self, agent_id: &str) -> Result<()> {
+        let pane_ids = selection_broadcast_panes(&self.list_panes()?);
+        if pane_ids.is_empty() {
+            return Ok(());
+        }
+        self.status(&["set-option", "-g", UI_SELECTION_OPTION, agent_id])?;
+        wake_ui_panes(&pane_ids, |pane_id| {
+            let mut args = vec!["send-keys", "-H", "-t", pane_id];
+            args.extend(UI_SELECTION_WAKE_HEX);
+            self.status(&args)
+        })
+    }
+
+    pub fn ui_selection(&self) -> Result<Option<String>> {
+        Ok(self
+            .run_optional(&["show-option", "-gqv", UI_SELECTION_OPTION])?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()))
     }
 
     pub fn pane_visible(&self, pane_id: &str) -> Result<bool> {
@@ -1219,6 +1279,43 @@ mod tests {
         assert!(pane_is_visible("1", "2"));
         assert!(!pane_is_visible("0", "1"));
         assert!(!pane_is_visible("1", "0"));
+    }
+
+    #[test]
+    fn selection_broadcast_targets_every_live_ui_pane() {
+        let mut first = pane("%1", "one", "ui");
+        first.is_agent_ui = true;
+        let mut second = pane("%2", "two", "ui");
+        second.is_agent_ui = true;
+        let ordinary = pane("%3", "three", "shell");
+        let mut dead = pane("%4", "four", "ui");
+        dead.is_agent_ui = true;
+        dead.dead = true;
+
+        assert_eq!(
+            selection_broadcast_panes(&[first, second, ordinary, dead]),
+            vec!["%1", "%2"]
+        );
+    }
+
+    #[test]
+    fn selection_broadcast_continues_after_one_pane_disappears() {
+        let pane_ids = vec!["%1".to_string(), "%2".to_string(), "%3".to_string()];
+        let attempted = std::sync::Mutex::new(Vec::new());
+
+        let error = wake_ui_panes(&pane_ids, |pane_id| {
+            attempted.lock().unwrap().push(pane_id.to_string());
+            if pane_id == "%2" {
+                anyhow::bail!("pane disappeared");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        let mut attempted = attempted.into_inner().unwrap();
+        attempted.sort();
+        assert_eq!(attempted, vec!["%1", "%2", "%3"]);
+        assert!(error.to_string().contains("%2"));
     }
 
     #[test]
