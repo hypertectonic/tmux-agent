@@ -7,25 +7,138 @@ use crate::model::{
 use crate::tmux::{Tmux, is_focus_target_missing};
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-    MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
+use futures_util::StreamExt;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph};
 use std::collections::{HashMap, HashSet};
+use std::future::pending;
 use std::io;
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_FRAME_TIME: Duration = Duration::from_millis(120);
+const ELAPSED_TIME_TICK: Duration = Duration::from_secs(1);
+const VISIBLE_VISIBILITY_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+const HIDDEN_VISIBILITY_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+const WATCH_RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
 const ACTION_MESSAGE_DURATION: Duration = Duration::from_secs(3);
 const PROVIDER_WIDTH: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiTimer {
+    AnimationFrame,
+    ElapsedTime,
+    VisibilityProbe,
+}
+
+#[derive(Debug)]
+struct UiSchedule {
+    visible: bool,
+    dirty: bool,
+    rendered_once: bool,
+    next_animation_frame: Instant,
+    next_elapsed_time: Instant,
+    next_visibility_probe: Option<Instant>,
+}
+
+impl UiSchedule {
+    fn new(visible: bool, now: Instant) -> Self {
+        Self {
+            visible,
+            dirty: true,
+            rendered_once: false,
+            next_animation_frame: now + SPINNER_FRAME_TIME,
+            next_elapsed_time: now + ELAPSED_TIME_TICK,
+            next_visibility_probe: Some(now + visibility_probe_interval(visible)),
+        }
+    }
+
+    fn always_visible(now: Instant) -> Self {
+        Self {
+            visible: true,
+            dirty: true,
+            rendered_once: false,
+            next_animation_frame: now + SPINNER_FRAME_TIME,
+            next_elapsed_time: now + ELAPSED_TIME_TICK,
+            next_visibility_probe: None,
+        }
+    }
+
+    fn should_render(&self) -> bool {
+        self.dirty && (self.visible || !self.rendered_once)
+    }
+
+    fn rendered(&mut self) {
+        self.dirty = false;
+        self.rendered_once = true;
+    }
+
+    fn view_changed(&mut self) {
+        self.dirty = true;
+    }
+
+    fn next_timer(
+        &self,
+        has_working_agents: bool,
+        has_running_subagents: bool,
+    ) -> Option<(Instant, UiTimer)> {
+        let animation = (self.visible && has_working_agents)
+            .then_some((self.next_animation_frame, UiTimer::AnimationFrame));
+        let elapsed_time = (self.visible && has_running_subagents)
+            .then_some((self.next_elapsed_time, UiTimer::ElapsedTime));
+        let visibility = self
+            .next_visibility_probe
+            .map(|deadline| (deadline, UiTimer::VisibilityProbe));
+        let mut next = animation;
+        for candidate in [elapsed_time, visibility].into_iter().flatten() {
+            if next.is_none_or(|current| candidate.0 < current.0) {
+                next = Some(candidate);
+            }
+        }
+        next
+    }
+
+    fn timer_elapsed(&mut self, timer: UiTimer, now: Instant) {
+        match timer {
+            UiTimer::AnimationFrame => {
+                self.dirty = true;
+                self.next_animation_frame = now + SPINNER_FRAME_TIME;
+            }
+            UiTimer::ElapsedTime => {
+                self.dirty = true;
+                self.next_elapsed_time = now + ELAPSED_TIME_TICK;
+            }
+            UiTimer::VisibilityProbe => {}
+        }
+    }
+
+    fn visibility_checked(&mut self, visible: bool, now: Instant) {
+        if visible && !self.visible {
+            self.dirty = true;
+            self.next_animation_frame = now + SPINNER_FRAME_TIME;
+            self.next_elapsed_time = now + ELAPSED_TIME_TICK;
+        }
+        self.visible = visible;
+        self.next_visibility_probe = Some(now + visibility_probe_interval(visible));
+    }
+}
+
+fn visibility_probe_interval(visible: bool) -> Duration {
+    if visible {
+        VISIBLE_VISIBILITY_PROBE_INTERVAL
+    } else {
+        HIDDEN_VISIBILITY_PROBE_INTERVAL
+    }
+}
 
 pub async fn run(
     paths: &RuntimePaths,
@@ -40,14 +153,23 @@ pub async fn run(
     }
     let _guard = UiMarkerGuard {
         tmux: tmux.clone(),
-        pane_id,
+        pane_id: pane_id.clone(),
     };
     let mut terminal = ratatui::init();
     if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
         ratatui::restore();
         return Err(error).context("enable mouse capture");
     }
-    let result = run_loop(&mut terminal, paths, &tmux, popup, config, config_path).await;
+    let result = run_loop(
+        &mut terminal,
+        paths,
+        &tmux,
+        popup,
+        pane_id.as_deref(),
+        config,
+        config_path,
+    )
+    .await;
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     match result? {
@@ -69,13 +191,21 @@ struct RenderTopology {
 }
 
 impl RenderTopology {
+    #[cfg(test)]
     fn from_snapshot(snapshot: &Snapshot) -> Self {
+        let visible_indices = (0..snapshot.agents.len()).collect::<Vec<_>>();
+        Self::from_visible(snapshot, &visible_indices)
+    }
+
+    fn from_visible(snapshot: &Snapshot, visible_indices: &[usize]) -> Self {
         Self {
             has_peers: !snapshot.peers.is_empty(),
-            rows: snapshot
-                .agents
+            rows: visible_indices
                 .iter()
-                .map(|agent| (agent.id.clone(), agent_row_height(agent)))
+                .map(|index| {
+                    let agent = &snapshot.agents[*index];
+                    (agent.id.clone(), agent_row_height(agent))
+                })
                 .collect(),
         }
     }
@@ -121,19 +251,35 @@ impl UiMessage {
         };
     }
 
-    fn set_daemon_error(&mut self, text: impl Into<String>) {
-        *self = Self::DaemonError(text.into());
+    fn set_daemon_error(&mut self, text: impl Into<String>) -> bool {
+        let text = text.into();
+        if matches!(self, Self::DaemonError(current) if current == &text) {
+            return false;
+        }
+        *self = Self::DaemonError(text);
+        true
     }
 
-    fn clear_daemon_error(&mut self) {
+    fn clear_daemon_error(&mut self) -> bool {
         if matches!(self, Self::DaemonError(_)) {
             *self = Self::None;
+            return true;
         }
+        false
     }
 
-    fn expire(&mut self, now: Instant) {
+    fn expire(&mut self, now: Instant) -> bool {
         if matches!(self, Self::Transient { expires_at, .. } if now >= *expires_at) {
             *self = Self::None;
+            return true;
+        }
+        false
+    }
+
+    fn expires_at(&self) -> Option<Instant> {
+        match self {
+            Self::Transient { expires_at, .. } => Some(*expires_at),
+            Self::None | Self::DaemonError(_) => None,
         }
     }
 
@@ -145,11 +291,195 @@ impl UiMessage {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AgentListState {
+    searching: bool,
+    query: String,
+    selected_id: Option<String>,
+    selected_position: usize,
+}
+
+impl AgentListState {
+    fn enter_search(&mut self) {
+        self.searching = true;
+    }
+
+    fn push_query(&mut self, character: char) {
+        self.query.push(character);
+    }
+
+    fn visible_indices(&self, agents: &[AgentRecord]) -> Vec<usize> {
+        let query = self.query.to_lowercase();
+        agents
+            .iter()
+            .enumerate()
+            .filter_map(|(index, agent)| agent_matches_query(agent, &query).then_some(index))
+            .collect()
+    }
+
+    fn reconcile_selection(&mut self, agents: &[AgentRecord]) {
+        let visible = self.visible_indices(agents);
+        if visible.is_empty() {
+            return;
+        }
+        if let Some(position) = self.selected_id.as_deref().and_then(|selected_id| {
+            visible
+                .iter()
+                .position(|index| agents[*index].id == selected_id)
+        }) {
+            self.selected_position = position;
+            return;
+        }
+        self.selected_position = self.selected_position.min(visible.len() - 1);
+        self.selected_id = Some(agents[visible[self.selected_position]].id.clone());
+    }
+
+    fn selected_visible_index(&self, agents: &[AgentRecord]) -> Option<usize> {
+        let selected_id = self.selected_id.as_deref()?;
+        self.visible_indices(agents)
+            .iter()
+            .position(|index| agents[*index].id == selected_id)
+    }
+
+    fn select_visible(&mut self, agents: &[AgentRecord], visible_index: usize) {
+        let visible = self.visible_indices(agents);
+        if let Some(index) = visible.get(visible_index) {
+            self.selected_id = Some(agents[*index].id.clone());
+            self.selected_position = visible_index;
+        }
+    }
+
+    fn select_snapshot(&mut self, agents: &[AgentRecord], snapshot_index: usize) {
+        if let Some(agent) = agents.get(snapshot_index) {
+            self.selected_id = Some(agent.id.clone());
+            if let Some(position) = self
+                .visible_indices(agents)
+                .iter()
+                .position(|index| *index == snapshot_index)
+            {
+                self.selected_position = position;
+            }
+        }
+    }
+
+    fn move_selection(&mut self, agents: &[AgentRecord], direction: isize) {
+        let visible = self.visible_indices(agents);
+        if visible.is_empty() {
+            return;
+        }
+        let current = self.selected_visible_index(agents).unwrap_or_default();
+        let next = if direction < 0 {
+            current.saturating_sub(1)
+        } else {
+            current.saturating_add(1).min(visible.len() - 1)
+        };
+        self.selected_id = Some(agents[visible[next]].id.clone());
+        self.selected_position = next;
+    }
+
+    fn selected_snapshot_index(&self, agents: &[AgentRecord]) -> Option<usize> {
+        let selected_id = self.selected_id.as_deref()?;
+        self.visible_indices(agents)
+            .into_iter()
+            .find(|index| agents[*index].id == selected_id)
+    }
+
+    fn leave_search(&mut self) {
+        self.searching = false;
+        self.query.clear();
+    }
+}
+
+fn agent_matches_query(agent: &AgentRecord, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let title = display_title(agent);
+    let location = location_breadcrumb(agent);
+    [
+        agent.agent.as_str(),
+        title.as_str(),
+        agent.label.as_deref().unwrap_or_default(),
+        agent.host.as_str(),
+        agent.session_name.as_str(),
+        agent.window_name.as_str(),
+        agent.cwd.as_str(),
+        location.as_str(),
+        attention_label(agent.attention),
+    ]
+    .into_iter()
+    .any(|value| value.to_lowercase().contains(query))
+        || agent.subagent.as_ref().is_some_and(|subagent| {
+            subagent
+                .name
+                .as_deref()
+                .is_some_and(|name| name.to_lowercase().contains(query))
+                || subagent_state_label(subagent.finished_at_ms).contains(query)
+        })
+}
+
+fn subagent_state_label(finished_at_ms: Option<u64>) -> &'static str {
+    if finished_at_ms.is_some() {
+        "done"
+    } else {
+        "running"
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListAction {
+    None,
+    Close,
+    Activate,
+    Refresh,
+}
+
+fn handle_list_key(key: KeyEvent, list: &mut AgentListState, agents: &[AgentRecord]) -> ListAction {
+    let action = if list.searching {
+        match key.code {
+            KeyCode::Esc => list.leave_search(),
+            KeyCode::Enter => return ListAction::Activate,
+            KeyCode::Down => list.move_selection(agents, 1),
+            KeyCode::Up => list.move_selection(agents, -1),
+            KeyCode::Backspace => {
+                list.query.pop();
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                list.push_query(character);
+            }
+            _ => {}
+        }
+        ListAction::None
+    } else {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return ListAction::Close,
+            KeyCode::Char('j') | KeyCode::Down => list.move_selection(agents, 1),
+            KeyCode::Char('k') | KeyCode::Up => list.move_selection(agents, -1),
+            KeyCode::Char('g') | KeyCode::Home => list.select_visible(agents, 0),
+            KeyCode::Char('G') | KeyCode::End => {
+                list.select_visible(agents, list.visible_indices(agents).len().saturating_sub(1));
+            }
+            KeyCode::Enter => return ListAction::Activate,
+            KeyCode::Char('r') => return ListAction::Refresh,
+            KeyCode::Char('/') => list.enter_search(),
+            _ => {}
+        }
+        ListAction::None
+    };
+    list.reconcile_selection(agents);
+    action
+}
+
 async fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
     paths: &RuntimePaths,
     tmux: &Tmux,
     exit_after_focus: bool,
+    ui_pane_id: Option<&str>,
     config: &Config,
     config_path: &Path,
 ) -> Result<LoopExit> {
@@ -160,105 +490,295 @@ async fn run_loop(
         config_path,
         exit_after_focus,
     };
-    let mut snapshot = ipc::snapshot(&paths.socket, false).await?;
-    let mut selected = 0usize;
+    let (initial_watch, mut snapshot) = connect_snapshot_watch(&paths.socket).await?;
+    let mut watch = Some(initial_watch);
+    let mut list = AgentListState::default();
+    list.reconcile_selection(&snapshot.agents);
     let mut message = UiMessage::default();
-    let mut last_refresh = Instant::now();
-    let animation_started = Instant::now();
+    let started = Instant::now();
+    let mut schedule = match ui_pane_id {
+        Some(pane_id) => UiSchedule::new(read_pane_visibility(tmux, pane_id).await?, started),
+        None => UiSchedule::always_visible(started),
+    };
+    let animation_started = started;
     let mut redraw = RedrawTracker::default();
+    let mut terminal_events = EventStream::new();
+    let mut reconnect_at = None;
 
     loop {
-        message.expire(Instant::now());
-        if selected >= snapshot.agents.len() && !snapshot.agents.is_empty() {
-            selected = snapshot.agents.len() - 1;
+        if schedule.should_render() {
+            list.reconcile_selection(&snapshot.agents);
+            let visible_indices = list.visible_indices(&snapshot.agents);
+            let topology = RenderTopology::from_visible(&snapshot, &visible_indices);
+            if redraw.needs_full_redraw(&topology) {
+                let area = terminal
+                    .size()
+                    .context("read terminal size for full redraw")?
+                    .into();
+                terminal
+                    .resize(area)
+                    .context("prepare terminal for full redraw")?;
+            }
+            terminal.draw(|frame| {
+                render_agent_list(
+                    frame,
+                    &snapshot,
+                    &list,
+                    message.text(),
+                    spinner_frame(animation_started.elapsed()),
+                    current_time_ms(),
+                )
+            })?;
+            redraw.mark_rendered(topology);
+            schedule.rendered();
         }
-        let spinner_frame = spinner_frame(animation_started.elapsed());
-        let topology = RenderTopology::from_snapshot(&snapshot);
-        if redraw.needs_full_redraw(&topology) {
-            terminal.clear().context("clear terminal for full redraw")?;
-        }
-        terminal.draw(|frame| render(frame, &snapshot, selected, message.text(), spinner_frame))?;
-        redraw.mark_rendered(topology);
-        if event::poll(Duration::from_millis(100)).context("poll terminal input")? {
-            match event::read().context("read terminal input")? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(LoopExit::Close),
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if selected + 1 < snapshot.agents.len() {
-                            selected += 1;
-                        }
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        selected = selected.saturating_sub(1);
-                    }
-                    KeyCode::Char('g') | KeyCode::Home => selected = 0,
-                    KeyCode::Char('G') | KeyCode::End => {
-                        selected = snapshot.agents.len().saturating_sub(1)
-                    }
-                    KeyCode::Enter => {
-                        match activate_record(
-                            &activation_context,
-                            &mut snapshot,
-                            selected,
-                            &mut message,
-                        )
-                        .await?
-                        {
-                            Activation::Continue => {}
-                            Activation::Close => return Ok(LoopExit::Close),
-                            Activation::RunInCurrentTerminal(command) => {
-                                return Ok(LoopExit::RunInCurrentTerminal(command));
+
+        let visible_indices = list.visible_indices(&snapshot.agents);
+        let (has_working_agents, has_running_subagents) =
+            visible_timer_requirements(&snapshot.agents, &visible_indices);
+        let timer = next_loop_timer(
+            &schedule,
+            has_working_agents,
+            has_running_subagents,
+            message.expires_at(),
+            reconnect_at,
+        );
+        tokio::select! {
+            terminal_event = terminal_events.next() => match terminal_event {
+                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                    let previous_list = list.clone();
+                    match handle_list_key(key, &mut list, &snapshot.agents) {
+                        ListAction::None => {
+                            if list != previous_list {
+                                schedule.view_changed();
                             }
                         }
+                        ListAction::Close => return Ok(LoopExit::Close),
+                        ListAction::Activate => {
+                            let Some(selected) = list.selected_snapshot_index(&snapshot.agents)
+                            else {
+                                continue;
+                            };
+                            let activation = activate_record(
+                                &activation_context,
+                                &mut snapshot,
+                                selected,
+                                &mut message,
+                            )
+                            .await?;
+                            if let Some(exit) =
+                                apply_activation_outcome(activation, &mut list, &snapshot.agents)
+                            {
+                                return Ok(exit);
+                            }
+                            schedule.view_changed();
+                        }
+                        ListAction::Refresh => {
+                            let (next_watch, next_snapshot) =
+                                connect_snapshot_watch(&paths.socket).await?;
+                            watch = Some(next_watch);
+                            snapshot = next_snapshot;
+                            list.reconcile_selection(&snapshot.agents);
+                            reconnect_at = None;
+                            message.set_transient("refreshed", Instant::now());
+                            redraw.force();
+                            schedule.view_changed();
+                        }
                     }
-                    KeyCode::Char('r') => {
-                        snapshot = ipc::snapshot(&paths.socket, false).await?;
-                        last_refresh = Instant::now();
-                        message.set_transient("refreshed", Instant::now());
-                        redraw.force();
-                    }
-                    _ => {}
-                },
-                Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                }
+                Some(Ok(Event::Mouse(mouse)))
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
+                {
                     let (width, height) =
                         crossterm::terminal::size().context("read terminal size")?;
-                    if let Some(index) = agent_at_mouse(
+                    let visible_indices = list.visible_indices(&snapshot.agents);
+                    let selected = list
+                        .selected_visible_index(&snapshot.agents)
+                        .unwrap_or_default();
+                    if let Some(index) = agent_at_mouse_filtered(
                         Rect::new(0, 0, width, height),
                         !snapshot.peers.is_empty(),
                         selected,
                         &snapshot.agents,
+                        &visible_indices,
                         mouse.column,
                         mouse.row,
                     ) {
-                        selected = index;
-                        match activate_record(
+                        list.select_snapshot(&snapshot.agents, index);
+                        let activation = activate_record(
                             &activation_context,
                             &mut snapshot,
-                            selected,
+                            index,
                             &mut message,
                         )
-                        .await?
+                        .await?;
+                        if let Some(exit) =
+                            apply_activation_outcome(activation, &mut list, &snapshot.agents)
                         {
-                            Activation::Continue => {}
-                            Activation::Close => return Ok(LoopExit::Close),
-                            Activation::RunInCurrentTerminal(command) => {
-                                return Ok(LoopExit::RunInCurrentTerminal(command));
+                            return Ok(exit);
+                        }
+                        schedule.view_changed();
+                    }
+                }
+                Some(Ok(Event::Resize(_, _))) => {
+                    schedule.view_changed();
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => return Err(error).context("read terminal input"),
+                None => return Ok(LoopExit::Close),
+            },
+            watched_snapshot = next_watched_snapshot(&mut watch) => {
+                match watched_snapshot {
+                    Ok(Some(next)) => {
+                        apply_daemon_refresh(&mut snapshot, &mut message, Ok(next));
+                        list.reconcile_selection(&snapshot.agents);
+                        schedule.view_changed();
+                    }
+                    Ok(None) => {
+                        if message.set_daemon_error("daemon: watch stream closed") {
+                            schedule.view_changed();
+                        }
+                        watch = None;
+                        reconnect_at = Some(Instant::now() + WATCH_RECONNECT_INTERVAL);
+                    }
+                    Err(error) => {
+                        if message.set_daemon_error(format!("daemon: {error:#}")) {
+                            schedule.view_changed();
+                        }
+                        watch = None;
+                        reconnect_at = Some(Instant::now() + WATCH_RECONNECT_INTERVAL);
+                    }
+                }
+            },
+            timer = wait_for_timer(timer) => {
+                let now = Instant::now();
+                match timer {
+                    LoopTimer::Ui(UiTimer::AnimationFrame) => {
+                        schedule.timer_elapsed(UiTimer::AnimationFrame, now);
+                    }
+                    LoopTimer::Ui(UiTimer::ElapsedTime) => {
+                        schedule.timer_elapsed(UiTimer::ElapsedTime, now);
+                    }
+                    LoopTimer::Ui(UiTimer::VisibilityProbe) => {
+                        let pane_id = ui_pane_id.context("visibility timer without a UI pane")?;
+                        let visible = read_pane_visibility(tmux, pane_id).await?;
+                        schedule.visibility_checked(visible, Instant::now());
+                    }
+                    LoopTimer::MessageExpiry => {
+                        if message.expire(now) {
+                            schedule.view_changed();
+                        }
+                    }
+                    LoopTimer::WatchReconnect => {
+                        match connect_snapshot_watch(&paths.socket).await {
+                            Ok((next_watch, next_snapshot)) => {
+                                watch = Some(next_watch);
+                                reconnect_at = None;
+                                apply_daemon_refresh(
+                                    &mut snapshot,
+                                    &mut message,
+                                    Ok(next_snapshot),
+                                );
+                                list.reconcile_selection(&snapshot.agents);
+                                schedule.view_changed();
+                            }
+                            Err(error) => {
+                                if message.set_daemon_error(format!("daemon: {error:#}")) {
+                                    schedule.view_changed();
+                                }
+                                reconnect_at =
+                                    Some(Instant::now() + WATCH_RECONNECT_INTERVAL);
                             }
                         }
                     }
                 }
-                _ => {}
             }
         }
-        if last_refresh.elapsed() >= Duration::from_millis(500) {
-            apply_daemon_refresh(
-                &mut snapshot,
-                &mut message,
-                ipc::snapshot(&paths.socket, false).await,
-            );
-            last_refresh = Instant::now();
+    }
+}
+
+fn visible_timer_requirements(agents: &[AgentRecord], visible_indices: &[usize]) -> (bool, bool) {
+    visible_indices.iter().fold(
+        (false, false),
+        |(has_working_agent, has_running_subagent), index| {
+            let agent = &agents[*index];
+            match &agent.subagent {
+                Some(subagent) => (
+                    has_working_agent,
+                    has_running_subagent || subagent.finished_at_ms.is_none(),
+                ),
+                None => (
+                    has_working_agent || agent.attention == Attention::Working,
+                    has_running_subagent,
+                ),
+            }
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LoopTimer {
+    Ui(UiTimer),
+    MessageExpiry,
+    WatchReconnect,
+}
+
+fn next_loop_timer(
+    schedule: &UiSchedule,
+    has_working_agents: bool,
+    has_running_subagents: bool,
+    message_expiry: Option<Instant>,
+    reconnect_at: Option<Instant>,
+) -> Option<(Instant, LoopTimer)> {
+    let mut next = schedule
+        .next_timer(has_working_agents, has_running_subagents)
+        .map(|(deadline, timer)| (deadline, LoopTimer::Ui(timer)));
+    for candidate in [
+        message_expiry.map(|deadline| (deadline, LoopTimer::MessageExpiry)),
+        reconnect_at.map(|deadline| (deadline, LoopTimer::WatchReconnect)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if next.is_none_or(|current| candidate.0 < current.0) {
+            next = Some(candidate);
         }
     }
+    next
+}
+
+async fn wait_for_timer(timer: Option<(Instant, LoopTimer)>) -> LoopTimer {
+    match timer {
+        Some((deadline, timer)) => {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            timer
+        }
+        None => pending().await,
+    }
+}
+
+async fn next_watched_snapshot(watch: &mut Option<ipc::SnapshotWatch>) -> Result<Option<Snapshot>> {
+    match watch {
+        Some(watch) => watch.next_snapshot().await,
+        None => pending().await,
+    }
+}
+
+async fn connect_snapshot_watch(socket: &Path) -> Result<(ipc::SnapshotWatch, Snapshot)> {
+    let mut watch = ipc::SnapshotWatch::connect(socket, false).await?;
+    let snapshot = watch
+        .next_snapshot()
+        .await?
+        .context("daemon closed watch stream before its initial snapshot")?;
+    Ok((watch, snapshot))
+}
+
+async fn read_pane_visibility(tmux: &Tmux, pane_id: &str) -> Result<bool> {
+    let tmux = tmux.clone();
+    let pane_id = pane_id.to_string();
+    tokio::task::spawn_blocking(move || tmux.pane_visible(&pane_id))
+        .await
+        .context("join tmux pane visibility probe")?
 }
 
 fn apply_daemon_refresh(
@@ -271,15 +791,35 @@ fn apply_daemon_refresh(
             *snapshot = next;
             message.clear_daemon_error();
         }
-        Err(error) => message.set_daemon_error(format!("daemon: {error:#}")),
+        Err(error) => {
+            message.set_daemon_error(format!("daemon: {error:#}"));
+        }
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Activation {
-    Continue,
+    Completed,
+    Failed,
     Close,
     RunInCurrentTerminal(Vec<String>),
+}
+
+fn apply_activation_outcome(
+    activation: Activation,
+    list: &mut AgentListState,
+    agents: &[AgentRecord],
+) -> Option<LoopExit> {
+    match activation {
+        Activation::Completed => {
+            list.leave_search();
+            list.reconcile_selection(agents);
+            None
+        }
+        Activation::Failed => None,
+        Activation::Close => Some(LoopExit::Close),
+        Activation::RunInCurrentTerminal(command) => Some(LoopExit::RunInCurrentTerminal(command)),
+    }
 }
 
 struct ActivationContext<'a> {
@@ -297,19 +837,31 @@ async fn activate_record(
     message: &mut UiMessage,
 ) -> Result<Activation> {
     let Some(record) = snapshot.agents.get(selected).cloned() else {
-        return Ok(Activation::Continue);
+        return Ok(Activation::Failed);
     };
     if record.subagent.is_some() {
         let command =
-            subagent_view_command(context.config, context.config_path, snapshot, &record)?;
+            match subagent_view_command(context.config, context.config_path, snapshot, &record) {
+                Ok(command) => command,
+                Err(error) if !context.exit_after_focus => {
+                    message.set_transient(format!("{error:#}"), Instant::now());
+                    return Ok(Activation::Failed);
+                }
+                Err(error) => return Err(error),
+            };
         if context.exit_after_focus {
             return Ok(Activation::RunInCurrentTerminal(command));
         }
-        match context.tmux.display_popup(&shell_join(&command)) {
-            Ok(()) => message.set_transient("opened read-only subagent view", Instant::now()),
-            Err(error) => message.set_transient(format!("{error:#}"), Instant::now()),
-        }
-        return Ok(Activation::Continue);
+        return match context.tmux.display_popup(&shell_join(&command)) {
+            Ok(()) => {
+                message.set_transient("opened read-only subagent view", Instant::now());
+                Ok(Activation::Completed)
+            }
+            Err(error) => {
+                message.set_transient(format!("{error:#}"), Instant::now());
+                Ok(Activation::Failed)
+            }
+        };
     }
     let focus_record = &record;
     if focus_record.is_tmux() || focus_record.remote_alias.is_some() {
@@ -325,7 +877,7 @@ async fn activate_record(
                     format!("focused {}", focus_record.location()),
                     Instant::now(),
                 );
-                Ok(Activation::Continue)
+                Ok(Activation::Completed)
             }
             Err(focus_error)
                 if focus_record.remote_alias.is_some()
@@ -341,22 +893,27 @@ async fn activate_record(
                     ),
                     Instant::now(),
                 );
-                Ok(Activation::Continue)
+                Ok(Activation::Completed)
             }
             Err(error) => {
                 message.set_transient(format!("{error:#}"), Instant::now());
-                Ok(Activation::Continue)
+                Ok(Activation::Failed)
             }
         };
     }
     match acknowledge_record(context.paths, snapshot, &record.id).await {
-        Ok(()) => message.set_transient(
-            format!("acknowledged {}", record.location()),
-            Instant::now(),
-        ),
-        Err(error) => message.set_transient(format!("{error:#}"), Instant::now()),
+        Ok(()) => {
+            message.set_transient(
+                format!("acknowledged {}", record.location()),
+                Instant::now(),
+            );
+            Ok(Activation::Completed)
+        }
+        Err(error) => {
+            message.set_transient(format!("{error:#}"), Instant::now());
+            Ok(Activation::Failed)
+        }
     }
-    Ok(Activation::Continue)
 }
 
 fn activation_requires_acknowledgement(record: &AgentRecord) -> bool {
@@ -441,6 +998,7 @@ async fn acknowledge_record(
     Ok(())
 }
 
+#[cfg(test)]
 fn render(
     frame: &mut Frame,
     snapshot: &Snapshot,
@@ -448,7 +1006,77 @@ fn render(
     message: &str,
     spinner_frame: usize,
 ) {
+    render_at(
+        frame,
+        snapshot,
+        selected,
+        message,
+        spinner_frame,
+        snapshot.generated_at_ms,
+    );
+}
+
+#[cfg(test)]
+fn render_live(
+    frame: &mut Frame,
+    snapshot: &Snapshot,
+    selected: usize,
+    message: &str,
+    spinner_frame: usize,
+) {
+    render_at(
+        frame,
+        snapshot,
+        selected,
+        message,
+        spinner_frame,
+        current_time_ms(),
+    );
+}
+
+#[cfg(test)]
+fn render_at(
+    frame: &mut Frame,
+    snapshot: &Snapshot,
+    selected: usize,
+    message: &str,
+    spinner_frame: usize,
+    rendered_at_ms: u64,
+) {
+    let list = AgentListState {
+        selected_id: snapshot.agents.get(selected).map(|agent| agent.id.clone()),
+        ..AgentListState::default()
+    };
+    render_agent_list(
+        frame,
+        snapshot,
+        &list,
+        message,
+        spinner_frame,
+        rendered_at_ms,
+    );
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn render_agent_list(
+    frame: &mut Frame,
+    snapshot: &Snapshot,
+    list: &AgentListState,
+    message: &str,
+    spinner_frame: usize,
+    rendered_at_ms: u64,
+) {
     let chunks = ui_layout(frame.area(), !snapshot.peers.is_empty());
+    let visible_indices = list.visible_indices(&snapshot.agents);
+    let selected = list
+        .selected_visible_index(&snapshot.agents)
+        .unwrap_or_default();
 
     let counts = snapshot
         .agents
@@ -473,6 +1101,18 @@ fn render(
             counts
         });
     let subagent_depths = subagent_depths(&snapshot.agents);
+    let search_line = if list.searching {
+        Line::from(vec![
+            Span::styled(" search ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                terminal_safe(&list.query),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("█", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::default()
+    };
     let header = Paragraph::new(vec![
         Line::default(),
         Line::from(vec![
@@ -498,23 +1138,24 @@ fn render(
                 Style::default().fg(attention_color(Attention::Working)),
             ),
         ]),
+        search_line,
     ])
     .block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, chunks[0]);
 
     let list_width = chunks[1].width.saturating_sub(1) as usize;
-    let items = snapshot
-        .agents
+    let items = visible_indices
         .iter()
         .enumerate()
-        .map(|(index, agent)| {
+        .map(|(visible_index, snapshot_index)| {
+            let agent = &snapshot.agents[*snapshot_index];
             if let Some(subagent) = &agent.subagent {
                 let finished = subagent.finished_at_ms.is_some();
                 let state_color = if finished { Color::Green } else { Color::Cyan };
-                let state_label = if finished { "done" } else { "running" };
+                let state_label = subagent_state_label(subagent.finished_at_ms);
                 let end = subagent
                     .finished_at_ms
-                    .unwrap_or(snapshot.generated_at_ms.max(subagent.started_at_ms));
+                    .unwrap_or(rendered_at_ms.max(subagent.started_at_ms));
                 let duration = format_duration(
                     end.saturating_sub(subagent.started_at_ms)
                         .saturating_div(1_000),
@@ -589,7 +1230,7 @@ fn render(
                 .max(1);
             let location_width = list_width.saturating_sub(2 + PROVIDER_WIDTH + 2).max(1);
             let (provider, provider_style) = provider_badge(&agent.agent);
-            let row_style = agent_row_style(agent.attention, index == selected);
+            let row_style = agent_row_style(agent.attention, visible_index == selected);
             let glyph = attention_glyph(agent.attention, spinner_frame);
             let glyph_color = if agent.attention == Attention::Working {
                 provider_style.fg.unwrap_or(color)
@@ -644,7 +1285,13 @@ fn render(
             .style(row_style)
         })
         .collect::<Vec<_>>();
-    let list = List::new(items)
+    if visible_indices.is_empty() && list.searching && !list.query.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" no sessions match").style(Style::default().fg(Color::DarkGray)),
+            chunks[1],
+        );
+    }
+    let agent_list = List::new(items)
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol(Line::from(Span::styled(
             "▌",
@@ -653,10 +1300,10 @@ fn render(
         .highlight_spacing(HighlightSpacing::Always)
         .repeat_highlight_symbol(true);
     let mut list_state = ListState::default();
-    if !snapshot.agents.is_empty() {
+    if !visible_indices.is_empty() {
         list_state.select(Some(selected));
     }
-    frame.render_stateful_widget(list, chunks[1], &mut list_state);
+    frame.render_stateful_widget(agent_list, chunks[1], &mut list_state);
 
     if !snapshot.peers.is_empty() {
         let mut peers = Vec::new();
@@ -691,15 +1338,16 @@ fn render(
         }
         frame.render_widget(Paragraph::new(Line::from(peers)), chunks[2]);
     }
-    let safe_message = terminal_safe(message);
-    let footer = if message.is_empty() {
-        "j/k move  enter focus/view  r refresh  q close"
+    let footer = if !message.is_empty() {
+        terminal_safe(message)
+    } else if list.searching {
+        "↑/↓ move  enter focus/view  backspace edit  esc clear".to_string()
     } else {
-        safe_message.as_str()
+        "j/k move  / search  enter focus/view  r refresh  q close".to_string()
     };
     frame.render_widget(
         Paragraph::new(truncate(
-            footer,
+            &footer,
             frame.area().width.saturating_sub(1) as usize,
         ))
         .style(Style::default().fg(Color::DarkGray)),
@@ -753,11 +1401,33 @@ fn agent_row_height(agent: &AgentRecord) -> usize {
     if agent.subagent.is_some() { 1 } else { 2 }
 }
 
+#[cfg(test)]
 fn agent_at_mouse(
     area: Rect,
     has_peers: bool,
     selected: usize,
     agents: &[AgentRecord],
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let visible_indices = (0..agents.len()).collect::<Vec<_>>();
+    agent_at_mouse_filtered(
+        area,
+        has_peers,
+        selected,
+        agents,
+        &visible_indices,
+        column,
+        row,
+    )
+}
+
+fn agent_at_mouse_filtered(
+    area: Rect,
+    has_peers: bool,
+    selected: usize,
+    agents: &[AgentRecord],
+    visible_indices: &[usize],
     column: u16,
     row: u16,
 ) -> Option<usize> {
@@ -769,7 +1439,10 @@ fn agent_at_mouse(
     {
         return None;
     }
-    let heights = agents.iter().map(agent_row_height).collect::<Vec<_>>();
+    let heights = visible_indices
+        .iter()
+        .map(|index| agent_row_height(&agents[*index]))
+        .collect::<Vec<_>>();
     let offset = visible_list_offset(&heights, selected, usize::from(list.height));
     let mut relative_row = usize::from(row - list.y);
     let mut rendered_height = 0usize;
@@ -778,7 +1451,7 @@ fn agent_at_mouse(
             break;
         }
         if relative_row < height {
-            return Some(index);
+            return visible_indices.get(index).copied();
         }
         relative_row = relative_row.saturating_sub(height);
         rendered_height += height;
@@ -922,7 +1595,16 @@ fn location_breadcrumb(agent: &AgentRecord) -> String {
 }
 
 fn display_title(agent: &AgentRecord) -> String {
-    let title = trim_braille_activity_prefix(&agent.title);
+    let stable_grok_title = if agent.agent.eq_ignore_ascii_case("grok") {
+        Path::new(&agent.cwd)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .or_else(|| (!agent.cwd.is_empty()).then_some(agent.cwd.as_str()))
+    } else {
+        None
+    };
+    let title = stable_grok_title.unwrap_or_else(|| trim_braille_activity_prefix(&agent.title));
     let title = if title.is_empty() {
         trim_braille_activity_prefix(&agent.window_name)
     } else {
@@ -1136,7 +1818,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             row_text(&terminal, footer_row),
-            "j/k move  enter focus/view  r refresh  q close"
+            "j/k move  / search  enter focus/view  r refresh  q close"
         );
     }
 
@@ -1307,6 +1989,124 @@ mod tests {
     }
 
     #[test]
+    fn ui_schedule_draws_initially_and_after_changes_not_unchanged_probes() {
+        let started = Instant::now();
+        let mut schedule = UiSchedule::new(true, started);
+
+        assert!(schedule.should_render());
+        schedule.rendered();
+        assert!(!schedule.should_render());
+
+        assert_eq!(
+            schedule.next_timer(true, false),
+            Some((started + SPINNER_FRAME_TIME, UiTimer::AnimationFrame))
+        );
+        schedule.timer_elapsed(UiTimer::AnimationFrame, started + SPINNER_FRAME_TIME);
+        assert!(schedule.should_render());
+        schedule.rendered();
+
+        schedule.view_changed();
+        assert!(schedule.should_render());
+        schedule.rendered();
+
+        let (deadline, timer) = schedule.next_timer(false, false).unwrap();
+        assert_eq!(deadline, started + VISIBLE_VISIBILITY_PROBE_INTERVAL);
+        assert_eq!(timer, UiTimer::VisibilityProbe);
+        schedule.visibility_checked(true, deadline);
+        assert!(!schedule.should_render());
+    }
+
+    #[test]
+    fn visible_timer_requirements_follow_rendered_rows() {
+        let working_root = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        let idle_root = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        let mut running_subagent = test_agent("Codex", Attention::Working, AgentOrigin::Terminal);
+        running_subagent.subagent = Some(SubagentInfo {
+            parent_id: working_root.id.clone(),
+            started_at_ms: 1,
+            finished_at_ms: None,
+            name: Some("review".into()),
+            thread_id: None,
+        });
+        let agents = vec![working_root, idle_root, running_subagent];
+
+        assert_eq!(visible_timer_requirements(&agents, &[1]), (false, false));
+        assert_eq!(visible_timer_requirements(&agents, &[2]), (false, true));
+        assert_eq!(visible_timer_requirements(&agents, &[0]), (true, false));
+        assert_eq!(visible_timer_requirements(&agents, &[0, 2]), (true, true));
+    }
+
+    #[test]
+    fn hidden_schedule_defers_updates_and_animation() {
+        let started = Instant::now();
+        let mut schedule = UiSchedule::new(false, started);
+        assert!(schedule.should_render());
+        schedule.rendered();
+        schedule.view_changed();
+
+        assert!(!schedule.should_render());
+        assert_eq!(
+            schedule.next_timer(true, true),
+            Some((
+                started + HIDDEN_VISIBILITY_PROBE_INTERVAL,
+                UiTimer::VisibilityProbe
+            ))
+        );
+
+        let hidden_probe = started + HIDDEN_VISIBILITY_PROBE_INTERVAL;
+        schedule.visibility_checked(false, hidden_probe);
+        assert!(!schedule.should_render());
+
+        schedule.visibility_checked(true, hidden_probe);
+        assert!(schedule.should_render());
+    }
+
+    #[test]
+    fn running_subagent_duration_advances_without_a_new_snapshot() {
+        let now_ms = crate::scanner::now_ms();
+        let mut parent = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
+        parent.id = "local/default/parent".into();
+        let mut child = test_agent("Codex", Attention::Unknown, AgentOrigin::Terminal);
+        child.id = "local/terminal/ttys054/70".into();
+        child.subagent = Some(SubagentInfo {
+            parent_id: parent.id.clone(),
+            started_at_ms: now_ms - 2_000,
+            finished_at_ms: None,
+            name: Some("review".into()),
+            thread_id: None,
+        });
+        let mut snapshot = Snapshot {
+            generated_at_ms: now_ms,
+            agents: vec![parent, child],
+            ..Snapshot::default()
+        };
+        snapshot.sort_agents();
+        let mut terminal = Terminal::new(TestBackend::new(90, 14)).unwrap();
+
+        terminal
+            .draw(|frame| render_live(frame, &snapshot, 0, "", 0))
+            .unwrap();
+        assert!(row_text(&terminal, 6).contains("running  ·  2s"));
+
+        std::thread::sleep(Duration::from_millis(1_100));
+        terminal
+            .draw(|frame| render_live(frame, &snapshot, 0, "", 0))
+            .unwrap();
+
+        assert!(row_text(&terminal, 6).contains("running  ·  3s"));
+
+        let started = Instant::now();
+        let mut schedule = UiSchedule::always_visible(started);
+        schedule.rendered();
+        assert_eq!(
+            schedule.next_timer(false, true),
+            Some((started + Duration::from_secs(1), UiTimer::ElapsedTime))
+        );
+        schedule.timer_elapsed(UiTimer::ElapsedTime, started + Duration::from_secs(1));
+        assert!(schedule.should_render());
+    }
+
+    #[test]
     fn goal_durations_follow_codex_compact_units() {
         assert_eq!(format_goal_duration(42), "42s");
         assert_eq!(format_goal_duration(1_122), "18m 42s");
@@ -1463,6 +2263,20 @@ mod tests {
     }
 
     #[test]
+    fn display_title_keeps_grok_working_directory_stable() {
+        let mut agent = test_agent("Grok", Attention::Working, AgentOrigin::Tmux);
+        agent.cwd = "/work/sample-project".into();
+        agent.title = "⠦ Analyzing changes - grok".into();
+        assert_eq!(display_title(&agent), "sample-project");
+
+        agent.title = "⠸ Running cargo test - grok".into();
+        assert_eq!(display_title(&agent), "sample-project");
+
+        agent.cwd = "/".into();
+        assert_eq!(display_title(&agent), "/");
+    }
+
+    #[test]
     fn display_title_appends_the_pane_label() {
         let mut agent = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
         agent.title = "⠦ sample-project".into();
@@ -1474,6 +2288,343 @@ mod tests {
 
         agent.label = Some("sample-project".into());
         assert_eq!(display_title(&agent), "sample-project");
+    }
+
+    #[test]
+    fn search_filters_agents_by_visible_text_case_insensitively() {
+        let mut codex = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        codex.title = "Payment API".into();
+        let mut claude = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        claude.title = "Documentation".into();
+        let agents = vec![codex, claude];
+        let mut list = AgentListState::default();
+
+        list.enter_search();
+        for character in "PAYMENT".chars() {
+            list.push_query(character);
+        }
+
+        assert_eq!(list.visible_indices(&agents), vec![0]);
+    }
+
+    #[test]
+    fn search_matches_provider_label_location_and_working_directory() {
+        let mut codex = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        codex.id = "local/default/payment".into();
+        codex.title = "Payment API".into();
+        codex.label = Some("priority work".into());
+        codex.host = "build-host".into();
+        codex.session_name = "backend".into();
+        codex.cwd = "/work/services/payments".into();
+        let mut claude = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        claude.id = "local/default/docs".into();
+        claude.title = "Documentation".into();
+        let agents = vec![codex, claude];
+
+        for query in ["codex", "priority", "build-host", "backend", "payments"] {
+            let mut list = AgentListState::default();
+            list.enter_search();
+            for character in query.chars() {
+                list.push_query(character);
+            }
+            assert_eq!(list.visible_indices(&agents), vec![0], "query {query:?}");
+        }
+    }
+
+    #[test]
+    fn search_matches_the_state_displayed_for_subagents() {
+        let mut running = test_agent("Codex", Attention::Working, AgentOrigin::Terminal);
+        running.subagent = Some(SubagentInfo {
+            parent_id: "local/default/parent".into(),
+            started_at_ms: 1,
+            finished_at_ms: None,
+            name: Some("review".into()),
+            thread_id: None,
+        });
+        let mut done = running.clone();
+        done.id = "local/default/done".into();
+        done.subagent.as_mut().unwrap().finished_at_ms = Some(2);
+        let agents = vec![running, done];
+
+        let mut list = AgentListState::default();
+        list.enter_search();
+        for character in "running".chars() {
+            list.push_query(character);
+        }
+        assert_eq!(list.visible_indices(&agents), vec![0]);
+
+        list.query = "done".into();
+        assert_eq!(list.visible_indices(&agents), vec![1]);
+    }
+
+    #[test]
+    fn search_mode_treats_navigation_commands_as_query_text() {
+        let agents = vec![test_agent("Codex", Attention::Working, AgentOrigin::Tmux)];
+        let mut list = AgentListState::default();
+        list.reconcile_selection(&agents);
+
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::Close
+        );
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::None
+        );
+        assert!(list.searching);
+
+        for character in ['j', 'k', 'r', 'q'] {
+            assert_eq!(
+                handle_list_key(
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                    &mut list,
+                    &agents,
+                ),
+                ListAction::None
+            );
+        }
+        assert_eq!(list.query, "jkrq");
+
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::None
+        );
+        assert!(!list.searching);
+        assert!(list.query.is_empty());
+    }
+
+    #[test]
+    fn search_renders_only_matching_rows_and_an_active_prompt() {
+        let mut payment = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        payment.id = "local/default/payment".into();
+        payment.title = "Payment API".into();
+        let mut docs = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        docs.id = "local/default/docs".into();
+        docs.title = "Documentation".into();
+        let snapshot = Snapshot {
+            agents: vec![payment, docs],
+            ..Snapshot::default()
+        };
+        let mut list = AgentListState::default();
+        list.enter_search();
+        for character in "doc".chars() {
+            list.push_query(character);
+        }
+        list.reconcile_selection(&snapshot.agents);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_agent_list(frame, &snapshot, &list, "", 0, snapshot.generated_at_ms)
+            })
+            .unwrap();
+
+        let screen = (0..12)
+            .map(|row| row_text(&terminal, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Documentation"));
+        assert!(!screen.contains("Payment API"));
+        assert!(screen.contains("search doc█"));
+    }
+
+    #[test]
+    fn search_keeps_operational_messages_visible() {
+        let snapshot = Snapshot::default();
+        let mut list = AgentListState::default();
+        list.enter_search();
+        for character in "doc".chars() {
+            list.push_query(character);
+        }
+        let area = Rect::new(0, 0, 80, 10);
+        let search_row = 2;
+        let footer_row = ui_layout(area, false)[3].y;
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_agent_list(
+                    frame,
+                    &snapshot,
+                    &list,
+                    "focus failed",
+                    0,
+                    snapshot.generated_at_ms,
+                )
+            })
+            .unwrap();
+
+        let footer = row_text(&terminal, footer_row);
+        assert!(footer.contains("focus failed"));
+        assert!(row_text(&terminal, search_row).contains("search doc█"));
+    }
+
+    #[test]
+    fn filtered_selection_and_mouse_activation_use_snapshot_indices() {
+        let mut payment = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        payment.id = "local/default/payment".into();
+        payment.title = "Payment API".into();
+        let mut docs = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        docs.id = "local/default/docs".into();
+        docs.title = "Documentation".into();
+        let agents = vec![payment, docs];
+        let mut list = AgentListState::default();
+        list.enter_search();
+        for character in "doc".chars() {
+            list.push_query(character);
+        }
+        list.reconcile_selection(&agents);
+        let visible = list.visible_indices(&agents);
+
+        assert_eq!(visible, vec![1]);
+        assert_eq!(list.selected_snapshot_index(&agents), Some(1));
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::Activate
+        );
+        assert_eq!(
+            agent_at_mouse_filtered(Rect::new(0, 0, 80, 12), false, 0, &agents, &visible, 4, 4),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn successful_activation_clears_search_and_keeps_the_activated_record_selected() {
+        let mut payment = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        payment.id = "local/default/payment".into();
+        payment.title = "Payment API".into();
+        let mut docs = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        docs.id = "local/default/docs".into();
+        docs.title = "Documentation".into();
+        let agents = vec![payment, docs];
+        let mut list = AgentListState::default();
+        list.enter_search();
+        for character in "doc".chars() {
+            list.push_query(character);
+        }
+        list.reconcile_selection(&agents);
+
+        let exit = apply_activation_outcome(Activation::Completed, &mut list, &agents);
+
+        assert_eq!(exit, None);
+        assert!(!list.searching);
+        assert!(list.query.is_empty());
+        assert_eq!(list.visible_indices(&agents), vec![0, 1]);
+        assert_eq!(list.selected_snapshot_index(&agents), Some(1));
+        assert_eq!(list.selected_id.as_deref(), Some("local/default/docs"));
+    }
+
+    #[test]
+    fn failed_activation_keeps_the_active_search() {
+        let mut payment = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        payment.id = "local/default/payment".into();
+        payment.title = "Payment API".into();
+        let mut docs = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        docs.id = "local/default/docs".into();
+        docs.title = "Documentation".into();
+        let agents = vec![payment, docs];
+        let mut list = AgentListState::default();
+        list.enter_search();
+        for character in "doc".chars() {
+            list.push_query(character);
+        }
+        list.reconcile_selection(&agents);
+
+        let exit = apply_activation_outcome(Activation::Failed, &mut list, &agents);
+
+        assert_eq!(exit, None);
+        assert!(list.searching);
+        assert_eq!(list.query, "doc");
+        assert_eq!(list.visible_indices(&agents), vec![1]);
+        assert_eq!(list.selected_snapshot_index(&agents), Some(1));
+    }
+
+    #[test]
+    fn search_keeps_selection_by_agent_id_across_snapshot_refreshes() {
+        let mut payment = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        payment.id = "local/default/payment".into();
+        payment.title = "Payment API".into();
+        let mut docs = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        docs.id = "local/default/docs".into();
+        docs.title = "Documentation".into();
+        let mut agents = vec![payment, docs];
+        let mut list = AgentListState::default();
+        list.reconcile_selection(&agents);
+        list.move_selection(&agents, 1);
+        assert_eq!(list.selected_snapshot_index(&agents), Some(1));
+
+        agents.swap(0, 1);
+        list.reconcile_selection(&agents);
+
+        assert_eq!(list.selected_snapshot_index(&agents), Some(0));
+        assert_eq!(list.selected_id.as_deref(), Some("local/default/docs"));
+    }
+
+    #[test]
+    fn selection_keeps_its_position_when_the_selected_agent_disappears() {
+        let mut agents = ["one", "two", "three", "four"]
+            .into_iter()
+            .map(|id| {
+                let mut agent = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
+                agent.id = format!("local/default/{id}");
+                agent
+            })
+            .collect::<Vec<_>>();
+        let mut list = AgentListState::default();
+        list.reconcile_selection(&agents);
+        list.select_visible(&agents, 2);
+
+        agents.remove(2);
+        list.reconcile_selection(&agents);
+
+        assert_eq!(list.selected_snapshot_index(&agents), Some(2));
+        assert_eq!(list.selected_id.as_deref(), Some("local/default/four"));
+    }
+
+    #[test]
+    fn search_with_no_matches_cannot_activate_a_hidden_session() {
+        let agents = vec![test_agent("Codex", Attention::Working, AgentOrigin::Tmux)];
+        let mut list = AgentListState::default();
+        list.reconcile_selection(&agents);
+        list.enter_search();
+        for character in "missing".chars() {
+            list.push_query(character);
+        }
+        list.reconcile_selection(&agents);
+
+        assert!(list.visible_indices(&agents).is_empty());
+        assert_eq!(list.selected_snapshot_index(&agents), None);
+    }
+
+    #[test]
+    fn redraws_when_search_changes_the_visible_rows() {
+        let snapshot = Snapshot {
+            agents: vec![
+                test_agent("Codex", Attention::Working, AgentOrigin::Tmux),
+                test_agent("Claude", Attention::Idle, AgentOrigin::Tmux),
+            ],
+            ..Snapshot::default()
+        };
+        let mut redraw = RedrawTracker::default();
+        redraw.mark_rendered(RenderTopology::from_snapshot(&snapshot));
+
+        assert!(redraw.needs_full_redraw(&RenderTopology::from_visible(&snapshot, &[1])));
     }
 
     #[test]
@@ -1705,7 +2856,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(90, 14)).unwrap();
 
         terminal
-            .draw(|frame| render(frame, &snapshot, 0, "", 5))
+            .draw(|frame| render_at(frame, &snapshot, 0, "", 5, 270_000))
             .unwrap();
 
         assert!(!row_text(&terminal, 4).contains("+1 agent"));
@@ -1713,6 +2864,11 @@ mod tests {
         let done_x = row_text(&terminal, 6).find("done").unwrap() as u16;
         assert_eq!(terminal.backend().buffer()[(done_x, 6)].fg, Color::Green);
         assert_eq!(terminal.backend().buffer()[(89, 6)].bg, Color::Reset);
+
+        terminal
+            .draw(|frame| render_at(frame, &snapshot, 0, "", 5, 330_000))
+            .unwrap();
+        assert!(row_text(&terminal, 6).contains("done  ·  4m 12s"));
     }
 
     #[test]
@@ -1846,7 +3002,7 @@ mod tests {
         let paths = RuntimePaths::discover(&socket_name).unwrap();
         paths.ensure_dirs().unwrap();
         let listener = UnixListener::bind(&paths.socket).unwrap();
-        let mut remote = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
+        let mut remote = test_agent("Codex", Attention::Done, AgentOrigin::Tmux);
         remote.id = "remote/remote-mac/host/default/%1".into();
         remote.remote_alias = Some("remote-mac".into());
         remote.title = "completed-task".into();
@@ -1865,6 +3021,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .achievement_pending = false;
+        acknowledged_snapshot.agents[0].attention = Attention::Idle;
         let server = tokio::spawn(async move {
             let mut acknowledged = None;
             for _ in 0..2 {
@@ -1914,6 +3071,13 @@ mod tests {
             agents: vec![remote],
             ..Snapshot::default()
         };
+        let mut list = AgentListState::default();
+        list.enter_search();
+        for character in "done".chars() {
+            list.push_query(character);
+        }
+        list.reconcile_selection(&snapshot.agents);
+        assert_eq!(list.visible_indices(&snapshot.agents), vec![0]);
         let context = ActivationContext {
             paths: &paths,
             tmux: &tmux,
@@ -1931,12 +3095,26 @@ mod tests {
         let acknowledged = server.await.unwrap();
         let _ = std::fs::remove_file(&paths.socket);
         let _ = std::fs::remove_dir(&paths.runners);
-        assert_eq!(activation.unwrap(), Activation::Continue);
+        let activation = activation.unwrap();
+        assert_eq!(activation, Activation::Completed);
+        assert_eq!(
+            apply_activation_outcome(activation, &mut list, &snapshot.agents),
+            None
+        );
         assert_eq!(
             acknowledged.as_deref(),
             Some("remote/remote-mac/host/default/%1")
         );
         assert!(message.text().contains("acknowledged"));
+        assert!(message.text().contains("focus unavailable"));
+        assert!(!list.searching);
+        assert!(list.query.is_empty());
+        assert_eq!(list.visible_indices(&snapshot.agents), vec![0]);
+        assert_eq!(list.selected_snapshot_index(&snapshot.agents), Some(0));
+        assert_eq!(
+            list.selected_id.as_deref(),
+            Some("remote/remote-mac/host/default/%1")
+        );
         assert!(
             !snapshot.agents[0]
                 .goal

@@ -78,6 +78,17 @@ version, protocol, and capabilities. It intentionally has no freshness
 timestamp because snapshots are emitted on state changes, not as connection
 heartbeats.
 
+The terminal UI keeps one `watch` connection open. The daemon releases that
+connection when the UI closes or replaces its watch. The UI redraws after
+input, resize, snapshot, message, working animation, or a visible unfinished
+subagent's one-second elapsed-time change. A user-managed sidebar checks whether
+its tmux window is active in an attached session. Hidden sidebars keep their
+latest snapshot, search, and selection but pause drawing, working animation,
+and elapsed-time ticks until the window is visible again. Visibility never
+changes search, selection, scrolling, or activation state. Popups remain
+visible for their whole lifetime, and `r` replaces the current watch with a
+freshly connected stream and its initial snapshot.
+
 ## Plugin and managed-binary compatibility
 
 The TPM checkout owns compatibility repair and fallback installation; the

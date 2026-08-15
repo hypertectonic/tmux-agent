@@ -108,11 +108,18 @@ tmux-agent ui
 
 | Input | Action |
 | --- | --- |
-| `j`, `k`, arrows | Move selection |
+| `j`, `k` | Move selection in normal mode; type those characters during search |
+| Up, Down | Move selection in normal or search mode |
+| `/` | Start filtering sessions as you type |
+| `Backspace` | Edit the active search |
 | `Enter` | Focus, acknowledge, or open a Codex child |
 | Left click | Activate a row |
 | `r` | Refresh |
-| `q`, `Esc` | Close |
+| `q` | Close in normal mode; type `q` during search |
+| `Esc` | Clear the active search, otherwise close |
+
+Search is case-insensitive and matches the displayed title, provider, label,
+state, location, and working directory. It remains local to the UI process.
 
 A non-empty tmux pane label is appended to the task title:
 
