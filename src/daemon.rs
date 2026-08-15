@@ -27,6 +27,7 @@ struct Aggregate {
     remotes: HashMap<String, Snapshot>,
     peers: HashMap<String, PeerStatus>,
     acknowledgements: Acknowledgements,
+    last_used_at_ms: HashMap<String, u64>,
     revision: u64,
 }
 
@@ -109,6 +110,7 @@ impl Shared {
                 remotes: HashMap::new(),
                 peers,
                 acknowledgements,
+                last_used_at_ms: HashMap::new(),
                 revision: 1,
             }),
             changed,
@@ -133,6 +135,7 @@ impl Shared {
         }
         let local_revision = snapshot.revision;
         inner.local = snapshot;
+        prune_last_used(&mut inner);
         inner.revision += 1;
         let revision = inner.revision;
         if acknowledgement_changed {
@@ -154,6 +157,7 @@ impl Shared {
         let acknowledgement_changed =
             apply_acknowledgements(&mut snapshot.agents, &mut inner.acknowledgements);
         inner.remotes.insert(alias.to_string(), snapshot);
+        prune_last_used(&mut inner);
         if let Some(peer) = inner.peers.get_mut(alias) {
             peer.connected = true;
             peer.last_error = None;
@@ -177,6 +181,7 @@ impl Shared {
             peer.last_error = Some(message);
         }
         inner.remotes.remove(alias);
+        prune_last_used(&mut inner);
         inner.revision += 1;
         let revision = inner.revision;
         drop(inner);
@@ -231,6 +236,30 @@ impl Shared {
         Ok(true)
     }
 
+    async fn mark_used(&self, target: &str) -> bool {
+        let mut inner = self.inner.write().await;
+        let is_top_level = inner
+            .local
+            .agents
+            .iter()
+            .chain(
+                inner
+                    .remotes
+                    .values()
+                    .flat_map(|snapshot| snapshot.agents.iter()),
+            )
+            .any(|agent| agent.id == target && agent.subagent.is_none());
+        if !is_top_level {
+            return false;
+        }
+        inner.last_used_at_ms.insert(target.to_string(), now_ms());
+        inner.revision += 1;
+        let revision = inner.revision;
+        drop(inner);
+        self.changed.send_replace(revision);
+        true
+    }
+
     async fn snapshot(&self, local_only: bool) -> Snapshot {
         let inner = self.inner.read().await;
         if local_only {
@@ -245,7 +274,7 @@ impl Shared {
             snapshot.agents.extend(agents);
         }
         snapshot.peers = inner.peers.values().cloned().collect();
-        snapshot.sort_agents();
+        snapshot.sort_agents_by_last_used(&inner.last_used_at_ms);
         snapshot
     }
 
@@ -256,6 +285,24 @@ impl Shared {
             eprintln!("tmux-agent: persist acknowledgements: {error:#}");
         }
     }
+}
+
+fn prune_last_used(inner: &mut Aggregate) {
+    let known_ids = inner
+        .local
+        .agents
+        .iter()
+        .chain(
+            inner
+                .remotes
+                .values()
+                .flat_map(|snapshot| snapshot.agents.iter()),
+        )
+        .map(|agent| agent.id.clone())
+        .collect::<HashSet<_>>();
+    inner
+        .last_used_at_ms
+        .retain(|agent_id, _| known_ids.contains(agent_id));
 }
 
 pub async fn run(config: Config, paths: RuntimePaths, tmux: Tmux) -> Result<()> {
@@ -448,6 +495,19 @@ async fn serve_client(
                     &mut writer,
                     &IpcResponse::Error {
                         message: format!("no agent matches {target:?}"),
+                    },
+                )
+                .await?;
+            }
+        }
+        IpcRequest::MarkUsed { target } => {
+            if shared.mark_used(&target).await {
+                write_response(&mut writer, &IpcResponse::Ack).await?;
+            } else {
+                write_response(
+                    &mut writer,
+                    &IpcResponse::Error {
+                        message: format!("no top-level agent matches {target:?}"),
                     },
                 )
                 .await?;
@@ -894,6 +954,98 @@ mod tests {
             .expect("daemon watch task should stop when its client disconnects")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_use_reorders_idle_agents_for_every_local_ui_watch() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut alpha = agent("shared-host/default/%1", AgentState::Idle, Attention::Idle);
+        alpha.session_name = "alpha".into();
+        let mut beta = agent("shared-host/default/%2", AgentState::Idle, Attention::Idle);
+        beta.session_name = "beta".into();
+        let shared = Shared::new(
+            Snapshot {
+                revision: 1,
+                agents: vec![alpha, beta],
+                ..Snapshot::default()
+            },
+            &[],
+            Acknowledgements::default(),
+            directory.path().join("acknowledged.json"),
+        )
+        .unwrap();
+        let (shutdown, _) = tokio::sync::mpsc::channel(1);
+        let server = tokio::spawn(accept_clients(listener, shared.clone(), shutdown));
+        let mut first_watch = SnapshotWatch::connect(&socket, false).await.unwrap();
+        let mut second_watch = SnapshotWatch::connect(&socket, false).await.unwrap();
+
+        for watch in [&mut first_watch, &mut second_watch] {
+            let initial = watch.next_snapshot().await.unwrap().unwrap();
+            assert_eq!(
+                initial
+                    .agents
+                    .iter()
+                    .map(|agent| agent.session_name.as_str())
+                    .collect::<Vec<_>>(),
+                ["alpha", "beta"]
+            );
+        }
+
+        crate::ipc::mark_used(&socket, "shared-host/default/%2")
+            .await
+            .unwrap();
+
+        for watch in [&mut first_watch, &mut second_watch] {
+            let changed = tokio::time::timeout(Duration::from_secs(1), watch.next_snapshot())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                changed
+                    .agents
+                    .iter()
+                    .map(|agent| agent.session_name.as_str())
+                    .collect::<Vec<_>>(),
+                ["beta", "alpha"]
+            );
+            let encoded = serde_json::to_value(changed).unwrap();
+            assert!(!encoded.to_string().contains("last_used"));
+        }
+
+        let federated = crate::ipc::snapshot(&socket, true).await.unwrap();
+        assert_eq!(
+            federated
+                .agents
+                .iter()
+                .map(|agent| agent.session_name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+
+        let mut without_beta = federated.clone();
+        without_beta.revision = 2;
+        without_beta
+            .agents
+            .retain(|agent| agent.session_name == "alpha");
+        assert!(shared.publish_local(without_beta).await);
+        let mut restored = federated;
+        restored.revision = 3;
+        assert!(shared.publish_local(restored).await);
+        assert_eq!(
+            shared
+                .snapshot(false)
+                .await
+                .agents
+                .iter()
+                .map(|agent| agent.session_name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+
+        server.abort();
     }
 
     #[test]
