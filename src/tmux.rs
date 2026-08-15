@@ -460,6 +460,12 @@ impl Tmux {
         self.status(&["set-option", "-p", "-t", pane_id, "@tmux_agent_ui", value])
     }
 
+    pub fn pane_visible(&self, pane_id: &str) -> Result<bool> {
+        let format = format!("#{{window_active}}{SEPARATOR}#{{session_attached}}");
+        let output = self.run(&["display-message", "-p", "-t", pane_id, &format])?;
+        parse_pane_visibility(&output, pane_id)
+    }
+
     pub fn reconcile_pane_hosts(
         &self,
         overrides: &HashMap<String, String>,
@@ -755,6 +761,22 @@ fn visible_capture_args(pane_id: &str) -> [&str; 4] {
     ["capture-pane", "-p", "-t", pane_id]
 }
 
+fn parse_pane_visibility(line: &str, pane_id: &str) -> Result<bool> {
+    let line = line.trim();
+    let mut fields = line.split(SEPARATOR).collect::<Vec<_>>();
+    if fields.len() != 2 {
+        fields = line.split(ESCAPED_SEPARATOR).collect::<Vec<_>>();
+    }
+    if fields.len() != 2 {
+        bail!(
+            "unexpected tmux visibility record for {pane_id} with {} fields: {:?}",
+            fields.len(),
+            line
+        );
+    }
+    Ok(pane_is_visible(fields[0], fields[1]))
+}
+
 fn parse_pane(line: &str) -> Result<Pane> {
     let mut fields = line.split(SEPARATOR).collect::<Vec<_>>();
     if fields.len() != 21 {
@@ -780,7 +802,7 @@ fn parse_pane(line: &str) -> Result<Pane> {
         title: fields[9].to_string(),
         cwd: fields[10].to_string(),
         dead: fields[11] == "1",
-        visible: fields[13] == "1" && fields[14] != "0",
+        visible: pane_is_visible(fields[13], fields[14]),
         is_agent_ui: fields[15] == "1",
         mirror_host: nonempty(fields[16]),
         mirror_session: nonempty(fields[17]),
@@ -788,6 +810,10 @@ fn parse_pane(line: &str) -> Result<Pane> {
         context_host: nonempty(fields[19]),
         context_host_color: nonempty(fields[20]),
     })
+}
+
+fn pane_is_visible(window_active: &str, session_attached: &str) -> bool {
+    window_active == "1" && session_attached != "0"
 }
 
 fn parse_process(line: &str) -> Option<Process> {
@@ -1403,6 +1429,27 @@ mod tests {
         assert_eq!(pane.label.as_deref(), Some("remote development"));
         assert_eq!(pane.context_host.as_deref(), Some("BUILD-HOST"));
         assert_eq!(pane.context_host_color.as_deref(), Some("#a6e3a1"));
+    }
+
+    #[test]
+    fn pane_visibility_requires_an_active_window_and_attached_session() {
+        assert!(pane_is_visible("1", "1"));
+        assert!(pane_is_visible("1", "2"));
+        assert!(!pane_is_visible("0", "1"));
+        assert!(!pane_is_visible("1", "0"));
+    }
+
+    #[test]
+    fn parses_raw_and_escaped_pane_visibility_records() {
+        assert!(parse_pane_visibility("1\u{1f}2\n", "%1").unwrap());
+        assert!(parse_pane_visibility(r"1\0372", "%1").unwrap());
+
+        let error = parse_pane_visibility("1", "%1").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected tmux visibility record for %1 with 1 fields")
+        );
     }
 
     #[test]
