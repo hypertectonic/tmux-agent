@@ -6,6 +6,25 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+## [0.6.0] - 2026-08-15
+
+### Added
+
+- Activate the first ten top-level sessions with `1` through `9` and `0`.
+  Provider-adjacent keycaps show the available shortcuts, and explicit numeric
+  selection stays synchronized across persistent UIs on the same tmux server.
+- Keep recently used idle sessions near the top of the idle bucket. Successful
+  focus through tmux-agent updates an in-memory daemon timestamp shared by its
+  local UIs, while other attention buckets and subagent ordering stay unchanged.
+
+### Changed
+
+- Remove tmux-agent's pane-host badge presentation metadata, palette, and
+  reconciliation. Pane titles, `@pane_label`, SSH transport discovery, remote
+  routing markers, and focus behavior remain supported.
+- Refresh the README interface overview to match the current header, shortcut
+  keycaps, row styling, peer status, and footer controls.
+
 ## [0.5.0] - 2026-08-15
 
 ### Added
