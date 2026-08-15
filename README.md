@@ -3,7 +3,7 @@
 tmux-agent is a local-first activity view for coding agents running in tmux,
 ordinary terminals, and explicitly configured SSH machines.
 
-![tmux-agent showing local and remote agents, goals, and a child session](docs/assets/ui-overview.svg)
+![tmux-agent showing local and remote agents, numeric shortcuts, goals, and a child session](docs/assets/ui-overview.svg)
 
 It shows which sessions are working, blocked, idle, or done and lets you jump
 back to the exact tmux pane. Codex, Claude, OpenCode, Grok, and Pi have
@@ -90,6 +90,7 @@ Linux release archives require glibc 2.35 or newer. Windows is not supported.
   states.
 - Provider badges, working animation, task titles, pane labels, and host-first
   location breadcrumbs.
+- Idle sessions ordered by their most recent successful focus or state change.
 - Codex goal state and elapsed time without the goal objective.
 - Process-backed and in-process Codex children beneath their actual parent.
 - Local and SSH-federated machines in one view.
@@ -108,6 +109,7 @@ tmux-agent ui
 
 | Input | Action |
 | --- | --- |
+| `1`-`9`, `0` | Select and immediately activate top-level sessions 1-10 in normal mode |
 | `j`, `k` | Move selection in normal mode; type those characters during search |
 | Up, Down | Move selection in normal or search mode |
 | `/` | Start filtering sessions as you type |
