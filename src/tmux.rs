@@ -1,7 +1,6 @@
 use crate::config::Config;
 use crate::model::{
-    AgentRecord, SshConnection, SshTransport, TmuxTarget, terminal_safe,
-    trim_braille_activity_prefix,
+    AgentRecord, SshConnection, SshTransport, TmuxTarget, trim_braille_activity_prefix,
 };
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
@@ -14,10 +13,6 @@ use std::process::Command;
 
 const SEPARATOR: char = '\u{1f}';
 const ESCAPED_SEPARATOR: &str = r"\037";
-const PANE_HOST_COLORS: [&str; 8] = [
-    "#89b4fa", "#cba6f7", "#fab387", "#f9e2af", "#a6e3a1", "#f38ba8", "#74c7ec", "#94e2d5",
-];
-
 #[derive(Debug, Clone)]
 pub struct Pane {
     pub pane_id: String,
@@ -37,8 +32,6 @@ pub struct Pane {
     pub is_agent_ui: bool,
     pub mirror_host: Option<String>,
     pub mirror_session: Option<String>,
-    pub context_host: Option<String>,
-    pub context_host_color: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,18 +98,6 @@ struct FocusTargetMissing {
     title: String,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum PaneHostChange {
-    Set {
-        pane_id: String,
-        host: String,
-        color: String,
-    },
-    Clear {
-        pane_id: String,
-    },
-}
-
 impl fmt::Display for FocusTargetMissing {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -137,7 +118,7 @@ impl Tmux {
     pub fn new(config: &Config) -> Self {
         Self {
             args: config.tmux_args.clone(),
-            host_aliases: pane_host_aliases(config),
+            host_aliases: configured_host_aliases(config),
         }
     }
 
@@ -185,8 +166,6 @@ impl Tmux {
             "#{@tmux_agent_remote_host}",
             "#{@tmux_agent_remote_session}",
             "#{@pane_label}",
-            "#{@tmux_agent_host}",
-            "#{@tmux_agent_host_color}",
         ]
         .join(&sep);
         let Some(output) = self.run_optional(&["list-panes", "-a", "-F", &format])? else {
@@ -324,32 +303,6 @@ impl Tmux {
         })
     }
 
-    fn pane_processes(&self, panes: &[Pane]) -> Result<HashMap<String, String>> {
-        let output = Command::new("ps")
-            .args([
-                "-axww",
-                "-o",
-                "uid=,pid=,ppid=,pgid=,tpgid=,tty=,etime=,args=",
-            ])
-            .output()
-            .context("run ps for pane host discovery")?;
-        if !output.status.success() {
-            bail!("ps failed with {}", output.status);
-        }
-        let processes = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(parse_process)
-            .filter(|process| process.uid == unsafe { libc::geteuid() })
-            .collect::<Vec<_>>();
-        Ok(panes
-            .iter()
-            .filter_map(|pane| {
-                foreground_job(pane.pane_pid, &processes)
-                    .map(|(_, description, _)| (pane.pane_id.clone(), description))
-            })
-            .collect())
-    }
-
     pub fn capture_visible(&self, pane_id: &str) -> Result<String> {
         self.run(&visible_capture_args(pane_id))
     }
@@ -400,29 +353,22 @@ impl Tmux {
     pub fn focus_agent(&self, record: &AgentRecord) -> Result<()> {
         if let Some(alias) = &record.remote_alias {
             if let Some(target) = &record.focus_target {
-                return self.focus_location_with_host(
+                return self.focus_location(
                     &target.session_name,
                     &target.window_id,
                     &target.pane_id,
-                    &record.host,
                 );
             }
             if record.is_tmux() {
                 if let Some(mirror) = self.find_mirror(alias, &record.session_name)? {
-                    return self.focus_location_with_host(
+                    return self.focus_location(
                         &mirror.session_name,
                         &mirror.window_id,
                         &mirror.pane_id,
-                        &record.host,
                     );
                 }
             } else if let Some(pane) = self.find_transport_pane(alias, &record.title)? {
-                return self.focus_location_with_host(
-                    &pane.session_name,
-                    &pane.window_id,
-                    &pane.pane_id,
-                    &record.host,
-                );
+                return self.focus_location(&pane.session_name, &pane.window_id, &pane.pane_id);
             }
             return Err(FocusTargetMissing {
                 alias: alias.clone(),
@@ -436,12 +382,7 @@ impl Tmux {
                 record.location()
             );
         }
-        self.focus_location_with_host(
-            &record.session_name,
-            &record.window_id,
-            &record.pane_id,
-            &record.host,
-        )
+        self.focus_location(&record.session_name, &record.window_id, &record.pane_id)
     }
 
     pub fn find_mirror(&self, remote_alias: &str, remote_session: &str) -> Result<Option<Pane>> {
@@ -466,48 +407,6 @@ impl Tmux {
         parse_pane_visibility(&output, pane_id)
     }
 
-    pub fn reconcile_pane_hosts(
-        &self,
-        overrides: &HashMap<String, String>,
-        local_host: &str,
-    ) -> Result<()> {
-        let panes = self.list_panes()?;
-        if panes.is_empty() {
-            return Ok(());
-        }
-        let pane_processes = self.pane_processes(&panes)?;
-        let desired = pane_host_presentations(
-            &panes,
-            &pane_processes,
-            overrides,
-            local_host,
-            &self.host_aliases,
-        );
-        for change in pane_host_changes(&panes, &desired) {
-            match change {
-                PaneHostChange::Set {
-                    pane_id,
-                    host,
-                    color,
-                } => {
-                    self.set_pane_host(&pane_id, &host, &color)?;
-                }
-                PaneHostChange::Clear { pane_id } => {
-                    self.status(&["set-option", "-p", "-u", "-t", &pane_id, "@tmux_agent_host"])?;
-                    self.status(&[
-                        "set-option",
-                        "-p",
-                        "-u",
-                        "-t",
-                        &pane_id,
-                        "@tmux_agent_host_color",
-                    ])?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub fn display_popup(&self, command: &str) -> Result<()> {
         self.status(&["display-popup", "-E", "-w", "85%", "-h", "80%", command])
     }
@@ -519,33 +418,6 @@ impl Tmux {
         self.status(&["select-window", "-t", window])?;
         self.status(&["select-pane", "-t", pane])?;
         Ok(())
-    }
-
-    fn focus_location_with_host(
-        &self,
-        session: &str,
-        window: &str,
-        pane: &str,
-        host: &str,
-    ) -> Result<()> {
-        let host = display_host(host);
-        let color = pane_host_color(&host);
-        if let Err(error) = self.set_pane_host(pane, &host, color) {
-            eprintln!("tmux-agent: set pane host context for {pane}: {error:#}");
-        }
-        self.focus_location(session, window, pane)
-    }
-
-    fn set_pane_host(&self, pane_id: &str, host: &str, color: &str) -> Result<()> {
-        self.status(&["set-option", "-p", "-t", pane_id, "@tmux_agent_host", host])?;
-        self.status(&[
-            "set-option",
-            "-p",
-            "-t",
-            pane_id,
-            "@tmux_agent_host_color",
-            color,
-        ])
     }
 
     fn run(&self, command_args: &[&str]) -> Result<String> {
@@ -612,7 +484,7 @@ fn default_socket_path(tmux_tmpdir: Option<&OsStr>, effective_uid: u32) -> PathB
         .join("default")
 }
 
-fn pane_host_aliases(config: &Config) -> HashMap<String, String> {
+fn configured_host_aliases(config: &Config) -> HashMap<String, String> {
     let mut aliases = HashMap::new();
     for machine in &config.machines {
         insert_host_alias(&mut aliases, &machine.name, &machine.name);
@@ -669,85 +541,6 @@ fn local_ssh_transport(
     }
 }
 
-fn pane_host_presentations(
-    panes: &[Pane],
-    pane_processes: &HashMap<String, String>,
-    overrides: &HashMap<String, String>,
-    local_host: &str,
-    aliases: &HashMap<String, String>,
-) -> HashMap<String, (String, String)> {
-    panes
-        .iter()
-        .map(|pane| {
-            let observed = overrides
-                .get(&pane.pane_id)
-                .map(String::as_str)
-                .or(pane.mirror_host.as_deref())
-                .or_else(|| {
-                    pane_processes
-                        .get(&pane.pane_id)
-                        .and_then(|processes| ssh_destination(processes))
-                })
-                .or_else(|| mosh_destination_from_title(&pane.title))
-                .unwrap_or(local_host);
-            let alias_key = observed.trim_end_matches('.').to_ascii_lowercase();
-            let host = display_host(
-                aliases
-                    .get(&alias_key)
-                    .map(String::as_str)
-                    .unwrap_or(observed),
-            );
-            let color = pane_host_color(&host).to_string();
-            (pane.pane_id.clone(), (host, color))
-        })
-        .collect()
-}
-
-fn display_host(host: &str) -> String {
-    terminal_safe(host).to_uppercase()
-}
-
-fn pane_host_color(host: &str) -> &'static str {
-    let hash = host
-        .as_bytes()
-        .iter()
-        .fold(0xcbf29ce484222325_u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        });
-    PANE_HOST_COLORS[hash as usize % PANE_HOST_COLORS.len()]
-}
-
-fn pane_host_changes(
-    panes: &[Pane],
-    desired: &HashMap<String, (String, String)>,
-) -> Vec<PaneHostChange> {
-    panes
-        .iter()
-        .filter_map(|pane| {
-            match (
-                pane.context_host.as_deref(),
-                pane.context_host_color.as_deref(),
-                desired.get(&pane.pane_id),
-            ) {
-                (Some(current_host), Some(current_color), Some((host, color)))
-                    if current_host == host && current_color == color =>
-                {
-                    None
-                }
-                (_, _, Some((host, color))) => Some(PaneHostChange::Set {
-                    pane_id: pane.pane_id.clone(),
-                    host: host.clone(),
-                    color: color.clone(),
-                }),
-                (Some(_), _, None) | (_, Some(_), None) => Some(PaneHostChange::Clear {
-                    pane_id: pane.pane_id.clone(),
-                }),
-                (None, None, None) => None,
-            }
-        })
-        .collect()
-}
-
 fn normalized_socket_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| {
         path.parent()
@@ -779,10 +572,10 @@ fn parse_pane_visibility(line: &str, pane_id: &str) -> Result<bool> {
 
 fn parse_pane(line: &str) -> Result<Pane> {
     let mut fields = line.split(SEPARATOR).collect::<Vec<_>>();
-    if fields.len() != 21 {
+    if fields.len() != 19 {
         fields = line.split(ESCAPED_SEPARATOR).collect::<Vec<_>>();
     }
-    if fields.len() != 21 {
+    if fields.len() != 19 {
         bail!(
             "unexpected tmux pane record with {} fields: {:?}",
             fields.len(),
@@ -807,8 +600,6 @@ fn parse_pane(line: &str) -> Result<Pane> {
         mirror_host: nonempty(fields[16]),
         mirror_session: nonempty(fields[17]),
         label: nonempty(fields[18]),
-        context_host: nonempty(fields[19]),
-        context_host_color: nonempty(fields[20]),
     })
 }
 
@@ -1270,11 +1061,6 @@ pub(crate) fn normalize_transport_title(value: &str) -> String {
     trim_braille_activity_prefix(value).trim_end().to_string()
 }
 
-fn mosh_destination_from_title(title: &str) -> Option<&str> {
-    let destination = title.strip_prefix("[mosh] ")?.split(':').next()?.trim();
-    (!destination.is_empty()).then_some(destination)
-}
-
 fn ssh_destination(processes: &str) -> Option<&str> {
     processes
         .lines()
@@ -1374,8 +1160,6 @@ mod tests {
             is_agent_ui: false,
             mirror_host: None,
             mirror_session: None,
-            context_host: None,
-            context_host_color: None,
         }
     }
 
@@ -1397,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn every_pane_in_an_attached_active_window_is_visible() {
+    fn pane_metadata_does_not_depend_on_host_presentation_options() {
         let separator = SEPARATOR.to_string();
         let line = [
             "%1",
@@ -1416,19 +1200,17 @@ mod tests {
             "1",
             "1",
             "",
-            "",
-            "",
+            "remote-host",
+            "remote-session",
             "remote development",
-            "BUILD-HOST",
-            "#a6e3a1",
         ]
         .join(&separator);
         let pane = parse_pane(&line).unwrap();
         assert!(pane.visible);
         assert!(!pane.dead);
+        assert_eq!(pane.mirror_host.as_deref(), Some("remote-host"));
+        assert_eq!(pane.mirror_session.as_deref(), Some("remote-session"));
         assert_eq!(pane.label.as_deref(), Some("remote development"));
-        assert_eq!(pane.context_host.as_deref(), Some("BUILD-HOST"));
-        assert_eq!(pane.context_host_color.as_deref(), Some("#a6e3a1"));
     }
 
     #[test]
@@ -1456,7 +1238,7 @@ mod tests {
     fn parses_pane_separators_escaped_by_older_tmux() {
         let line = [
             "%1", "123", "$1", "main", "@1", "1", "work", "0", "codex", "title", "/tmp", "0", "1",
-            "1", "1", "", "", "", "", "", "",
+            "1", "1", "", "", "", "",
         ]
         .join(ESCAPED_SEPARATOR);
 
@@ -1468,117 +1250,11 @@ mod tests {
     }
 
     #[test]
-    fn pane_host_reconciliation_sets_changes_and_clears_stale_context() {
-        let mut missing = pane("%1", "main", "one");
-        let mut current = pane("%2", "main", "two");
-        current.context_host = Some("BUILD-HOST".into());
-        current.context_host_color = Some("#a6e3a1".into());
-        let mut stale = pane("%3", "main", "three");
-        stale.context_host = Some("LINUX-MACHINE".into());
-        stale.context_host_color = Some("#f38ba8".into());
-        let desired = HashMap::from([
-            (
-                "%1".to_string(),
-                ("LOCAL-MAC".to_string(), "#fab387".to_string()),
-            ),
-            (
-                "%2".to_string(),
-                ("BUILD-HOST".to_string(), "#a6e3a1".to_string()),
-            ),
-        ]);
-
-        let changes = pane_host_changes(&[missing.clone(), current, stale], &desired);
-
-        assert_eq!(
-            changes,
-            vec![
-                PaneHostChange::Set {
-                    pane_id: "%1".into(),
-                    host: "LOCAL-MAC".into(),
-                    color: "#fab387".into(),
-                },
-                PaneHostChange::Clear {
-                    pane_id: "%3".into(),
-                },
-            ]
-        );
-
-        missing.context_host = Some("OLD-HOST".into());
-        missing.context_host_color = Some("#fab387".into());
-        assert_eq!(
-            pane_host_changes(&[missing], &desired),
-            vec![PaneHostChange::Set {
-                pane_id: "%1".into(),
-                host: "LOCAL-MAC".into(),
-                color: "#fab387".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn pane_host_presentations_cover_local_ssh_mosh_and_explicit_agent_panes() {
-        let mut local = pane("%1", "main", "shell");
-        local.current_command = "zsh".into();
-        let ssh = pane("%2", "main", "remote shell");
-        let mosh = pane("%3", "main", "[mosh] build-host:TUI");
-        let explicit = pane("%4", "main", "provider");
-        let unknown_ssh = pane("%5", "main", "other remote");
-        let panes = vec![local, ssh, mosh, explicit, unknown_ssh];
-        let processes = HashMap::from([
-            ("%1".to_string(), "/bin/zsh".to_string()),
-            (
-                "%2".to_string(),
-                "/usr/bin/ssh -tt remote-mac.example.ts.net".to_string(),
-            ),
-            ("%5".to_string(), "/usr/bin/ssh linux-machine".to_string()),
-        ]);
-        let overrides = HashMap::from([("%4".to_string(), "build-host".to_string())]);
-        let aliases = HashMap::from([
-            ("build-host".to_string(), "build-host".to_string()),
-            (
-                "remote-mac.example.ts.net".to_string(),
-                "build-host".to_string(),
-            ),
-        ]);
-
-        let presentations =
-            pane_host_presentations(&panes, &processes, &overrides, "local-mac", &aliases);
-
-        assert_eq!(
-            presentations.get("%1"),
-            Some(&("LOCAL-MAC".into(), "#fab387".into()))
-        );
-        assert_eq!(
-            presentations.get("%2"),
-            Some(&("BUILD-HOST".into(), "#a6e3a1".into()))
-        );
-        assert_eq!(
-            presentations.get("%3"),
-            Some(&("BUILD-HOST".into(), "#a6e3a1".into()))
-        );
-        assert_eq!(
-            presentations.get("%4"),
-            Some(&("BUILD-HOST".into(), "#a6e3a1".into()))
-        );
-        assert_eq!(
-            presentations.get("%5"),
-            Some(&("LINUX-MACHINE".into(), "#f38ba8".into()))
-        );
-    }
-
-    #[test]
-    fn pane_host_colors_are_stable_and_distinct_for_known_machines() {
-        assert_eq!(pane_host_color("LOCAL-MAC"), "#fab387");
-        assert_eq!(pane_host_color("BUILD-HOST"), "#a6e3a1");
-        assert_eq!(pane_host_color("LINUX-MACHINE"), "#f38ba8");
-    }
-
-    #[test]
     fn parses_dead_panes() {
         let separator = SEPARATOR.to_string();
         let line = [
             "%1", "123", "$1", "main", "@1", "1", "work", "0", "codex", "title", "/tmp", "1", "0",
-            "1", "1", "", "", "", "", "", "",
+            "1", "1", "", "", "", "",
         ]
         .join(&separator);
         let pane = parse_pane(&line).unwrap();
@@ -1607,8 +1283,6 @@ mod tests {
             "",
             "remote-mac",
             "project",
-            "",
-            "",
             "",
         ]
         .join(&separator);
