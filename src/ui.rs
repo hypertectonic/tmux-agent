@@ -32,6 +32,7 @@ const HIDDEN_VISIBILITY_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
 const ACTION_MESSAGE_DURATION: Duration = Duration::from_secs(3);
 const PROVIDER_WIDTH: usize = 8;
+const PROVIDER_TITLE_GAP: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiTimer {
@@ -45,6 +46,7 @@ struct UiSchedule {
     visible: bool,
     dirty: bool,
     rendered_once: bool,
+    render_while_hidden_once: bool,
     next_animation_frame: Instant,
     next_elapsed_time: Instant,
     next_visibility_probe: Option<Instant>,
@@ -56,6 +58,7 @@ impl UiSchedule {
             visible,
             dirty: true,
             rendered_once: false,
+            render_while_hidden_once: false,
             next_animation_frame: now + SPINNER_FRAME_TIME,
             next_elapsed_time: now + ELAPSED_TIME_TICK,
             next_visibility_probe: Some(now + visibility_probe_interval(visible)),
@@ -67,6 +70,7 @@ impl UiSchedule {
             visible: true,
             dirty: true,
             rendered_once: false,
+            render_while_hidden_once: false,
             next_animation_frame: now + SPINNER_FRAME_TIME,
             next_elapsed_time: now + ELAPSED_TIME_TICK,
             next_visibility_probe: None,
@@ -74,16 +78,22 @@ impl UiSchedule {
     }
 
     fn should_render(&self) -> bool {
-        self.dirty && (self.visible || !self.rendered_once)
+        self.dirty && (self.visible || !self.rendered_once || self.render_while_hidden_once)
     }
 
     fn rendered(&mut self) {
         self.dirty = false;
         self.rendered_once = true;
+        self.render_while_hidden_once = false;
     }
 
     fn view_changed(&mut self) {
         self.dirty = true;
+    }
+
+    fn shared_selection_changed(&mut self) {
+        self.dirty = true;
+        self.render_while_hidden_once = true;
     }
 
     fn next_timer(
@@ -390,6 +400,42 @@ impl AgentListState {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RenderedSessionShortcuts {
+    agent_ids: Vec<String>,
+}
+
+impl RenderedSessionShortcuts {
+    fn from_list(list: &AgentListState, agents: &[AgentRecord]) -> Self {
+        if list.searching {
+            return Self::default();
+        }
+        Self {
+            agent_ids: list
+                .visible_indices(agents)
+                .into_iter()
+                .filter(|index| agents[*index].subagent.is_none())
+                .take(10)
+                .map(|index| agents[index].id.clone())
+                .collect(),
+        }
+    }
+
+    fn snapshot_index(&self, agents: &[AgentRecord], slot: usize) -> Option<usize> {
+        let agent_id = self.agent_ids.get(slot)?;
+        agents.iter().position(|agent| &agent.id == agent_id)
+    }
+
+    fn key_for(&self, agent_id: &str) -> Option<char> {
+        let slot = self.agent_ids.iter().position(|id| id == agent_id)?;
+        match slot {
+            0..=8 => char::from_digit(slot as u32 + 1, 10),
+            9 => Some('0'),
+            _ => None,
+        }
+    }
+}
+
 fn agent_matches_query(agent: &AgentRecord, query: &str) -> bool {
     if query.is_empty() {
         return true;
@@ -431,10 +477,25 @@ enum ListAction {
     None,
     Close,
     Activate,
+    ActivateShortcut(usize),
+    SyncSharedSelection,
     Refresh,
 }
 
+const UI_SELECTION_WAKE_KEY: u8 = 17;
+
+fn shortcut_slot(character: char) -> Option<usize> {
+    match character {
+        '1'..='9' => Some(character as usize - '1' as usize),
+        '0' => Some(9),
+        _ => None,
+    }
+}
+
 fn handle_list_key(key: KeyEvent, list: &mut AgentListState, agents: &[AgentRecord]) -> ListAction {
+    if key.code == KeyCode::F(UI_SELECTION_WAKE_KEY) {
+        return ListAction::SyncSharedSelection;
+    }
     let action = if list.searching {
         match key.code {
             KeyCode::Esc => list.leave_search(),
@@ -466,12 +527,60 @@ fn handle_list_key(key: KeyEvent, list: &mut AgentListState, agents: &[AgentReco
             KeyCode::Enter => return ListAction::Activate,
             KeyCode::Char('r') => return ListAction::Refresh,
             KeyCode::Char('/') => list.enter_search(),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(slot) = shortcut_slot(character) {
+                    return ListAction::ActivateShortcut(slot);
+                }
+            }
             _ => {}
         }
         ListAction::None
     };
     list.reconcile_selection(agents);
     action
+}
+
+fn apply_shared_selection(
+    list: &mut AgentListState,
+    agents: &[AgentRecord],
+    agent_id: &str,
+) -> bool {
+    let Some(index) = agents.iter().position(|agent| agent.id == agent_id) else {
+        return false;
+    };
+    let previous = list.clone();
+    list.leave_search();
+    list.select_snapshot(agents, index);
+    *list != previous
+}
+
+fn apply_pending_shared_selection(
+    pending: &mut Option<String>,
+    list: &mut AgentListState,
+    agents: &[AgentRecord],
+) -> bool {
+    let Some(agent_id) = pending.as_deref() else {
+        return false;
+    };
+    if !agents.iter().any(|agent| agent.id == agent_id) {
+        return false;
+    }
+    let changed = apply_shared_selection(list, agents, agent_id);
+    pending.take();
+    changed
+}
+
+fn broadcast_ui_selection_in_background(tmux: &Tmux, agent_id: String) {
+    let tmux = tmux.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = tmux.broadcast_ui_selection(&agent_id) {
+            eprintln!("tmux-agent: synchronize UI selection: {error:#}");
+        }
+    });
 }
 
 async fn run_loop(
@@ -502,13 +611,23 @@ async fn run_loop(
     };
     let animation_started = started;
     let mut redraw = RedrawTracker::default();
+    let mut rendered_shortcuts = RenderedSessionShortcuts::default();
+    let mut pending_shared_selection = None;
     let mut terminal_events = EventStream::new();
     let mut reconnect_at = None;
 
     loop {
+        if apply_pending_shared_selection(
+            &mut pending_shared_selection,
+            &mut list,
+            &snapshot.agents,
+        ) {
+            schedule.shared_selection_changed();
+        }
         if schedule.should_render() {
             list.reconcile_selection(&snapshot.agents);
             let visible_indices = list.visible_indices(&snapshot.agents);
+            let next_shortcuts = RenderedSessionShortcuts::from_list(&list, &snapshot.agents);
             let topology = RenderTopology::from_visible(&snapshot, &visible_indices);
             if redraw.needs_full_redraw(&topology) {
                 let area = terminal
@@ -529,6 +648,7 @@ async fn run_loop(
                     current_time_ms(),
                 )
             })?;
+            rendered_shortcuts = next_shortcuts;
             redraw.mark_rendered(topology);
             schedule.rendered();
         }
@@ -554,11 +674,25 @@ async fn run_loop(
                             }
                         }
                         ListAction::Close => return Ok(LoopExit::Close),
-                        ListAction::Activate => {
-                            let Some(selected) = list.selected_snapshot_index(&snapshot.agents)
-                            else {
-                                continue;
+                        action @ (ListAction::Activate | ListAction::ActivateShortcut(_)) => {
+                            let selected = match action {
+                                ListAction::Activate => {
+                                    list.selected_snapshot_index(&snapshot.agents)
+                                }
+                                ListAction::ActivateShortcut(slot) => {
+                                    let selected = rendered_shortcuts
+                                        .snapshot_index(&snapshot.agents, slot);
+                                    if let Some(index) = selected {
+                                        list.select_snapshot(&snapshot.agents, index);
+                                    }
+                                    selected
+                                }
+                                _ => unreachable!(),
                             };
+                            let Some(selected) = selected else { continue };
+                            let shared_selection = matches!(action, ListAction::ActivateShortcut(_))
+                                .then(|| snapshot.agents.get(selected).map(|agent| agent.id.clone()))
+                                .flatten();
                             let activation = activate_record(
                                 &activation_context,
                                 &mut snapshot,
@@ -566,12 +700,28 @@ async fn run_loop(
                                 &mut message,
                             )
                             .await?;
+                            if let Some(agent_id) = shared_selection {
+                                broadcast_ui_selection_in_background(tmux, agent_id);
+                            }
                             if let Some(exit) =
                                 apply_activation_outcome(activation, &mut list, &snapshot.agents)
                             {
                                 return Ok(exit);
                             }
                             schedule.view_changed();
+                        }
+                        ListAction::SyncSharedSelection => {
+                            let agent_id = match tmux.ui_selection() {
+                                Ok(Some(agent_id)) => agent_id,
+                                Ok(None) => continue,
+                                Err(error) => {
+                                    eprintln!(
+                                        "tmux-agent: read synchronized UI selection: {error:#}"
+                                    );
+                                    continue;
+                                }
+                            };
+                            pending_shared_selection = Some(agent_id);
                         }
                         ListAction::Refresh => {
                             let (next_watch, next_snapshot) =
@@ -1074,6 +1224,7 @@ fn render_agent_list(
 ) {
     let chunks = ui_layout(frame.area(), !snapshot.peers.is_empty());
     let visible_indices = list.visible_indices(&snapshot.agents);
+    let shortcuts = RenderedSessionShortcuts::from_list(list, &snapshot.agents);
     let selected = list
         .selected_visible_index(&snapshot.agents)
         .unwrap_or_default();
@@ -1163,7 +1314,9 @@ fn render_agent_list(
                 let name = subagent.name.as_deref().unwrap_or("agent");
                 let depth = subagent_depths.get(&agent.id).copied().unwrap_or(1);
                 return ListItem::new(Line::from(vec![
-                    Span::raw(" ".repeat(2 + PROVIDER_WIDTH + 2 + depth.saturating_sub(1) * 2)),
+                    Span::raw(" ".repeat(
+                        2 + PROVIDER_WIDTH + PROVIDER_TITLE_GAP + depth.saturating_sub(1) * 2,
+                    )),
                     Span::styled("↳ ", Style::default().fg(Color::Yellow)),
                     Span::styled("subagent: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
@@ -1225,12 +1378,27 @@ fn render_agent_list(
                 .unwrap_or(0);
             let title_width = list_width
                 .saturating_sub(
-                    2 + PROVIDER_WIDTH + 2 + state_width + goal_width + child_count_width,
+                    2 + PROVIDER_WIDTH
+                        + PROVIDER_TITLE_GAP
+                        + state_width
+                        + goal_width
+                        + child_count_width,
                 )
                 .max(1);
-            let location_width = list_width.saturating_sub(2 + PROVIDER_WIDTH + 2).max(1);
+            let location_width = list_width
+                .saturating_sub(2 + PROVIDER_WIDTH + PROVIDER_TITLE_GAP)
+                .max(1);
             let (provider, provider_style) = provider_badge(&agent.agent);
-            let row_style = agent_row_style(agent.attention, visible_index == selected);
+            let shortcut = shortcuts.key_for(&agent.id);
+            let is_selected = visible_index == selected;
+            let row_style = agent_row_style(agent.attention, is_selected);
+            let shortcut_style = if is_selected {
+                provider_style
+            } else {
+                Style::default()
+                    .fg(Color::Rgb(145, 165, 171))
+                    .bg(Color::Rgb(45, 45, 45))
+            };
             let glyph = attention_glyph(agent.attention, spinner_frame);
             let glyph_color = if agent.attention == Attention::Working {
                 provider_style.fg.unwrap_or(color)
@@ -1246,7 +1414,12 @@ fn render_agent_list(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(provider, provider_style),
-                Span::raw("  "),
+                Span::raw(" "),
+                shortcut.map_or_else(
+                    || Span::raw(" "),
+                    |key| Span::styled(key.to_string(), shortcut_style),
+                ),
+                Span::raw(" "),
                 Span::styled(
                     truncate(&safe_title, title_width),
                     Style::default().add_modifier(Modifier::BOLD),
@@ -1274,7 +1447,7 @@ fn render_agent_list(
             ListItem::new(vec![
                 Line::from(first_line),
                 Line::from(vec![
-                    Span::raw(" ".repeat(2 + PROVIDER_WIDTH + 2)),
+                    Span::raw(" ".repeat(2 + PROVIDER_WIDTH + PROVIDER_TITLE_GAP)),
                     Span::styled(
                         truncate(&safe_location, location_width),
                         Style::default().fg(Color::DarkGray),
@@ -2062,6 +2235,20 @@ mod tests {
     }
 
     #[test]
+    fn explicit_shared_selection_renders_once_while_hidden() {
+        let started = Instant::now();
+        let mut schedule = UiSchedule::new(false, started);
+        schedule.rendered();
+
+        schedule.shared_selection_changed();
+        assert!(schedule.should_render());
+
+        schedule.rendered();
+        assert!(!schedule.should_render());
+        assert!(!schedule.visible);
+    }
+
+    #[test]
     fn running_subagent_duration_advances_without_a_new_snapshot() {
         let now_ms = crate::scanner::now_ms();
         let mut parent = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
@@ -2406,6 +2593,147 @@ mod tests {
     }
 
     #[test]
+    fn number_keys_request_top_level_shortcuts_only_outside_search() {
+        let agents = vec![test_agent("Codex", Attention::Working, AgentOrigin::Tmux)];
+        let mut list = AgentListState::default();
+        list.reconcile_selection(&agents);
+
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::ActivateShortcut(0)
+        );
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::ActivateShortcut(9)
+        );
+
+        list.enter_search();
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::None
+        );
+        assert_eq!(list.query, "1");
+    }
+
+    #[test]
+    fn shared_selection_wake_is_not_treated_as_user_input() {
+        let agents = vec![test_agent("Codex", Attention::Working, AgentOrigin::Tmux)];
+        let mut list = AgentListState::default();
+        list.reconcile_selection(&agents);
+
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::F(17), KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::SyncSharedSelection
+        );
+    }
+
+    #[test]
+    fn shared_numeric_selection_updates_other_sidebar_instances() {
+        let mut first = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        first.id = "local/default/first".into();
+        let mut second = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
+        second.id = "local/default/second".into();
+        let agents = vec![first, second];
+        let mut source_sidebar = AgentListState::default();
+        let mut destination_sidebar = AgentListState::default();
+        source_sidebar.reconcile_selection(&agents);
+        destination_sidebar.reconcile_selection(&agents);
+
+        assert!(apply_shared_selection(
+            &mut source_sidebar,
+            &agents,
+            "local/default/second"
+        ));
+        assert!(apply_shared_selection(
+            &mut destination_sidebar,
+            &agents,
+            "local/default/second"
+        ));
+        assert_eq!(
+            source_sidebar.selected_id.as_deref(),
+            Some("local/default/second")
+        );
+        assert_eq!(
+            destination_sidebar.selected_id.as_deref(),
+            Some("local/default/second")
+        );
+    }
+
+    #[test]
+    fn shared_numeric_selection_waits_for_the_destination_snapshot() {
+        let mut first = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        first.id = "local/default/first".into();
+        let mut second = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        second.id = "local/default/second".into();
+        let mut list = AgentListState::default();
+        list.reconcile_selection(std::slice::from_ref(&first));
+        list.enter_search();
+        list.push_query('f');
+        let mut pending = Some(second.id.clone());
+
+        assert!(!apply_pending_shared_selection(
+            &mut pending,
+            &mut list,
+            std::slice::from_ref(&first)
+        ));
+        assert_eq!(pending.as_deref(), Some("local/default/second"));
+        assert!(list.searching);
+        assert_eq!(list.query, "f");
+
+        assert!(apply_pending_shared_selection(
+            &mut pending,
+            &mut list,
+            &[first, second]
+        ));
+        assert_eq!(pending, None);
+        assert!(!list.searching);
+        assert!(list.query.is_empty());
+        assert_eq!(list.selected_id.as_deref(), Some("local/default/second"));
+    }
+
+    #[test]
+    fn rendered_shortcuts_keep_top_level_targets_stable_across_snapshot_changes() {
+        let mut first = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+        first.id = "local/default/first".into();
+        let mut child = test_agent("Codex", Attention::Working, AgentOrigin::Terminal);
+        child.id = "local/terminal/child".into();
+        child.subagent = Some(SubagentInfo {
+            parent_id: first.id.clone(),
+            started_at_ms: 1,
+            finished_at_ms: None,
+            name: Some("review".into()),
+            thread_id: None,
+        });
+        let mut second = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        second.id = "local/default/second".into();
+        let rendered = vec![first.clone(), child, second.clone()];
+        let list = AgentListState::default();
+
+        let shortcuts = RenderedSessionShortcuts::from_list(&list, &rendered);
+        let current = vec![second, first];
+
+        assert_eq!(shortcuts.snapshot_index(&current, 0), Some(1));
+        assert_eq!(shortcuts.snapshot_index(&current, 1), Some(0));
+        assert_eq!(shortcuts.snapshot_index(&current, 2), None);
+    }
+
+    #[test]
     fn search_renders_only_matching_rows_and_an_active_prompt() {
         let mut payment = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
         payment.id = "local/default/payment".into();
@@ -2673,6 +3001,81 @@ mod tests {
             terminal.backend().buffer()[(69, 6)].bg,
             Color::Rgb(45, 20, 24)
         );
+    }
+
+    #[test]
+    fn shortcut_keycaps_reuse_the_provider_gap_and_skip_subagents() {
+        let mut agents = (1..=11)
+            .map(|number| {
+                let mut agent = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
+                agent.id = format!("local/default/session-{number:02}");
+                agent.title = format!("session-{number:02}");
+                agent
+            })
+            .collect::<Vec<_>>();
+        let mut child = test_agent("Codex", Attention::Working, AgentOrigin::Terminal);
+        child.id = "local/terminal/review".into();
+        child.subagent = Some(SubagentInfo {
+            parent_id: agents[0].id.clone(),
+            started_at_ms: 1,
+            finished_at_ms: None,
+            name: Some("review".into()),
+            thread_id: None,
+        });
+        agents.insert(1, child);
+        let snapshot = Snapshot {
+            agents,
+            ..Snapshot::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 32)).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &snapshot, 0, "", 0))
+            .unwrap();
+
+        let keycap_x = 12;
+        let second_session_row = 7;
+        assert_eq!(terminal.backend().buffer()[(keycap_x - 1, 4)].symbol(), " ");
+        assert_eq!(
+            terminal.backend().buffer()[(keycap_x - 1, second_session_row)].bg,
+            Color::Reset
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(keycap_x, second_session_row)].symbol(),
+            "2"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(keycap_x, second_session_row)].fg,
+            Color::Rgb(145, 165, 171)
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(keycap_x, second_session_row)].bg,
+            Color::Rgb(45, 45, 45)
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(keycap_x, 4)].fg,
+            terminal.backend().buffer()[(3, 4)].fg
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(keycap_x, 4)].bg,
+            terminal.backend().buffer()[(3, 4)].bg
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(keycap_x + 1, second_session_row)].bg,
+            Color::Reset
+        );
+        assert_eq!(terminal.backend().buffer()[(keycap_x, 23)].symbol(), "0");
+        assert_eq!(terminal.backend().buffer()[(keycap_x, 25)].symbol(), " ");
+        assert_eq!(terminal.backend().buffer()[(keycap_x, 25)].bg, Color::Reset);
+        let first_title_x = (0..80)
+            .find(|x| terminal.backend().buffer()[(*x, 4)].symbol() == "s")
+            .unwrap();
+        let eleventh_title_x = (0..80)
+            .find(|x| terminal.backend().buffer()[(*x, 25)].symbol() == "s")
+            .unwrap();
+        assert_eq!(first_title_x, eleventh_title_x);
+        assert_eq!(first_title_x, 14);
+        assert_eq!(terminal.backend().buffer()[(keycap_x, 6)].symbol(), " ");
     }
 
     #[test]

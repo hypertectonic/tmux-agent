@@ -108,6 +108,7 @@ tmux-agent ui
 
 | Input | Action |
 | --- | --- |
+| `1`-`9`, `0` | Select and immediately activate top-level sessions 1-10 in normal mode |
 | `j`, `k` | Move selection in normal mode; type those characters during search |
 | Up, Down | Move selection in normal or search mode |
 | `/` | Start filtering sessions as you type |

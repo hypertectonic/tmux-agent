@@ -6,6 +6,7 @@ command -v tmux >/dev/null 2>&1 || {
     printf '%s\n' 'tmux is required for event-driven UI tests' >&2
     exit 1
 }
+real_tmux=$(command -v tmux)
 cargo build --locked
 
 test_root=$(mktemp -d "/tmp/tmux-agent-event-ui-test.XXXXXX")
@@ -30,6 +31,7 @@ run_isolated() {
 
 cleanup() {
     exit_code=$?
+    touch "$test_root/wake-release"
     run_isolated daemon stop >/dev/null 2>&1 || true
     if [[ -n $control_pid ]]; then
         kill "$control_pid" 2>/dev/null || true
@@ -56,12 +58,29 @@ set -eu
 output=$(/bin/ps "$@")
 pid_file=${TMUX_AGENT_FIXTURE_PID_FILE:?}
 if [ -s "$pid_file" ]; then
-    pid=$(sed -n '1p' "$pid_file")
-    printf '%s\n' "$output" | awk -v pid="$pid" \
-        '$2 == pid { printf "%s %s %s %s %s %s %s /usr/bin/codex\n", $1, $2, $3, $4, $5, $6, $7 }'
+    printf '%s\n' "$output" | awk \
+        'NR == FNR { pids[$1] = 1; next }
+         $2 in pids { printf "%s %s %s %s %s %s %s /usr/bin/codex\n", $1, $2, $3, $4, $5, $6, $7 }' \
+        "$pid_file" -
 fi
 EOF
 chmod +x "$test_root/bin/ps"
+cat >"$test_root/bin/tmux" <<EOF
+#!/bin/sh
+set -eu
+printf '%s\n' "\$*" >>"$test_root/tmux-calls"
+for argument in "\$@"; do
+    if [ "\$argument" = "-H" ] && [ -e "$test_root/wake-block" ]; then
+        printf '%s\n' "\$$" >>"$test_root/wake-started"
+        while [ ! -e "$test_root/wake-release" ]; do
+            sleep 0.01
+        done
+        break
+    fi
+done
+exec "$real_tmux" "\$@"
+EOF
+chmod +x "$test_root/bin/tmux"
 cat >"$config" <<EOF
 host_name = "fixture-host"
 server_name = "fixture-server"
@@ -91,13 +110,25 @@ if [[ $attached != 1 ]]; then
     printf '%s\n' 'isolated tmux client did not attach' >&2
     exit 1
 fi
+"${tmux_test[@]}" resize-window -t event-ui:0 -x 100 -y 80
 
-agent_pane=$(
+first_agent_pane=$(
     "${tmux_test[@]}" split-window -d -P -F '#{pane_id}' \
         'sleep 300'
 )
-"${tmux_test[@]}" select-pane -t "$agent_pane" -T fixture-task
-agent_pid=$("${tmux_test[@]}" display-message -p -t "$agent_pane" '#{pane_pid}')
+"${tmux_test[@]}" select-pane -t "$first_agent_pane" -T fixture-task-1
+second_agent_pane=$(
+    "${tmux_test[@]}" new-window -d -t event-ui -n destination -P -F '#{pane_id}' \
+        'sleep 300'
+)
+"${tmux_test[@]}" select-pane -t "$second_agent_pane" -T fixture-task-2
+"${tmux_test[@]}" resize-window -t "$second_agent_pane" -x 100 -y 80
+first_agent_pid=$(
+    "${tmux_test[@]}" display-message -p -t "$first_agent_pane" '#{pane_pid}'
+)
+second_agent_pid=$(
+    "${tmux_test[@]}" display-message -p -t "$second_agent_pane" '#{pane_pid}'
+)
 run_isolated daemon start >"$test_root/daemon-start.out" 2>"$test_root/daemon-start.err" || true
 status=
 for _ in {1..100}; do
@@ -110,30 +141,46 @@ if [[ $status != running:* ]]; then
     exit 1
 fi
 
-ui_pane=$("${tmux_test[@]}" split-window -d -P -F '#{pane_id}' 'sleep 300')
+ui_pane=$(
+    "${tmux_test[@]}" split-window -d -t "$first_agent_pane" -P -F '#{pane_id}' 'sleep 300'
+)
+printf -v ui_command 'env PATH=%q %q --config %q ui' \
+    "$test_root/bin:$PATH" "$binary" "$config"
 "${tmux_test[@]}" set-option -pt "$ui_pane" remain-on-exit on
-"${tmux_test[@]}" respawn-pane -k -t "$ui_pane" "$binary --config $config ui"
+"${tmux_test[@]}" respawn-pane -k -t "$ui_pane" "$ui_command"
+second_ui_pane=$(
+    "${tmux_test[@]}" split-window -d -t "$second_agent_pane" -P -F '#{pane_id}' 'sleep 300'
+)
+"${tmux_test[@]}" set-option -pt "$second_ui_pane" remain-on-exit on
+"${tmux_test[@]}" respawn-pane -k -t "$second_ui_pane" "$ui_command"
+"${tmux_test[@]}" select-window -t "$ui_pane"
 for _ in {1..50}; do
     marker=$("${tmux_test[@]}" display-message -p -t "$ui_pane" '#{@tmux_agent_ui}')
-    [[ $marker == 1 ]] && break
+    second_marker=$(
+        "${tmux_test[@]}" display-message -p -t "$second_ui_pane" '#{@tmux_agent_ui}'
+    )
+    [[ $marker == 1 && $second_marker == 1 ]] && break
     sleep 0.1
 done
-if [[ $marker != 1 ]]; then
+if [[ $marker != 1 || $second_marker != 1 ]]; then
     printf '%s\n' 'UI marker was not published' >&2
     exit 1
 fi
-if [[ $("${tmux_test[@]}" display-message -p -t "$ui_pane" '#{pane_dead}') != 0 ]]; then
+if [[ $("${tmux_test[@]}" display-message -p -t "$ui_pane" '#{pane_dead}') != 0 ]] ||
+    [[ $("${tmux_test[@]}" display-message -p -t "$second_ui_pane" '#{pane_dead}') != 0 ]]; then
     printf '%s\n' 'UI exited before the topology change' >&2
     "${tmux_test[@]}" capture-pane -p -S -80 -t "$ui_pane" >&2
+    "${tmux_test[@]}" capture-pane -p -S -80 -t "$second_ui_pane" >&2
     exit 1
 fi
-if "${tmux_test[@]}" capture-pane -p -t "$ui_pane" | grep -F 'CODEX' >/dev/null; then
+if "${tmux_test[@]}" capture-pane -p -t "$ui_pane" | grep -F 'CODEX' >/dev/null ||
+    "${tmux_test[@]}" capture-pane -p -t "$second_ui_pane" | grep -F 'CODEX' >/dev/null; then
     printf '%s\n' 'synthetic Codex row must not exist before the topology change' >&2
     exit 1
 fi
 sleep 0.5
 
-printf '%s\n' "$agent_pid" >"$fixture_pid"
+printf '%s\n' "$first_agent_pid" "$second_agent_pid" >"$fixture_pid"
 
 discovered=0
 for _ in {1..50}; do
@@ -151,19 +198,22 @@ fi
 
 rendered=0
 for _ in {1..50}; do
-    if [[ $("${tmux_test[@]}" display-message -p -t "$ui_pane" '#{pane_dead}') == 1 ]]; then
+    if [[ $("${tmux_test[@]}" display-message -p -t "$ui_pane" '#{pane_dead}') == 1 ]] ||
+        [[ $("${tmux_test[@]}" display-message -p -t "$second_ui_pane" '#{pane_dead}') == 1 ]]; then
         break
     fi
-    if "${tmux_test[@]}" capture-pane -p -t "$ui_pane" | grep -F 'CODEX' >/dev/null; then
+    if "${tmux_test[@]}" capture-pane -p -t "$ui_pane" | grep -F 'fixture-task-2' >/dev/null; then
         rendered=1
         break
     fi
     sleep 0.1
 done
 
-if [[ $("${tmux_test[@]}" display-message -p -t "$ui_pane" '#{pane_dead}') == 1 ]]; then
+if [[ $("${tmux_test[@]}" display-message -p -t "$ui_pane" '#{pane_dead}') == 1 ]] ||
+    [[ $("${tmux_test[@]}" display-message -p -t "$second_ui_pane" '#{pane_dead}') == 1 ]]; then
     printf '%s\n' 'event-driven UI exited after a topology-changing snapshot' >&2
     "${tmux_test[@]}" capture-pane -p -S -80 -t "$ui_pane" >&2
+    "${tmux_test[@]}" capture-pane -p -S -80 -t "$second_ui_pane" >&2
     exit 1
 fi
 if [[ $rendered != 1 ]]; then
@@ -174,6 +224,55 @@ if [[ $rendered != 1 ]]; then
     printf 'event-driven UI did not render the published row; visibility=%s\n' \
         "$visibility" >&2
     "${tmux_test[@]}" capture-pane -p -S -80 -t "$ui_pane" >&2
+    "${tmux_test[@]}" capture-pane -p -S -80 -t "$second_ui_pane" >&2
+    exit 1
+fi
+
+touch "$test_root/wake-block"
+: >"$test_root/wake-started"
+"${tmux_test[@]}" send-keys -t "$ui_pane" 2
+focus_preceded_fanout=0
+for _ in {1..100}; do
+    wake_count=$(wc -l <"$test_root/wake-started" | tr -d ' ')
+    destination_visible=$(
+        "${tmux_test[@]}" display-message -p -t "$second_ui_pane" '#{window_active}'
+    )
+    if [[ $wake_count == 2 && $destination_visible == 1 ]]; then
+        focus_preceded_fanout=1
+        break
+    fi
+    sleep 0.01
+done
+touch "$test_root/wake-release"
+if [[ $focus_preceded_fanout != 1 ]]; then
+    printf '%s\n' 'numeric activation must focus before waking all sidebars concurrently' >&2
+    printf 'wake_count=%s destination_visible=%s\n' "$wake_count" "$destination_visible" >&2
+    sed -n '1,120p' "$test_root/tmux-calls" >&2
+    exit 1
+fi
+selection_synced=0
+for _ in {1..50}; do
+    first_selection=$(
+        "${tmux_test[@]}" capture-pane -p -t "$ui_pane" |
+            grep '▌.*CODEX.*2 ' || true
+    )
+    second_selection=$(
+        "${tmux_test[@]}" capture-pane -p -t "$second_ui_pane" |
+            grep '▌.*CODEX.*2 ' || true
+    )
+    destination_visible=$(
+        "${tmux_test[@]}" display-message -p -t "$second_ui_pane" '#{window_active}'
+    )
+    if [[ -n $first_selection && -n $second_selection && $destination_visible == 1 ]]; then
+        selection_synced=1
+        break
+    fi
+    sleep 0.1
+done
+if [[ $selection_synced != 1 ]]; then
+    printf '%s\n' 'numeric selection was not synchronized across persistent UIs' >&2
+    "${tmux_test[@]}" capture-pane -p -S -80 -t "$ui_pane" >&2
+    "${tmux_test[@]}" capture-pane -p -S -80 -t "$second_ui_pane" >&2
     exit 1
 fi
 
