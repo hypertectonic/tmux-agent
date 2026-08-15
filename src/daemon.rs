@@ -2,7 +2,7 @@ use crate::config::{Config, RemoteConfig, RuntimePaths};
 use crate::model::{
     APPLICATION_VERSION, AcknowledgedState, AgentRecord, AgentState, Attention,
     GoalAcknowledgement, GoalState, IpcRequest, IpcResponse, PROTOCOL_VERSION, PeerStatus,
-    Snapshot, SshTransport, terminal_safe,
+    Snapshot, SshTransport,
 };
 use crate::scanner::{Scanner, now_ms};
 use crate::{store, tmux::Tmux};
@@ -312,8 +312,6 @@ pub async fn run(config: Config, paths: RuntimePaths, tmux: Tmux) -> Result<()> 
         paths.state.clone(),
         Duration::from_millis(config.scan_interval_ms()),
     ));
-    let mut pane_context_task = tokio::spawn(pane_context_loop(tmux, shared));
-
     let outcome = tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             signal.context("wait for shutdown signal")
@@ -333,58 +331,16 @@ pub async fn run(config: Config, paths: RuntimePaths, tmux: Tmux) -> Result<()> 
                 Err(error) => Err(anyhow::Error::new(error).context("join daemon scanner task")),
             }
         }
-        result = &mut pane_context_task => {
-            match result {
-                Ok(()) => Err(anyhow::anyhow!("daemon pane context stopped unexpectedly")),
-                Err(error) => Err(anyhow::Error::new(error).context("join pane context task")),
-            }
-        }
     };
     listener_task.abort();
     scanner_task.abort();
-    pane_context_task.abort();
     let _ = listener_task.await;
     let _ = scanner_task.await;
-    let _ = pane_context_task.await;
     if paths.socket.exists() {
         fs::remove_file(&paths.socket)
             .with_context(|| format!("remove daemon socket {}", paths.socket.display()))?;
     }
     outcome
-}
-
-async fn pane_context_loop(tmux: Tmux, shared: Arc<Shared>) {
-    let mut changed = shared.changed.subscribe();
-    let mut refresh = tokio::time::interval(Duration::from_secs(1));
-    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    refresh.tick().await;
-    loop {
-        let snapshot = shared.snapshot(false).await;
-        let desired = pane_host_contexts(&snapshot);
-        let local_host = snapshot.host;
-        let next_tmux = tmux.clone();
-        match tokio::task::spawn_blocking(move || {
-            next_tmux.reconcile_pane_hosts(&desired, &local_host)
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                eprintln!("tmux-agent: reconcile pane host context: {error:#}");
-            }
-            Err(error) => {
-                eprintln!("tmux-agent: join pane host reconciliation: {error:#}");
-            }
-        }
-        tokio::select! {
-            _ = refresh.tick() => {}
-            result = changed.changed() => {
-                if result.is_err() {
-                    return;
-                }
-            }
-        }
-    }
 }
 
 async fn scan_loop(
@@ -618,35 +574,6 @@ fn unique_transport<'a>(
     } else {
         UniqueTransport::One(transport)
     }
-}
-
-fn pane_host_contexts(snapshot: &Snapshot) -> HashMap<String, String> {
-    let mut contexts = HashMap::new();
-    let mut ambiguous = HashSet::new();
-    for agent in &snapshot.agents {
-        let pane_id = if agent.remote_alias.is_some() {
-            agent
-                .focus_target
-                .as_ref()
-                .map(|target| target.pane_id.as_str())
-        } else {
-            agent.is_tmux().then_some(agent.pane_id.as_str())
-        };
-        let Some(pane_id) = pane_id else {
-            continue;
-        };
-        let host = terminal_safe(&agent.host).to_uppercase();
-        if contexts
-            .get(pane_id)
-            .is_some_and(|current| current != &host)
-        {
-            contexts.remove(pane_id);
-            ambiguous.insert(pane_id.to_string());
-        } else if !ambiguous.contains(pane_id) {
-            contexts.insert(pane_id.to_string(), host);
-        }
-    }
-    contexts
 }
 
 fn apply_acknowledgements(
@@ -997,69 +924,6 @@ mod tests {
             snapshot.agents[0].remote_alias.as_deref(),
             Some("remote-mac")
         );
-    }
-
-    #[test]
-    fn pane_host_contexts_map_local_and_resolved_remote_records() {
-        let local = agent(
-            "shared-host/default/%1",
-            AgentState::Working,
-            Attention::Working,
-        );
-        let mut remote = agent(
-            "remote/remote-mac/shared-host/default/%2",
-            AgentState::Idle,
-            Attention::Idle,
-        );
-        remote.host = "remote-mac".into();
-        remote.remote_alias = Some("remote-mac".into());
-        remote.focus_target = Some(TmuxTarget {
-            session_name: "transport".into(),
-            window_id: "@2".into(),
-            window_index: 1,
-            pane_id: "%9".into(),
-            pane_index: 0,
-        });
-        let snapshot = Snapshot {
-            agents: vec![local, remote],
-            ..Snapshot::default()
-        };
-
-        let contexts = pane_host_contexts(&snapshot);
-
-        assert_eq!(contexts.get("%1").map(String::as_str), Some("SHARED-HOST"));
-        assert_eq!(contexts.get("%9").map(String::as_str), Some("REMOTE-MAC"));
-    }
-
-    #[test]
-    fn pane_host_contexts_do_not_guess_between_conflicting_hosts() {
-        let target = TmuxTarget {
-            session_name: "transport".into(),
-            window_id: "@2".into(),
-            window_index: 1,
-            pane_id: "%9".into(),
-            pane_index: 0,
-        };
-        let agents = ["remote-one", "remote-two"]
-            .map(|host| {
-                let mut remote = agent(
-                    &format!("remote/{host}/shared-host/default/%1"),
-                    AgentState::Idle,
-                    Attention::Idle,
-                );
-                remote.host = host.into();
-                remote.remote_alias = Some(host.into());
-                remote.focus_target = Some(target.clone());
-                remote
-            })
-            .to_vec();
-
-        let contexts = pane_host_contexts(&Snapshot {
-            agents,
-            ..Snapshot::default()
-        });
-
-        assert!(!contexts.contains_key("%9"));
     }
 
     #[test]

@@ -208,7 +208,7 @@ Federation snapshots never include captured pane contents, screen buffers,
 prompts, reasoning, rollout events, goal objectives, or raw process command
 lines.
 
-## Focus and presentation
+## Focus
 
 Local records focus their stored tmux session, window, and pane. Remote focus
 matches the two endpoints of an established SSH connection to a local tmux
@@ -218,9 +218,6 @@ pane. Public mirror markers provide an explicit fallback:
 @tmux_agent_remote_host
 @tmux_agent_remote_session
 ```
-
-Execution-host presentation is stored locally in `@tmux_agent_host` and
-`@tmux_agent_host_color`. These values are not added to federation snapshots.
 
 ## Security boundaries
 
