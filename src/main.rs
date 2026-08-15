@@ -83,6 +83,7 @@ enum Command {
   tmux-agent run -- codex resume <session-id>
   tmux-agent run -- claude
   tmux-agent run -- opencode
+  tmux-agent run -- omp
   tmux-agent run -- pi")]
     Run {
         /// Agent command to proxy, for example: codex resume [session-id].
@@ -107,6 +108,13 @@ enum Command {
     #[command(disable_help_flag = true)]
     Opencode {
         /// Arguments forwarded directly to OpenCode.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<OsString>,
+    },
+    /// Run OMP through the owned PTY without replacing the omp command.
+    #[command(disable_help_flag = true)]
+    Omp {
+        /// Arguments forwarded directly to OMP.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<OsString>,
     },
@@ -297,6 +305,7 @@ async fn main() -> Result<()> {
         Command::Opencode { arguments } => {
             run_owned_pty(provider_command("opencode", arguments), &paths)
         }
+        Command::Omp { arguments } => run_owned_pty(provider_command("omp", arguments), &paths),
         Command::Pi { arguments } => run_owned_pty(provider_command("pi", arguments), &paths),
         Command::Paths => {
             println!("config {}", config_path.display());
@@ -401,6 +410,7 @@ mod tests {
         assert!(root_help.contains("claude"));
         assert!(root_help.contains("opencode"));
         assert!(root_help.contains("pi"));
+        assert!(command.find_subcommand("omp").is_some());
 
         let command = Cli::command();
         let run = command
@@ -411,6 +421,7 @@ mod tests {
         assert!(help.contains("tmux-agent run -- codex resume <session-id>"));
         assert!(help.contains("tmux-agent run -- claude"));
         assert!(help.contains("tmux-agent run -- opencode"));
+        assert!(help.contains("tmux-agent run -- omp"));
         assert!(help.contains("tmux-agent run -- pi"));
     }
 

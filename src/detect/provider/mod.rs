@@ -3,6 +3,7 @@ mod codex;
 #[cfg(test)]
 mod contract;
 mod grok;
+mod omp;
 mod opencode;
 mod pi;
 mod screen;
@@ -91,7 +92,15 @@ pub(super) fn detect(agent: &str, title: &str, screen: &str) -> Option<ProviderD
         "Claude" => Some(claude::detect(title, screen)),
         "Grok" => Some(grok::detect(title, screen)),
         "OpenCode" => Some(opencode::detect(title, screen)),
+        "OMP" => Some(omp::detect(title, screen)),
         "Pi" => Some(pi::detect(title, screen)),
+        _ => None,
+    }
+}
+
+pub(super) fn stable_title(agent: &str, title: &str) -> Option<String> {
+    match agent {
+        "OMP" => omp::stable_title(title),
         _ => None,
     }
 }

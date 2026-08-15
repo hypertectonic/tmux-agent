@@ -5,7 +5,7 @@ fixtures, documentation improvements, and focused code contributions are
 welcome.
 
 Real-world testing has focused primarily on Codex. Reports from Claude,
-OpenCode, Grok, and Pi workflows are especially useful.
+OpenCode, Grok, OMP, and Pi workflows are especially useful.
 
 ## Before opening a change
 

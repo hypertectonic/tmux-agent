@@ -100,6 +100,10 @@ pub fn detect_agent(agent: String, title: &str, screen: &str) -> Detection {
     }
 }
 
+pub fn stable_title(agent: &str, title: &str) -> Option<String> {
+    provider::stable_title(agent, title)
+}
+
 fn detect_codex_goal(screen: &str) -> Option<GoalInfo> {
     static GOAL: OnceLock<Regex> = OnceLock::new();
     let pattern = GOAL.get_or_init(|| {
@@ -178,13 +182,16 @@ fn agent_for_command(command: &str) -> Option<String> {
 
 fn agent_for_program(program: &str) -> Option<&'static str> {
     let name = program_name(program);
-    agent_for_name(&name).or_else(|| is_pi_package_entrypoint(program).then_some("Pi"))
+    agent_for_name(&name)
+        .or_else(|| is_pi_package_entrypoint(program).then_some("Pi"))
+        .or_else(|| is_omp_package_entrypoint(program).then_some("OMP"))
 }
 
 fn agent_for_os_program(program: &OsStr) -> Option<&'static str> {
     let name = program_name_os(program);
     agent_for_name(&name)
         .or_else(|| is_pi_package_entrypoint(&program.to_string_lossy()).then_some("Pi"))
+        .or_else(|| is_omp_package_entrypoint(&program.to_string_lossy()).then_some("OMP"))
 }
 
 fn agent_for_name(name: &str) -> Option<&'static str> {
@@ -198,6 +205,8 @@ fn agent_for_name(name: &str) -> Option<&'static str> {
         Some("Grok")
     } else if name == "pi" {
         Some("Pi")
+    } else if name == "omp" {
+        Some("OMP")
     } else {
         None
     }
@@ -210,6 +219,15 @@ fn is_pi_package_entrypoint(program: &str) -> bool {
             normalized.rsplit('/').next(),
             Some("cli.js" | "cli.mjs" | "cli.cjs")
         )
+}
+
+fn is_omp_package_entrypoint(program: &str) -> bool {
+    let normalized = program.replace('\\', "/").to_ascii_lowercase();
+    ["src/cli.ts", "dist/cli.js"].iter().any(|entrypoint| {
+        normalized
+            .strip_suffix(entrypoint)
+            .is_some_and(|package| package.ends_with("/@oh-my-pi/pi-coding-agent/"))
+    })
 }
 
 fn program_name(program: &str) -> String {
@@ -452,6 +470,34 @@ mod tests {
     }
 
     #[test]
+    fn omp_executable_and_official_package_entrypoint_are_detected() {
+        let direct = detect("/opt/homebrew/bin/omp", "π > work", "").unwrap();
+        assert_eq!(direct.agent, "OMP");
+
+        let package = detect(
+            "bun /opt/lib/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
+            "π > work",
+            "",
+        )
+        .unwrap();
+        assert_eq!(package.agent, "OMP");
+    }
+
+    #[test]
+    fn omp_identification_rejects_lookalikes_and_preserves_pi() {
+        assert!(detect("omp-helper", "π > work", "").is_none());
+        assert!(
+            detect(
+                "bun /opt/lib/node_modules/not-oh-my-pi/pi-coding-agent/dist/cli.js",
+                "π > work",
+                "",
+            )
+            .is_none()
+        );
+        assert_eq!(detect("pi", "π - work", "").unwrap().agent, "Pi");
+    }
+
+    #[test]
     fn generic_node_cli_is_not_mistaken_for_pi() {
         assert!(detect("node /opt/tools/cli.js", "π - work", "⠋ Working...").is_none());
     }
@@ -492,6 +538,15 @@ mod tests {
             OsString::from("/opt/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
         ];
         assert_eq!(agent_for_argv(&command).as_deref(), Some("Pi"));
+    }
+
+    #[test]
+    fn argv_detection_recognizes_omp_npm_entrypoint() {
+        let command = [
+            OsString::from("bun"),
+            OsString::from("/opt/lib/node_modules/@oh-my-pi/pi-coding-agent/src/cli.ts"),
+        ];
+        assert_eq!(agent_for_argv(&command).as_deref(), Some("OMP"));
     }
 
     #[test]

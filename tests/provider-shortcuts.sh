@@ -11,7 +11,7 @@ mkdir -p "$test_root/bin" "$test_home" "$test_root/runtime" "$test_root/state"
 printf '%s\n' sentinel >"$test_home/.zshrc"
 printf '%s\n' sentinel >"$test_home/.bashrc"
 
-for provider in codex claude opencode pi; do
+for provider in codex claude opencode omp pi; do
     provider_path="$test_root/bin/$provider"
     cat >"$provider_path" <<'EOF'
 #!/bin/sh
@@ -50,6 +50,7 @@ run_shortcut() {
 run_shortcut codex 23 resume session-id --model gpt-test
 run_shortcut claude 17 --continue --model sonnet
 run_shortcut opencode 0 --help
+run_shortcut omp 29 --model test-provider/test-model
 run_shortcut pi 19 --model test-provider/test-model
 
 grep -Fx $'codex\tresume\tsession-id\t--model\tgpt-test' \
@@ -57,6 +58,8 @@ grep -Fx $'codex\tresume\tsession-id\t--model\tgpt-test' \
 grep -Fx $'claude\t--continue\t--model\tsonnet' \
     "$test_root/providers.log" >/dev/null
 grep -Fx $'opencode\t--help' "$test_root/providers.log" >/dev/null
+grep -Fx $'omp\t--model\ttest-provider/test-model' \
+    "$test_root/providers.log" >/dev/null
 grep -Fx $'pi\t--model\ttest-provider/test-model' \
     "$test_root/providers.log" >/dev/null
 [[ $(<"$test_home/.zshrc") == sentinel ]]
