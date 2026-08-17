@@ -159,6 +159,7 @@ impl Scanner {
                 .filter(|state| !state.cwd.is_empty())
                 .map(|state| state.cwd.clone())
                 .unwrap_or(pane.cwd);
+            let title = collected_title(wrapped, &detection.agent, pane.title);
             let record = AgentRecord {
                 id: id.clone(),
                 host: self.host.clone(),
@@ -175,10 +176,7 @@ impl Scanner {
                 state: detection.state,
                 attention,
                 source: detection.source,
-                title: wrapped
-                    .filter(|state| !state.title.is_empty())
-                    .map(|state| state.title.clone())
-                    .unwrap_or(pane.title),
+                title,
                 label: pane.label,
                 cwd,
                 visible: pane.visible,
@@ -554,6 +552,14 @@ fn mark_process_only(detection: &mut detect::Detection) {
     detection.source = EvidenceSource::Process;
     detection.goal = None;
     detection.details = None;
+}
+
+fn collected_title(wrapped: Option<&RunnerState>, agent: &str, pane_title: String) -> String {
+    wrapped
+        .filter(|state| !state.title.is_empty())
+        .map(|state| state.title.clone())
+        .or_else(|| detect::stable_title(agent, &pane_title))
+        .unwrap_or(pane_title)
 }
 
 fn runner_for_pane<'a>(
@@ -1225,11 +1231,29 @@ mod tests {
 
     #[test]
     fn ordinary_terminal_without_owned_screen_is_unknown() {
-        let mut detection = detect::detect("/opt/homebrew/bin/codex", "", "").unwrap();
-        mark_process_only(&mut detection);
-        assert_eq!(detection.state, AgentState::Unknown);
-        assert_eq!(detection.source, EvidenceSource::Process);
-        assert!(detection.details.is_none());
+        for provider in ["/opt/homebrew/bin/codex", "/opt/homebrew/bin/omp"] {
+            let mut detection = detect::detect(provider, "", "").unwrap();
+            mark_process_only(&mut detection);
+            assert_eq!(detection.state, AgentState::Unknown);
+            assert_eq!(detection.source, EvidenceSource::Process);
+            assert!(detection.details.is_none());
+        }
+    }
+
+    #[test]
+    fn omp_spinner_frames_produce_the_same_collected_record_title() {
+        assert_eq!(
+            collected_title(None, "OMP", "π ⠋ local-bench".into()),
+            "local-bench"
+        );
+        assert_eq!(
+            collected_title(None, "OMP", "π ⠸ local-bench".into()),
+            "local-bench"
+        );
+        assert_eq!(
+            collected_title(None, "Codex", "⠸ local-bench".into()),
+            "⠸ local-bench"
+        );
     }
 
     #[test]
