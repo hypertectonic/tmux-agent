@@ -502,6 +502,7 @@ fn observed_state(
         .map_err(|_| anyhow::anyhow!("agent terminal buffer lock is poisoned"))?
         .evidence();
     let detection = detect::detect_agent(identity.agent.to_string(), &title, &screen);
+    let title = detect::stable_title(&detection.agent, &title).unwrap_or(title);
     Ok(RunnerState {
         protocol: RUNNER_PROTOCOL,
         run_id: identity.run_id.to_string(),
@@ -911,6 +912,35 @@ mod tests {
                 .as_ref()
                 .is_some_and(|details| details.inferred)
         );
+    }
+
+    #[test]
+    fn omp_owned_pty_publishes_one_stable_title_across_spinner_frames() {
+        let observe = |frame: &str| {
+            let mut terminal = TerminalBuffer::new(24, 80);
+            terminal.process(format!("\x1b]2;π {frame} local-bench\x07").as_bytes());
+            observed_state(
+                &Arc::new(Mutex::new(terminal)),
+                RunnerIdentity {
+                    run_id: "run-omp",
+                    owner_pid: 10,
+                    child_pid: 11,
+                    process_group: 11,
+                    agent: "OMP",
+                    cwd: "/work/local-bench",
+                    outer_terminal: Some("ttys001"),
+                    inner_terminal: Some("ttys002"),
+                    codex_thread_id: None,
+                },
+            )
+            .unwrap()
+        };
+
+        let first = observe("⠋");
+        let second = observe("⠸");
+        assert_eq!(first.title, "local-bench");
+        assert_eq!(second.title, "local-bench");
+        assert!(first.same_observation(&second));
     }
 
     #[test]

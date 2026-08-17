@@ -1735,6 +1735,7 @@ fn provider_palette(agent: &str) -> (&str, Color, Color) {
             Color::Rgb(50, 35, 75),
         ),
         "grok" => ("GROK", Color::Rgb(170, 195, 240), Color::Rgb(35, 45, 65)),
+        "omp" => ("OMP", Color::Rgb(230, 160, 190), Color::Rgb(65, 35, 50)),
         "pi" => ("PI", Color::Rgb(205, 235, 125), Color::Rgb(48, 62, 28)),
         _ => (agent, Color::Gray, Color::Rgb(45, 45, 45)),
     }
@@ -2358,14 +2359,20 @@ mod tests {
         let (codex, codex_style) = provider_badge("Codex");
         let (claude, claude_style) = provider_badge("Claude");
         let (opencode, opencode_style) = provider_badge("OpenCode");
+        let (omp, omp_style) = provider_badge("OMP");
         let (pi, pi_style) = provider_badge("Pi");
 
         assert_eq!(codex, "CODEX   ");
         assert_eq!(claude, "CLAUDE  ");
         assert_eq!(opencode, "OPENCODE");
+        assert_eq!(omp, "OMP     ");
+        assert_eq!(omp_style.fg, Some(Color::Rgb(230, 160, 190)));
+        assert_eq!(omp_style.bg, Some(Color::Rgb(65, 35, 50)));
         assert_eq!(pi, "PI      ");
         assert_ne!(codex_style.bg, claude_style.bg);
         assert_ne!(claude_style.bg, opencode_style.bg);
+        assert_ne!(opencode_style.bg, omp_style.bg);
+        assert_ne!(omp_style.bg, pi_style.bg);
         assert_ne!(opencode_style.bg, pi_style.bg);
     }
 
@@ -2376,6 +2383,7 @@ mod tests {
                 test_agent("Codex", Attention::Working, AgentOrigin::Tmux),
                 test_agent("OpenCode", Attention::Working, AgentOrigin::Tmux),
                 test_agent("Claude", Attention::Working, AgentOrigin::Tmux),
+                test_agent("OMP", Attention::Working, AgentOrigin::Tmux),
             ],
             ..Snapshot::default()
         };
@@ -2385,7 +2393,7 @@ mod tests {
             .draw(|frame| render(frame, &snapshot, 0, "", 5))
             .unwrap();
 
-        for row in [4, 6, 8] {
+        for row in [4, 6, 8, 10] {
             let spinner = &terminal.backend().buffer()[(1, row)];
             let provider_badge = &terminal.backend().buffer()[(3, row)];
             assert_eq!(spinner.fg, provider_badge.fg);

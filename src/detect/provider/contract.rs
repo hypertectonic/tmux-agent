@@ -77,3 +77,11 @@ fn pi_visible_behavior_contract() {
         super::pi::detect,
     );
 }
+
+#[test]
+fn omp_visible_behavior_contract() {
+    verify(
+        include_str!("../../../tests/fixtures/detection/omp.json"),
+        super::omp::detect,
+    );
+}

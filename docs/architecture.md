@@ -17,10 +17,16 @@ The scanner combines tmux pane metadata, foreground process groups, ordinary
 TTY process groups, and owned PTY records. Captured terminal surfaces are used
 only on the machine that owns them.
 
-Codex, Claude, OpenCode, Grok, and Pi each have a typed detector backed by
+Codex, Claude, OpenCode, Grok, OMP, and Pi each have a typed detector backed by
 minimal synthetic fixtures. Detectors emit semantic state and derived evidence
 details, not the source terminal content. State stabilization prevents one
 quiet frame from immediately erasing stronger working or blocked evidence.
+
+OMP v17.3.4 enables state titles by default. Its exact `π <separator>
+<label>` title is the primary state signal. The scanner stores only `<label>`,
+so the 80 ms working spinner does not change the record title or publish a new
+snapshot. If OMP disables or overrides state titles, its detector falls back
+to narrow visible status and permission markers.
 
 The owned PTY runner transparently forwards input, output, resize events,
 signals, job control, and child exit status. Its mode `0600` heartbeat record

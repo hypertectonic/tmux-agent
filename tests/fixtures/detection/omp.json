@@ -1,0 +1,80 @@
+[
+  {
+    "name": "working title carries state",
+    "basis": "OMP v17.3.4 title-generator source at c246f092001985be3e6c6a104639758c7bbac759",
+    "title": "π ⠋ local-bench",
+    "screen": "",
+    "state": "working",
+    "source": "title",
+    "signal": "state_title_working",
+    "scope": "terminal_title",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "attention title needs input",
+    "basis": "OMP v17.3.4 title-generator source at c246f092001985be3e6c6a104639758c7bbac759",
+    "title": "π ! local-bench",
+    "screen": "",
+    "state": "blocked",
+    "source": "title",
+    "signal": "state_title_attention",
+    "scope": "terminal_title",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "idle title is ready",
+    "basis": "OMP v17.3.4 title-generator source at c246f092001985be3e6c6a104639758c7bbac759",
+    "title": "π > local-bench",
+    "screen": "",
+    "state": "idle",
+    "source": "title",
+    "signal": "state_title_idle",
+    "scope": "terminal_title",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "arbitrary pi title does not carry state",
+    "basis": "OMP extension title override contract",
+    "title": "π custom working title",
+    "screen": "",
+    "state": "idle",
+    "source": "process",
+    "signal": "omp_foreground_without_activity",
+    "scope": "foreground_process",
+    "definitive": false,
+    "inferred": true,
+    "preserve_previous": false
+  },
+  {
+    "name": "screen fallback sees official status indicator",
+    "basis": "OMP status indicator source",
+    "title": "custom extension title",
+    "screen": "⠋ Working... (esc to interrupt)",
+    "state": "working",
+    "source": "screen",
+    "signal": "status_indicator",
+    "scope": "recent_lines",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "screen fallback sees permission selector",
+    "basis": "OMP permission selector source",
+    "title": "custom extension title",
+    "screen": "Allow?\n→ Yes\n  No\n↑↓ navigate  Enter select  Esc cancel",
+    "state": "blocked",
+    "source": "screen",
+    "signal": "permission_selector",
+    "scope": "current_selector",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  }
+]
