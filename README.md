@@ -15,6 +15,13 @@ snapshots.
 > and SSH-based tmux workflows. Claude, OpenCode, Grok, OMP, and Pi are supported
 > but have received less testing.
 
+## See the workflow
+
+![tmux-agent filtering sessions and switching between real Codex and OMP interfaces](docs/assets/tmux-agent-demo.gif)
+
+The sidebar filters sessions as you type, focuses the selected agent with
+`Enter`, and activates the first ten sessions directly with `1`-`9` and `0`.
+
 ## Install with TPM
 
 Requirements:
