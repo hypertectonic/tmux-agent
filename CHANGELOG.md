@@ -6,6 +6,23 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+## [0.7.0] - 2026-08-17
+
+### Added
+
+- Detect Oh My Pi (OMP) as a distinct provider in tmux and ordinary terminals,
+  with typed screen-state evidence, stable spinner-title normalization, and a
+  dedicated magenta provider badge.
+- Run OMP in an owned PTY with `tmux-agent omp [args...]`, preserving argument
+  forwarding and the child exit status.
+- Show the real tmux-agent workflow in the README with a sanitized terminal
+  recording that demonstrates filtering and switching between Codex and OMP.
+
+### Changed
+
+- Keep Pi and OMP identification separate by recognizing only the `omp`
+  executable and official OMP package entrypoints.
+
 ## [0.6.0] - 2026-08-15
 
 ### Added
