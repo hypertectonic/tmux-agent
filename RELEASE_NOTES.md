@@ -1,31 +1,26 @@
-tmux-agent v0.6.0 makes large session lists quicker to navigate and keeps
-recently used idle sessions within reach.
+tmux-agent v0.7.0 adds first-class Oh My Pi (OMP) support and a real terminal
+demo of the tmux-agent workflow.
 
 ## Highlights
 
-- Press `1` through `9` or `0` to activate one of the first ten top-level
-  sessions. The matching keycap appears beside each provider badge.
-- Numeric selection is sent to the other persistent tmux-agent UIs on the same
-  tmux server, so their selected row stays aligned after activation.
-- Idle sessions sort by the newer of their last successful tmux-agent focus and
-  their latest state change. The existing attention buckets and subagent
-  hierarchy keep their previous order.
-- The local daemon distributes last-used ordering to its connected UIs without
-  serializing, persisting, or federating the timestamps.
-- The README banner now matches the current header, row layout, shortcut
-  keycaps, peer status, version, and footer controls.
+- OMP sessions are detected as a distinct provider in tmux and ordinary
+  terminals without changing Pi detection.
+- Owned-PTY OMP sessions report typed working, needs-input, idle, and done
+  states from their visible terminal surface.
+- Animated OMP activity titles are normalized to a stable task title, and OMP
+  rows use a dedicated magenta provider badge.
+- `tmux-agent omp [args...]` runs OMP inside tmux-agent's owned PTY while
+  forwarding arguments, terminal behavior, and the child exit status.
+- The README now includes a sanitized recording of a real tmux layout,
+  demonstrating search, selection, and switching between Codex and OMP.
 
 ## Compatibility
 
 - No configuration or federation protocol migration is required.
-- Last-used ordering resets when the local daemon restarts. Manual tmux
-  switching does not update it.
-- tmux-agent no longer reads or writes the legacy `@tmux_agent_host` and
-  `@tmux_agent_host_color` presentation options. It leaves existing values
-  untouched. Integrations that render host badges should own their detection,
-  colors, and pane options.
-- Pane titles, `@pane_label`, remote routing markers, SSH transport discovery,
-  aliases, and focus behavior remain unchanged.
+- OMP and Pi remain separate providers. Lookalike command names are not
+  classified as either provider.
+- Process-only OMP sessions in ordinary terminals remain evidence-limited
+  `unknown` unless tmux-agent owns the inner PTY screen.
 - Existing standalone and TPM installations can update through the normal
   verified lifecycle.
 
@@ -51,6 +46,6 @@ Verify downloaded archives with `SHA256SUMS` before installation.
 ## Documentation
 
 See the
-[installation guide](https://github.com/hypertectonic/tmux-agent/blob/v0.6.0/docs/installation.md),
-[remote-machine guide](https://github.com/hypertectonic/tmux-agent/blob/v0.6.0/docs/remote-machines.md),
-and [security policy](https://github.com/hypertectonic/tmux-agent/blob/v0.6.0/SECURITY.md).
+[installation guide](https://github.com/hypertectonic/tmux-agent/blob/v0.7.0/docs/installation.md),
+[remote-machine guide](https://github.com/hypertectonic/tmux-agent/blob/v0.7.0/docs/remote-machines.md),
+and [security policy](https://github.com/hypertectonic/tmux-agent/blob/v0.7.0/SECURITY.md).
