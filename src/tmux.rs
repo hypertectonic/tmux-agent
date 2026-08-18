@@ -5,11 +5,15 @@ use crate::model::{
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::env;
+#[cfg(target_os = "macos")]
+use std::ffi::CStr;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,6 +21,12 @@ const SEPARATOR: char = '\u{1f}';
 const ESCAPED_SEPARATOR: &str = r"\037";
 const UI_SELECTION_OPTION: &str = "@tmux_agent_selection";
 static CAPTURE_BATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+const PROCESS_COLUMNS: &str = "uid=,pid=,ppid=,pgid=,tpgid=,tdev=,etime=,args=";
+#[cfg(not(target_os = "macos"))]
+const PROCESS_COLUMNS: &str = "uid=,pid=,ppid=,pgid=,tpgid=,tty=,etime=,args=";
+#[cfg(target_os = "macos")]
+static DEVNAME_LOCK: Mutex<()> = Mutex::new(());
 // CSI 34~ is an otherwise unused F17 key that wakes every persistent UI after
 // an explicit numeric selection without introducing polling or focus tracking.
 const UI_SELECTION_WAKE_HEX: [&str; 5] = ["1b", "5b", "33", "34", "7e"];
@@ -234,11 +244,7 @@ impl Tmux {
 
     pub fn process_snapshot(&self, panes: &[Pane]) -> Result<ProcessSnapshot> {
         let output = Command::new("ps")
-            .args([
-                "-axww",
-                "-o",
-                "uid=,pid=,ppid=,pgid=,tpgid=,tty=,etime=,args=",
-            ])
+            .args(["-axww", "-o", PROCESS_COLUMNS])
             .output()
             .context("run ps for foreground process discovery")?;
         if !output.status.success() {
@@ -249,9 +255,8 @@ impl Tmux {
             .lines()
             .filter_map(parse_process_start)
             .collect::<HashMap<_, _>>();
-        let processes = process_output
-            .lines()
-            .filter_map(parse_process)
+        let processes = parse_processes(&process_output)
+            .into_iter()
             .filter(|process| process.uid == unsafe { libc::geteuid() })
             .collect::<Vec<_>>();
         let mut pane_descriptions = HashMap::new();
@@ -789,7 +794,37 @@ fn pane_is_visible(window_active: &str, session_attached: &str) -> bool {
     window_active == "1" && session_attached != "0"
 }
 
-fn parse_process(line: &str) -> Option<Process> {
+fn parse_processes(output: &str) -> Vec<Process> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut terminal_names = HashMap::<String, Option<String>>::new();
+        output
+            .lines()
+            .filter_map(|line| {
+                parse_process_with_terminal_resolver(line, |terminal| {
+                    if let Some(name) = terminal_names.get(terminal) {
+                        return name.clone();
+                    }
+                    let name = resolve_macos_terminal(terminal);
+                    terminal_names.insert(terminal.to_string(), name.clone());
+                    name
+                })
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        output
+            .lines()
+            .filter_map(|line| parse_process_with_terminal_resolver(line, named_terminal))
+            .collect()
+    }
+}
+
+fn parse_process_with_terminal_resolver<F>(line: &str, resolve_terminal: F) -> Option<Process>
+where
+    F: FnOnce(&str) -> Option<String>,
+{
     let mut fields = line.split_whitespace();
     let uid = fields.next()?.parse().ok()?;
     let pid = fields.next()?.parse().ok()?;
@@ -801,10 +836,7 @@ fn parse_process(line: &str) -> Option<Process> {
         .ok()
         .and_then(|value| u32::try_from(value).ok())
         .filter(|value| *value > 0);
-    let terminal = fields
-        .next()
-        .filter(|value| !matches!(*value, "??" | "?"))
-        .map(str::to_string);
+    let terminal = resolve_terminal(fields.next()?);
     fields.next()?;
     let args = fields.collect::<Vec<_>>().join(" ");
     Some(Process {
@@ -816,6 +848,45 @@ fn parse_process(line: &str) -> Option<Process> {
         terminal,
         args,
     })
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn named_terminal(value: &str) -> Option<String> {
+    (!matches!(value, "??" | "?")).then(|| value.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_terminal(value: &str) -> Option<String> {
+    resolve_macos_terminal_with(value, macos_device_name)
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_terminal_with<F>(value: &str, lookup: F) -> Option<String>
+where
+    F: FnOnce(libc::dev_t) -> Option<String>,
+{
+    let (major, minor) = value.split_once('/')?;
+    let major = major.parse::<i32>().ok()?;
+    let minor = minor.parse::<i32>().ok()?;
+    if major < 0 || minor < 0 {
+        return None;
+    }
+    lookup(libc::makedev(major, minor))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_device_name(device: libc::dev_t) -> Option<String> {
+    let _guard = DEVNAME_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let name = unsafe { libc::devname(device, libc::S_IFCHR) };
+    if name.is_null() {
+        return None;
+    }
+    unsafe { CStr::from_ptr(name) }
+        .to_str()
+        .ok()
+        .map(str::to_string)
 }
 
 fn parse_process_start(line: &str) -> Option<(u32, u64)> {
@@ -1348,9 +1419,11 @@ mod tests {
 
     #[test]
     fn parses_ps_rows_with_full_arguments() {
-        let process =
-            parse_process("  502 123 10 123 123 ttys003 01:02 /usr/bin/codex --model smart")
-                .unwrap();
+        let process = parse_process_with_terminal_resolver(
+            "  502 123 10 123 123 ttys003 01:02 /usr/bin/codex --model smart",
+            named_terminal,
+        )
+        .unwrap();
         assert_eq!(process.uid, 502);
         assert_eq!(process.pid, 123);
         assert_eq!(process.parent_pid, 10);
@@ -1361,6 +1434,42 @@ mod tests {
         assert_eq!(parse_elapsed_ms("01:02"), Some(62_000));
         assert_eq!(parse_elapsed_ms("02:03:04"), Some(7_384_000));
         assert_eq!(parse_elapsed_ms("1-02:03:04"), Some(93_784_000));
+    }
+
+    #[test]
+    fn process_parser_applies_an_independent_terminal_fixture() {
+        let process = parse_process_with_terminal_resolver(
+            "  502 123 10 123 123 16/3 01:02 /usr/bin/codex --model smart",
+            |terminal| {
+                assert_eq!(terminal, "16/3");
+                Some("ttys003".into())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(process.terminal.as_deref(), Some("ttys003"));
+        assert_eq!(process.args, "/usr/bin/codex --model smart");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_process_columns_request_numeric_terminal_devices() {
+        assert!(PROCESS_COLUMNS.contains("tdev="));
+        assert!(!PROCESS_COLUMNS.contains("tty="));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_terminal_device_fixture_maps_back_to_the_tty_name() {
+        let terminal = resolve_macos_terminal_with("16/3", |device| {
+            assert_eq!(libc::major(device), 16);
+            assert_eq!(libc::minor(device), 3);
+            Some("ttys003".into())
+        });
+
+        assert_eq!(terminal.as_deref(), Some("ttys003"));
+        assert!(resolve_macos_terminal_with("??", |_| unreachable!()).is_none());
+        assert!(resolve_macos_terminal_with("16/not-a-number", |_| unreachable!()).is_none());
     }
 
     #[test]
