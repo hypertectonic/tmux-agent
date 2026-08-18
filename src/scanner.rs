@@ -90,6 +90,21 @@ impl Scanner {
         };
         let processes = self.tmux.process_snapshot(&panes)?;
         let runner_states = runner::load_states(&self.runner_directory, &processes.live_pids);
+        let capture_pane_ids = panes
+            .iter()
+            .filter(|pane| !pane.is_agent_ui && !pane.dead)
+            .filter(|pane| runner_for_pane(&runner_states, &processes, &pane.pane_id).is_none())
+            .filter(|pane| {
+                let process = processes
+                    .panes
+                    .get(&pane.pane_id)
+                    .map(String::as_str)
+                    .unwrap_or(&pane.current_command);
+                detect::looks_like_agent(process)
+            })
+            .map(|pane| pane.pane_id.clone())
+            .collect::<Vec<_>>();
+        let captured_screens = self.tmux.capture_visible_batch(&capture_pane_ids);
         let now = now_ms();
         let mut next = HashMap::new();
         let mut record_pids = HashMap::<String, HashSet<u32>>::new();
@@ -114,12 +129,15 @@ impl Scanner {
                 claimed_runners.insert(wrapped.run_id.clone());
                 wrapped.as_detection()
             } else {
-                let captured_screen = self.tmux.capture_visible(&pane.pane_id);
-                let screen = captured_screen.as_deref().unwrap_or_default();
+                let captured_screen = captured_screens.get(&pane.pane_id);
+                let screen = captured_screen
+                    .and_then(|capture| capture.as_ref().ok())
+                    .map(String::as_str)
+                    .unwrap_or_default();
                 let Some(mut detection) = detect::detect(process, &pane.title, screen) else {
                     continue;
                 };
-                if captured_screen.is_err() {
+                if captured_screen.is_none_or(Result::is_err) {
                     preserve_on_capture_failure(&mut detection);
                 }
                 detection

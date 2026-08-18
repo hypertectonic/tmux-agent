@@ -10,10 +10,13 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const SEPARATOR: char = '\u{1f}';
 const ESCAPED_SEPARATOR: &str = r"\037";
 const UI_SELECTION_OPTION: &str = "@tmux_agent_selection";
+static CAPTURE_BATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // CSI 34~ is an otherwise unused F17 key that wakes every persistent UI after
 // an explicit numeric selection without introducing polling or focus tracking.
 const UI_SELECTION_WAKE_HEX: [&str; 5] = ["1b", "5b", "33", "34", "7e"];
@@ -358,8 +361,36 @@ impl Tmux {
         })
     }
 
-    pub fn capture_visible(&self, pane_id: &str) -> Result<String> {
-        self.run(&visible_capture_args(pane_id))
+    pub fn capture_visible_batch(&self, pane_ids: &[String]) -> HashMap<String, Result<String>> {
+        if pane_ids.is_empty() {
+            return HashMap::new();
+        }
+        let framing = CaptureBatchFraming::fresh();
+        let command_args = capture_batch_args(pane_ids, &framing);
+        let mut command = Command::new("tmux");
+        command.args(&self.args).args(&command_args);
+        match command.output() {
+            Ok(output) => parse_capture_batch(
+                pane_ids,
+                &framing,
+                &String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            ),
+            Err(error) => {
+                let message = error.to_string();
+                pane_ids
+                    .iter()
+                    .map(|pane_id| {
+                        (
+                            pane_id.clone(),
+                            Err(anyhow::anyhow!(
+                                "run tmux capture-pane batch for {pane_id}: {message}"
+                            )),
+                        )
+                    })
+                    .collect()
+            }
+        }
     }
 
     pub fn process_working_directories(&self, pids: &[u32]) -> HashMap<u32, String> {
@@ -625,8 +656,84 @@ fn normalized_socket_path(path: &Path) -> PathBuf {
     })
 }
 
-fn visible_capture_args(pane_id: &str) -> [&str; 4] {
-    ["capture-pane", "-p", "-t", pane_id]
+struct CaptureBatchFraming {
+    nonce: String,
+}
+
+impl CaptureBatchFraming {
+    fn fresh() -> Self {
+        let sequence = CAPTURE_BATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        Self {
+            nonce: format!("{:x}-{:x}-{sequence:x}", std::process::id(), timestamp),
+        }
+    }
+
+    fn begin(&self, index: usize) -> String {
+        format!("__TMUX_AGENT_CAPTURE_{}_{}_BEGIN__", self.nonce, index)
+    }
+
+    fn end(&self, index: usize) -> String {
+        format!("__TMUX_AGENT_CAPTURE_{}_{}_END__", self.nonce, index)
+    }
+}
+
+fn capture_batch_args(pane_ids: &[String], framing: &CaptureBatchFraming) -> Vec<String> {
+    let mut args = Vec::with_capacity(pane_ids.len() * 16);
+    for (index, pane_id) in pane_ids.iter().enumerate() {
+        if !args.is_empty() {
+            args.push(";".into());
+        }
+        args.extend([
+            "display-message".into(),
+            "-p".into(),
+            framing.begin(index),
+            ";".into(),
+            "if-shell".into(),
+            "-F".into(),
+            "1".into(),
+            format!("capture-pane -p -t {pane_id}"),
+            ";".into(),
+            "display-message".into(),
+            "-p".into(),
+            framing.end(index),
+        ]);
+    }
+    args
+}
+
+fn parse_capture_batch(
+    pane_ids: &[String],
+    framing: &CaptureBatchFraming,
+    output: &str,
+    error: &str,
+) -> HashMap<String, Result<String>> {
+    let mut captures = HashMap::new();
+    let mut remaining = output;
+    for (index, pane_id) in pane_ids.iter().enumerate() {
+        let begin = format!("{}\n", framing.begin(index));
+        let end = format!("{}\n", framing.end(index));
+        let captured = remaining.find(&begin).and_then(|begin_at| {
+            let after_begin = &remaining[begin_at + begin.len()..];
+            let end_at = after_begin.find(&end)?;
+            let screen = &after_begin[..end_at];
+            remaining = &after_begin[end_at + end.len()..];
+            (!screen.is_empty()).then(|| screen.to_string())
+        });
+        let result = captured.ok_or_else(|| {
+            let detail = if error.is_empty() {
+                "capture produced no framed output"
+            } else {
+                error
+            };
+            anyhow::anyhow!("tmux capture-pane failed for {pane_id}: {detail}")
+        });
+        captures.insert(pane_id.clone(), result);
+    }
+    captures
 }
 
 fn parse_pane_visibility(line: &str, pane_id: &str) -> Result<bool> {
@@ -1467,10 +1574,117 @@ mod tests {
 
     #[test]
     fn capture_uses_only_the_live_visible_pane() {
-        let args = visible_capture_args("%42");
-        assert_eq!(args, ["capture-pane", "-p", "-t", "%42"]);
-        assert!(!args.contains(&"-S"));
-        assert!(!args.contains(&"-M"));
+        let framing = CaptureBatchFraming {
+            nonce: "fixture".into(),
+        };
+        let args = capture_batch_args(&["%42".into()], &framing);
+        let capture = args
+            .iter()
+            .find(|arg| arg.starts_with("capture-pane"))
+            .unwrap();
+        assert_eq!(capture, "capture-pane -p -t %42");
+        assert!(!capture.contains(" -S"));
+        assert!(!capture.contains(" -M"));
+    }
+
+    #[test]
+    fn batched_capture_preserves_successes_when_one_pane_disappears() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket_name = format!("tmux-agent-capture-{}-{nonce}", std::process::id());
+        let config = Config {
+            tmux_args: vec!["-L".into(), socket_name.clone()],
+            ..Config::default()
+        };
+        let started = Command::new("tmux")
+            .args([
+                "-L",
+                &socket_name,
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "capture-test",
+                "printf 'first-pane\\n'; sleep 30",
+            ])
+            .status()
+            .unwrap();
+        assert!(started.success());
+        let split = Command::new("tmux")
+            .args([
+                "-L",
+                &socket_name,
+                "split-window",
+                "-d",
+                "-t",
+                "capture-test",
+                "printf 'second-pane\\n'; sleep 30",
+            ])
+            .status()
+            .unwrap();
+        assert!(split.success());
+        let pane_output = Command::new("tmux")
+            .args([
+                "-L",
+                &socket_name,
+                "list-panes",
+                "-t",
+                "capture-test",
+                "-F",
+                "#{pane_id}",
+            ])
+            .output()
+            .unwrap();
+        assert!(pane_output.status.success());
+        let pane_ids = String::from_utf8(pane_output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(pane_ids.len(), 2);
+        for (pane_id, expected) in pane_ids.iter().zip(["first-pane", "second-pane"]) {
+            let ready = (0..100).any(|_| {
+                let output = Command::new("tmux")
+                    .args(["-L", &socket_name, "capture-pane", "-p", "-t", pane_id])
+                    .output()
+                    .unwrap();
+                if String::from_utf8_lossy(&output.stdout).contains(expected) {
+                    true
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    false
+                }
+            });
+            assert!(ready, "pane {pane_id} did not render {expected}");
+        }
+        let missing = "%999999".to_string();
+        let requested = vec![pane_ids[0].clone(), missing.clone(), pane_ids[1].clone()];
+
+        let captures = Tmux::new(&config).capture_visible_batch(&requested);
+
+        let _ = Command::new("tmux")
+            .args(["-L", &socket_name, "kill-server"])
+            .status();
+        assert!(
+            captures[&pane_ids[0]]
+                .as_ref()
+                .unwrap()
+                .contains("first-pane"),
+            "first capture was {:?}",
+            captures[&pane_ids[0]]
+        );
+        assert!(
+            captures[&pane_ids[1]]
+                .as_ref()
+                .unwrap()
+                .contains("second-pane"),
+            "second capture was {:?}",
+            captures[&pane_ids[1]]
+        );
+        assert!(captures[&missing].is_err());
     }
 
     #[test]
