@@ -154,6 +154,21 @@ pub fn is_focus_target_missing(error: &anyhow::Error) -> bool {
     error.downcast_ref::<FocusTargetMissing>().is_some()
 }
 
+#[derive(Debug)]
+struct ServerMissing;
+
+impl fmt::Display for ServerMissing {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("tmux server is missing")
+    }
+}
+
+impl std::error::Error for ServerMissing {}
+
+pub fn is_server_missing(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ServerMissing>().is_some()
+}
+
 impl Tmux {
     pub fn new(config: &Config) -> Self {
         Self {
@@ -209,7 +224,7 @@ impl Tmux {
         ]
         .join(&sep);
         let Some(output) = self.run_optional(&["list-panes", "-a", "-F", &format])? else {
-            return Ok(Vec::new());
+            return Err(ServerMissing.into());
         };
         output.lines().map(parse_pane).collect()
     }
@@ -1044,7 +1059,8 @@ fn nonempty(value: &str) -> Option<String> {
 }
 
 fn is_missing_server(stderr: &str) -> bool {
-    stderr.contains("no server running")
+    stderr.contains("server exited unexpectedly")
+        || stderr.contains("no server running")
         || stderr.contains("error connecting to")
         || stderr.contains("no sessions")
 }
@@ -1392,6 +1408,7 @@ mod tests {
 
     #[test]
     fn recognizes_missing_tmux_server_errors() {
+        assert!(is_missing_server("server exited unexpectedly"));
         assert!(is_missing_server(
             "error connecting to /private/tmp/tmux-502/default (No such file or directory)"
         ));
