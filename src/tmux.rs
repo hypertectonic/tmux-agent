@@ -13,13 +13,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SEPARATOR: char = '\u{1f}';
 const ESCAPED_SEPARATOR: &str = r"\037";
 const UI_SELECTION_OPTION: &str = "@tmux_agent_selection";
+const PROCESS_INVENTORY_TTL: Duration = Duration::from_secs(1);
 static CAPTURE_BATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 const PROCESS_COLUMNS: &str = "uid=,pid=,ppid=,pgid=,tpgid=,tdev=,etime=,args=";
@@ -121,6 +121,21 @@ pub struct ProcessSnapshot {
     pub ssh_transports: Vec<SshTransport>,
 }
 
+#[derive(Debug)]
+struct ProcessInventory {
+    processes: Vec<Process>,
+    process_started_at_ms: HashMap<u32, u64>,
+    tcp_connections: HashMap<u32, Vec<TcpSocket>>,
+    parent_pids: HashMap<u32, u32>,
+    ssh_connections: HashMap<u32, SshConnection>,
+}
+
+#[derive(Debug)]
+struct CachedProcessInventory {
+    refreshed_at: Instant,
+    inventory: Arc<ProcessInventory>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TcpEndpoint {
     address: String,
@@ -143,6 +158,7 @@ struct TcpSocket {
 pub struct Tmux {
     args: Vec<String>,
     host_aliases: HashMap<String, String>,
+    process_inventory: Arc<Mutex<Option<CachedProcessInventory>>>,
     #[cfg(target_os = "macos")]
     terminal_names: Arc<MacosTerminalNames>,
 }
@@ -214,6 +230,7 @@ impl Tmux {
         Self {
             args: config.tmux_args.clone(),
             host_aliases: configured_host_aliases(config),
+            process_inventory: Arc::new(Mutex::new(None)),
             #[cfg(target_os = "macos")]
             terminal_names: Arc::new(MacosTerminalNames::default()),
         }
@@ -272,6 +289,47 @@ impl Tmux {
     }
 
     pub fn process_snapshot(&self, panes: &[Pane]) -> Result<ProcessSnapshot> {
+        self.process_snapshot_with(panes, Instant::now, || self.refresh_process_inventory())
+    }
+
+    fn process_snapshot_with<N, F>(
+        &self,
+        panes: &[Pane],
+        mut now: N,
+        refresh: F,
+    ) -> Result<ProcessSnapshot>
+    where
+        N: FnMut() -> Instant,
+        F: FnOnce() -> Result<ProcessInventory>,
+    {
+        let inventory = {
+            let mut cached = self
+                .process_inventory
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let checked_at = now();
+            if let Some(inventory) = cached
+                .as_ref()
+                .filter(|cached| {
+                    checked_at.saturating_duration_since(cached.refreshed_at)
+                        < PROCESS_INVENTORY_TTL
+                })
+                .map(|cached| Arc::clone(&cached.inventory))
+            {
+                inventory
+            } else {
+                let inventory = Arc::new(refresh()?);
+                *cached = Some(CachedProcessInventory {
+                    refreshed_at: now(),
+                    inventory: Arc::clone(&inventory),
+                });
+                inventory
+            }
+        };
+        Ok(self.project_process_snapshot(panes, &inventory))
+    }
+
+    fn refresh_process_inventory(&self) -> Result<ProcessInventory> {
         let output = Command::new("ps")
             .args(["-axww", "-o", PROCESS_COLUMNS])
             .output()
@@ -292,20 +350,6 @@ impl Tmux {
             .into_iter()
             .filter(|process| process.uid == unsafe { libc::geteuid() })
             .collect::<Vec<_>>();
-        let mut pane_descriptions = HashMap::new();
-        let mut pane_groups = HashMap::new();
-        let mut pane_pids = HashMap::new();
-        let mut tmux_process_groups = HashSet::new();
-        for pane in panes {
-            if let Some((process_group, description, pids)) =
-                foreground_job(pane.pane_pid, &processes)
-            {
-                tmux_process_groups.insert(process_group);
-                pane_groups.insert(pane.pane_id.clone(), process_group);
-                pane_pids.insert(pane.pane_id.clone(), pids);
-                pane_descriptions.insert(pane.pane_id.clone(), description);
-            }
-        }
         let socket_pids = processes
             .iter()
             .filter(|process| {
@@ -314,7 +358,7 @@ impl Tmux {
             .map(|process| process.pid)
             .collect::<Vec<_>>();
         let tcp_connections = self.process_tcp_connections(&socket_pids);
-        let parents = processes
+        let parent_pids = processes
             .iter()
             .map(|process| (process.pid, process.parent_pid))
             .collect::<HashMap<_, _>>();
@@ -331,7 +375,37 @@ impl Tmux {
             })
             .collect::<HashMap<_, _>>();
         let ssh_connections =
-            unambiguous_ssh_connections(&processes, &parents, &sshd_pids, &sshd_connections);
+            unambiguous_ssh_connections(&processes, &parent_pids, &sshd_pids, &sshd_connections);
+        Ok(ProcessInventory {
+            processes,
+            process_started_at_ms,
+            tcp_connections,
+            parent_pids,
+            ssh_connections,
+        })
+    }
+
+    fn project_process_snapshot(
+        &self,
+        panes: &[Pane],
+        inventory: &ProcessInventory,
+    ) -> ProcessSnapshot {
+        let processes = inventory.processes.as_slice();
+        let tcp_connections = &inventory.tcp_connections;
+        let mut pane_descriptions = HashMap::new();
+        let mut pane_groups = HashMap::new();
+        let mut pane_pids = HashMap::new();
+        let mut tmux_process_groups = HashSet::new();
+        for pane in panes {
+            if let Some((process_group, description, pids)) =
+                foreground_job(pane.pane_pid, processes)
+            {
+                tmux_process_groups.insert(process_group);
+                pane_groups.insert(pane.pane_id.clone(), process_group);
+                pane_pids.insert(pane.pane_id.clone(), pids);
+                pane_descriptions.insert(pane.pane_id.clone(), description);
+            }
+        }
         let mut ssh_transports = Vec::new();
         for pane in panes.iter().filter(|pane| !pane.dead && !pane.is_agent_ui) {
             let mut found_ssh = false;
@@ -378,7 +452,7 @@ impl Tmux {
                 .then_with(|| left.target.pane_index.cmp(&right.target.pane_index))
         });
         ssh_transports.dedup();
-        Ok(ProcessSnapshot {
+        ProcessSnapshot {
             panes: pane_descriptions,
             pane_groups,
             pane_pids,
@@ -386,17 +460,17 @@ impl Tmux {
                 .iter()
                 .map(|process| (process.pid, process.args.clone()))
                 .collect(),
-            process_started_at_ms,
+            process_started_at_ms: inventory.process_started_at_ms.clone(),
             live_pids: processes.iter().map(|process| process.pid).collect(),
             terminals: foreground_terminal_jobs(
-                &processes,
+                processes,
                 &tmux_process_groups,
-                &tmux_pane_terminals(panes, &processes),
+                &tmux_pane_terminals(panes, processes),
             ),
-            parent_pids: parents,
-            ssh_connections,
+            parent_pids: inventory.parent_pids.clone(),
+            ssh_connections: inventory.ssh_connections.clone(),
             ssh_transports,
-        })
+        }
     }
 
     pub fn capture_visible_batch(&self, pane_ids: &[String]) -> HashMap<String, Result<String>> {
@@ -1482,6 +1556,115 @@ mod tests {
 
         assert_eq!(process.terminal.as_deref(), Some("ttys003"));
         assert_eq!(process.args, "/usr/bin/codex --model smart");
+    }
+
+    #[test]
+    fn process_inventory_cache_refreshes_after_one_second_and_reprojects_panes() {
+        fn process(pid: u32, process_group: u32, foreground_group: u32, args: &str) -> Process {
+            Process {
+                uid: unsafe { libc::geteuid() },
+                pid,
+                parent_pid: 1,
+                process_group,
+                foreground_group: Some(foreground_group),
+                terminal: None,
+                args: args.into(),
+            }
+        }
+
+        fn inventory() -> ProcessInventory {
+            ProcessInventory {
+                processes: vec![
+                    process(100, 100, 200, "shell"),
+                    process(200, 200, 200, "codex --model smart"),
+                    process(300, 300, 400, "shell"),
+                    process(400, 400, 400, "claude --model fast"),
+                ],
+                process_started_at_ms: HashMap::new(),
+                tcp_connections: HashMap::new(),
+                parent_pids: HashMap::new(),
+                ssh_connections: HashMap::new(),
+            }
+        }
+
+        let tmux = Tmux::new(&Config::default());
+        let base = std::time::Instant::now();
+        let moments = std::cell::RefCell::new(std::collections::VecDeque::from([
+            base,
+            base + std::time::Duration::from_millis(750),
+            base + std::time::Duration::from_millis(900),
+            base + std::time::Duration::from_millis(1_750),
+            base + std::time::Duration::from_millis(2_500),
+        ]));
+        let mut now = || moments.borrow_mut().pop_front().unwrap();
+        let refreshes = std::cell::Cell::new(0);
+        let mut current_pane = pane("%1", "main", "agent");
+        current_pane.pane_pid = 100;
+
+        let first = tmux
+            .process_snapshot_with(&[current_pane.clone()], &mut now, || {
+                refreshes.set(refreshes.get() + 1);
+                Ok(inventory())
+            })
+            .unwrap();
+        assert_eq!(first.panes["%1"], "codex --model smart");
+        assert_eq!(refreshes.get(), 1);
+
+        current_pane.pane_pid = 300;
+        let cached = tmux
+            .process_snapshot_with(&[current_pane.clone()], &mut now, || {
+                panic!("inventory refreshed inside its one-second lifetime")
+            })
+            .unwrap();
+        assert_eq!(cached.panes["%1"], "claude --model fast");
+        assert_eq!(refreshes.get(), 1);
+
+        let refreshed = tmux
+            .process_snapshot_with(&[current_pane], &mut now, || {
+                refreshes.set(refreshes.get() + 1);
+                Ok(inventory())
+            })
+            .unwrap();
+        assert_eq!(refreshed.panes["%1"], "claude --model fast");
+        assert_eq!(refreshes.get(), 2);
+        assert!(moments.borrow().is_empty());
+    }
+
+    #[test]
+    fn expired_process_inventory_refresh_error_is_not_hidden_by_stale_data() {
+        fn empty_inventory() -> ProcessInventory {
+            ProcessInventory {
+                processes: Vec::new(),
+                process_started_at_ms: HashMap::new(),
+                tcp_connections: HashMap::new(),
+                parent_pids: HashMap::new(),
+                ssh_connections: HashMap::new(),
+            }
+        }
+
+        let tmux = Tmux::new(&Config::default());
+        let base = Instant::now();
+        let moments = std::cell::RefCell::new(std::collections::VecDeque::from([
+            base,
+            base,
+            base + Duration::from_secs(1),
+            base + Duration::from_millis(1_001),
+            base + Duration::from_millis(1_001),
+        ]));
+        let mut now = || moments.borrow_mut().pop_front().unwrap();
+        tmux.process_snapshot_with(&[], &mut now, || Ok(empty_inventory()))
+            .unwrap();
+
+        let error = tmux
+            .process_snapshot_with(&[], &mut now, || {
+                Err(anyhow::anyhow!("process inventory failed"))
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "process inventory failed");
+
+        tmux.process_snapshot_with(&[], &mut now, || Ok(empty_inventory()))
+            .unwrap();
+        assert!(moments.borrow().is_empty());
     }
 
     #[cfg(target_os = "macos")]
