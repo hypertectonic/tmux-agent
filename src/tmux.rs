@@ -12,9 +12,9 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(target_os = "macos")]
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_os = "macos")]
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SEPARATOR: char = '\u{1f}';
@@ -143,6 +143,33 @@ struct TcpSocket {
 pub struct Tmux {
     args: Vec<String>,
     host_aliases: HashMap<String, String>,
+    #[cfg(target_os = "macos")]
+    terminal_names: Arc<MacosTerminalNames>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct MacosTerminalNames {
+    names: Mutex<HashMap<String, Option<String>>>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosTerminalNames {
+    fn resolve_with<F>(&self, value: &str, lookup: F) -> Option<String>
+    where
+        F: FnOnce(libc::dev_t) -> Option<String>,
+    {
+        let mut names = self
+            .names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(name) = names.get(value) {
+            return name.clone();
+        }
+        let name = resolve_macos_terminal_with(value, lookup);
+        names.insert(value.to_string(), name.clone());
+        name
+    }
 }
 
 #[derive(Debug)]
@@ -187,6 +214,8 @@ impl Tmux {
         Self {
             args: config.tmux_args.clone(),
             host_aliases: configured_host_aliases(config),
+            #[cfg(target_os = "macos")]
+            terminal_names: Arc::new(MacosTerminalNames::default()),
         }
     }
 
@@ -255,7 +284,11 @@ impl Tmux {
             .lines()
             .filter_map(parse_process_start)
             .collect::<HashMap<_, _>>();
-        let processes = parse_processes(&process_output)
+        #[cfg(target_os = "macos")]
+        let processes = parse_processes(&process_output, &self.terminal_names);
+        #[cfg(not(target_os = "macos"))]
+        let processes = parse_processes(&process_output);
+        let processes = processes
             .into_iter()
             .filter(|process| process.uid == unsafe { libc::geteuid() })
             .collect::<Vec<_>>();
@@ -794,31 +827,36 @@ fn pane_is_visible(window_active: &str, session_attached: &str) -> bool {
     window_active == "1" && session_attached != "0"
 }
 
-fn parse_processes(output: &str) -> Vec<Process> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut terminal_names = HashMap::<String, Option<String>>::new();
-        output
-            .lines()
-            .filter_map(|line| {
-                parse_process_with_terminal_resolver(line, |terminal| {
-                    if let Some(name) = terminal_names.get(terminal) {
-                        return name.clone();
-                    }
-                    let name = resolve_macos_terminal(terminal);
-                    terminal_names.insert(terminal.to_string(), name.clone());
-                    name
-                })
+#[cfg(target_os = "macos")]
+fn parse_processes(output: &str, terminal_names: &MacosTerminalNames) -> Vec<Process> {
+    parse_macos_processes_with(output, terminal_names, macos_device_name)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_processes_with<F>(
+    output: &str,
+    terminal_names: &MacosTerminalNames,
+    mut lookup: F,
+) -> Vec<Process>
+where
+    F: FnMut(libc::dev_t) -> Option<String>,
+{
+    output
+        .lines()
+        .filter_map(|line| {
+            parse_process_with_terminal_resolver(line, |terminal| {
+                terminal_names.resolve_with(terminal, &mut lookup)
             })
-            .collect()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        output
-            .lines()
-            .filter_map(|line| parse_process_with_terminal_resolver(line, named_terminal))
-            .collect()
-    }
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parse_processes(output: &str) -> Vec<Process> {
+    output
+        .lines()
+        .filter_map(|line| parse_process_with_terminal_resolver(line, named_terminal))
+        .collect()
 }
 
 fn parse_process_with_terminal_resolver<F>(line: &str, resolve_terminal: F) -> Option<Process>
@@ -853,11 +891,6 @@ where
 #[cfg(any(not(target_os = "macos"), test))]
 fn named_terminal(value: &str) -> Option<String> {
     (!matches!(value, "??" | "?")).then(|| value.to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn resolve_macos_terminal(value: &str) -> Option<String> {
-    resolve_macos_terminal_with(value, macos_device_name)
 }
 
 #[cfg(target_os = "macos")]
@@ -1470,6 +1503,30 @@ mod tests {
         assert_eq!(terminal.as_deref(), Some("ttys003"));
         assert!(resolve_macos_terminal_with("??", |_| unreachable!()).is_none());
         assert!(resolve_macos_terminal_with("16/not-a-number", |_| unreachable!()).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_terminal_names_persist_across_process_snapshots() {
+        let cache = MacosTerminalNames::default();
+        let snapshots = [
+            "502 123 10 123 123 16/3 00:01 codex\n502 124 10 124 124 16/4 00:01 shell",
+            "502 223 10 223 223 16/3 00:01 codex\n502 224 10 224 224 16/4 00:01 shell",
+        ];
+        let mut lookups = Vec::new();
+
+        let parsed = snapshots.map(|snapshot| {
+            parse_macos_processes_with(snapshot, &cache, |device| {
+                lookups.push((libc::major(device), libc::minor(device)));
+                (libc::minor(device) == 3).then(|| "ttys003".into())
+            })
+        });
+
+        assert_eq!(lookups, [(16, 3), (16, 4)]);
+        for snapshot in parsed {
+            assert_eq!(snapshot[0].terminal.as_deref(), Some("ttys003"));
+            assert_eq!(snapshot[1].terminal, None);
+        }
     }
 
     #[test]
