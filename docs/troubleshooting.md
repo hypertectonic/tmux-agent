@@ -118,6 +118,17 @@ matching panes are rejected. A remote tmux agent is not matched to a local SSH
 pane by title alone. Use `tmux-agent explain <id-or-pane>` and `tmux-agent
 doctor` to inspect the derived target without exposing pane contents.
 
+For nested remote tmux over mosh, bind the correct local transport pane
+explicitly. Run the command on the local machine, not inside the remote tmux
+session:
+
+```sh
+tmux-agent remote bind <configured-remote> <remote-tmux-session> --pane <local-pane-id>
+```
+
+Use `tmux-agent remote bindings` to inspect current mappings and `tmux-agent
+remote unbind --pane <local-pane-id>` to remove one.
+
 ## A completion remains visible
 
 Activate the row with `Enter` or a left click, or run:

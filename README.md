@@ -243,6 +243,9 @@ tmux-agent ui [--popup]
 tmux-agent focus <id-or-pane>
 tmux-agent explain <id-or-pane>
 tmux-agent acknowledge <id-or-pane>
+tmux-agent remote bind <remote> <session> [--pane <local-pane-id>]
+tmux-agent remote unbind [--pane <local-pane-id>]
+tmux-agent remote bindings
 tmux-agent codex [args...]
 tmux-agent claude [args...]
 tmux-agent opencode [args...]
