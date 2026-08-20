@@ -1,6 +1,6 @@
 [package]
 name = "tmux-agent"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "A local-first agent activity view for tmux, with SSH federation"
 authors = ["Tecto"]

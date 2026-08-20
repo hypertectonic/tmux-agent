@@ -1,26 +1,29 @@
-tmux-agent v0.7.0 adds first-class Oh My Pi (OMP) support and a real terminal
-demo of the tmux-agent workflow.
+tmux-agent v0.8.0 reduces scanner overhead in large tmux setups, shuts down
+daemons whose tmux server has disappeared, and adds explicit focus bindings
+for nested remote tmux sessions.
 
 ## Highlights
 
-- OMP sessions are detected as a distinct provider in tmux and ordinary
-  terminals without changing Pi detection.
-- Owned-PTY OMP sessions report typed working, needs-input, idle, and done
-  states from their visible terminal surface.
-- Animated OMP activity titles are normalized to a stable task title, and OMP
-  rows use a dedicated magenta provider badge.
-- `tmux-agent omp [args...]` runs OMP inside tmux-agent's owned PTY while
-  forwarding arguments, terminal behavior, and the child exit status.
-- The README now includes a sanitized recording of a real tmux layout,
-  demonstrating search, selection, and switching between Codex and OMP.
+- Scanner work now batches pane captures, caches macOS terminal resolution,
+  and refreshes the global process inventory at most once per second.
+- Panes in displayed windows retain the normal scan cadence. Hidden-window
+  screens are reused for one second and refresh immediately when their process
+  changes.
+- In a 20-second multi-session comparison, `capture-pane`, `display-message`,
+  and wrapper command traffic fell by about 68 percent.
+- A daemon exits after three consecutive missing-server scans, removes its
+  runtime socket, and terminates its remote collectors instead of continuing
+  process discovery indefinitely.
+- `tmux-agent remote bind` maps an SSH or Mosh transport pane to a specific
+  nested remote tmux session so focus reaches the intended inner pane.
 
 ## Compatibility
 
 - No configuration or federation protocol migration is required.
-- OMP and Pi remain separate providers. Lookalike command names are not
-  classified as either provider.
-- Process-only OMP sessions in ordinary terminals remain evidence-limited
-  `unknown` unless tmux-agent owns the inner PTY screen.
+- Nested remote focus bindings are optional. Existing local and direct SSH
+  focus paths keep their current behavior.
+- Hidden windows may take up to about one second to reflect screen-only state
+  changes. Displayed windows remain on the normal scan cadence.
 - Existing standalone and TPM installations can update through the normal
   verified lifecycle.
 
@@ -46,6 +49,6 @@ Verify downloaded archives with `SHA256SUMS` before installation.
 ## Documentation
 
 See the
-[installation guide](https://github.com/hypertectonic/tmux-agent/blob/v0.7.0/docs/installation.md),
-[remote-machine guide](https://github.com/hypertectonic/tmux-agent/blob/v0.7.0/docs/remote-machines.md),
-and [security policy](https://github.com/hypertectonic/tmux-agent/blob/v0.7.0/SECURITY.md).
+[installation guide](https://github.com/hypertectonic/tmux-agent/blob/v0.8.0/docs/installation.md),
+[remote-machine guide](https://github.com/hypertectonic/tmux-agent/blob/v0.8.0/docs/remote-machines.md),
+and [security policy](https://github.com/hypertectonic/tmux-agent/blob/v0.8.0/SECURITY.md).
