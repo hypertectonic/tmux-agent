@@ -17,6 +17,13 @@ The scanner combines tmux pane metadata, foreground process groups, ordinary
 TTY process groups, and owned PTY records. Captured terminal surfaces are used
 only on the machine that owns them.
 
+The daemon refreshes the global process table and process-derived socket
+inventory at most once per second. Every scan still reads current tmux pane
+metadata, projects those panes against the latest process inventory, and
+captures candidate terminal surfaces. Process starts, exits, and SSH connection
+changes can therefore take about one second to appear, while tmux metadata and
+screen-derived state remain on the normal scan cadence.
+
 Codex, Claude, OpenCode, Grok, OMP, and Pi each have a typed detector backed by
 minimal synthetic fixtures. Detectors emit semantic state and derived evidence
 details, not the source terminal content. State stabilization prevents one

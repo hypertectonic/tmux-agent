@@ -5,15 +5,28 @@ use crate::model::{
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::env;
+#[cfg(target_os = "macos")]
+use std::ffi::CStr;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SEPARATOR: char = '\u{1f}';
 const ESCAPED_SEPARATOR: &str = r"\037";
 const UI_SELECTION_OPTION: &str = "@tmux_agent_selection";
+const PROCESS_INVENTORY_TTL: Duration = Duration::from_secs(1);
+static CAPTURE_BATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+const PROCESS_COLUMNS: &str = "uid=,pid=,ppid=,pgid=,tpgid=,tdev=,etime=,args=";
+#[cfg(not(target_os = "macos"))]
+const PROCESS_COLUMNS: &str = "uid=,pid=,ppid=,pgid=,tpgid=,tty=,etime=,args=";
+#[cfg(target_os = "macos")]
+static DEVNAME_LOCK: Mutex<()> = Mutex::new(());
 // CSI 34~ is an otherwise unused F17 key that wakes every persistent UI after
 // an explicit numeric selection without introducing polling or focus tracking.
 const UI_SELECTION_WAKE_HEX: [&str; 5] = ["1b", "5b", "33", "34", "7e"];
@@ -108,6 +121,21 @@ pub struct ProcessSnapshot {
     pub ssh_transports: Vec<SshTransport>,
 }
 
+#[derive(Debug)]
+struct ProcessInventory {
+    processes: Vec<Process>,
+    process_started_at_ms: HashMap<u32, u64>,
+    tcp_connections: HashMap<u32, Vec<TcpSocket>>,
+    parent_pids: HashMap<u32, u32>,
+    ssh_connections: HashMap<u32, SshConnection>,
+}
+
+#[derive(Debug)]
+struct CachedProcessInventory {
+    refreshed_at: Instant,
+    inventory: Arc<ProcessInventory>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TcpEndpoint {
     address: String,
@@ -130,6 +158,34 @@ struct TcpSocket {
 pub struct Tmux {
     args: Vec<String>,
     host_aliases: HashMap<String, String>,
+    process_inventory: Arc<Mutex<Option<CachedProcessInventory>>>,
+    #[cfg(target_os = "macos")]
+    terminal_names: Arc<MacosTerminalNames>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct MacosTerminalNames {
+    names: Mutex<HashMap<String, Option<String>>>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosTerminalNames {
+    fn resolve_with<F>(&self, value: &str, lookup: F) -> Option<String>
+    where
+        F: FnOnce(libc::dev_t) -> Option<String>,
+    {
+        let mut names = self
+            .names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(name) = names.get(value) {
+            return name.clone();
+        }
+        let name = resolve_macos_terminal_with(value, lookup);
+        names.insert(value.to_string(), name.clone());
+        name
+    }
 }
 
 #[derive(Debug)]
@@ -174,6 +230,9 @@ impl Tmux {
         Self {
             args: config.tmux_args.clone(),
             host_aliases: configured_host_aliases(config),
+            process_inventory: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "macos")]
+            terminal_names: Arc::new(MacosTerminalNames::default()),
         }
     }
 
@@ -230,12 +289,49 @@ impl Tmux {
     }
 
     pub fn process_snapshot(&self, panes: &[Pane]) -> Result<ProcessSnapshot> {
+        self.process_snapshot_with(panes, Instant::now, || self.refresh_process_inventory())
+    }
+
+    fn process_snapshot_with<N, F>(
+        &self,
+        panes: &[Pane],
+        mut now: N,
+        refresh: F,
+    ) -> Result<ProcessSnapshot>
+    where
+        N: FnMut() -> Instant,
+        F: FnOnce() -> Result<ProcessInventory>,
+    {
+        let inventory = {
+            let mut cached = self
+                .process_inventory
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let checked_at = now();
+            if let Some(inventory) = cached
+                .as_ref()
+                .filter(|cached| {
+                    checked_at.saturating_duration_since(cached.refreshed_at)
+                        < PROCESS_INVENTORY_TTL
+                })
+                .map(|cached| Arc::clone(&cached.inventory))
+            {
+                inventory
+            } else {
+                let inventory = Arc::new(refresh()?);
+                *cached = Some(CachedProcessInventory {
+                    refreshed_at: now(),
+                    inventory: Arc::clone(&inventory),
+                });
+                inventory
+            }
+        };
+        Ok(self.project_process_snapshot(panes, &inventory))
+    }
+
+    fn refresh_process_inventory(&self) -> Result<ProcessInventory> {
         let output = Command::new("ps")
-            .args([
-                "-axww",
-                "-o",
-                "uid=,pid=,ppid=,pgid=,tpgid=,tty=,etime=,args=",
-            ])
+            .args(["-axww", "-o", PROCESS_COLUMNS])
             .output()
             .context("run ps for foreground process discovery")?;
         if !output.status.success() {
@@ -246,25 +342,14 @@ impl Tmux {
             .lines()
             .filter_map(parse_process_start)
             .collect::<HashMap<_, _>>();
-        let processes = process_output
-            .lines()
-            .filter_map(parse_process)
+        #[cfg(target_os = "macos")]
+        let processes = parse_processes(&process_output, &self.terminal_names);
+        #[cfg(not(target_os = "macos"))]
+        let processes = parse_processes(&process_output);
+        let processes = processes
+            .into_iter()
             .filter(|process| process.uid == unsafe { libc::geteuid() })
             .collect::<Vec<_>>();
-        let mut pane_descriptions = HashMap::new();
-        let mut pane_groups = HashMap::new();
-        let mut pane_pids = HashMap::new();
-        let mut tmux_process_groups = HashSet::new();
-        for pane in panes {
-            if let Some((process_group, description, pids)) =
-                foreground_job(pane.pane_pid, &processes)
-            {
-                tmux_process_groups.insert(process_group);
-                pane_groups.insert(pane.pane_id.clone(), process_group);
-                pane_pids.insert(pane.pane_id.clone(), pids);
-                pane_descriptions.insert(pane.pane_id.clone(), description);
-            }
-        }
         let socket_pids = processes
             .iter()
             .filter(|process| {
@@ -273,7 +358,7 @@ impl Tmux {
             .map(|process| process.pid)
             .collect::<Vec<_>>();
         let tcp_connections = self.process_tcp_connections(&socket_pids);
-        let parents = processes
+        let parent_pids = processes
             .iter()
             .map(|process| (process.pid, process.parent_pid))
             .collect::<HashMap<_, _>>();
@@ -290,7 +375,37 @@ impl Tmux {
             })
             .collect::<HashMap<_, _>>();
         let ssh_connections =
-            unambiguous_ssh_connections(&processes, &parents, &sshd_pids, &sshd_connections);
+            unambiguous_ssh_connections(&processes, &parent_pids, &sshd_pids, &sshd_connections);
+        Ok(ProcessInventory {
+            processes,
+            process_started_at_ms,
+            tcp_connections,
+            parent_pids,
+            ssh_connections,
+        })
+    }
+
+    fn project_process_snapshot(
+        &self,
+        panes: &[Pane],
+        inventory: &ProcessInventory,
+    ) -> ProcessSnapshot {
+        let processes = inventory.processes.as_slice();
+        let tcp_connections = &inventory.tcp_connections;
+        let mut pane_descriptions = HashMap::new();
+        let mut pane_groups = HashMap::new();
+        let mut pane_pids = HashMap::new();
+        let mut tmux_process_groups = HashSet::new();
+        for pane in panes {
+            if let Some((process_group, description, pids)) =
+                foreground_job(pane.pane_pid, processes)
+            {
+                tmux_process_groups.insert(process_group);
+                pane_groups.insert(pane.pane_id.clone(), process_group);
+                pane_pids.insert(pane.pane_id.clone(), pids);
+                pane_descriptions.insert(pane.pane_id.clone(), description);
+            }
+        }
         let mut ssh_transports = Vec::new();
         for pane in panes.iter().filter(|pane| !pane.dead && !pane.is_agent_ui) {
             let mut found_ssh = false;
@@ -337,7 +452,7 @@ impl Tmux {
                 .then_with(|| left.target.pane_index.cmp(&right.target.pane_index))
         });
         ssh_transports.dedup();
-        Ok(ProcessSnapshot {
+        ProcessSnapshot {
             panes: pane_descriptions,
             pane_groups,
             pane_pids,
@@ -345,21 +460,49 @@ impl Tmux {
                 .iter()
                 .map(|process| (process.pid, process.args.clone()))
                 .collect(),
-            process_started_at_ms,
+            process_started_at_ms: inventory.process_started_at_ms.clone(),
             live_pids: processes.iter().map(|process| process.pid).collect(),
             terminals: foreground_terminal_jobs(
-                &processes,
+                processes,
                 &tmux_process_groups,
-                &tmux_pane_terminals(panes, &processes),
+                &tmux_pane_terminals(panes, processes),
             ),
-            parent_pids: parents,
-            ssh_connections,
+            parent_pids: inventory.parent_pids.clone(),
+            ssh_connections: inventory.ssh_connections.clone(),
             ssh_transports,
-        })
+        }
     }
 
-    pub fn capture_visible(&self, pane_id: &str) -> Result<String> {
-        self.run(&visible_capture_args(pane_id))
+    pub fn capture_visible_batch(&self, pane_ids: &[String]) -> HashMap<String, Result<String>> {
+        if pane_ids.is_empty() {
+            return HashMap::new();
+        }
+        let framing = CaptureBatchFraming::fresh();
+        let command_args = capture_batch_args(pane_ids, &framing);
+        let mut command = Command::new("tmux");
+        command.args(&self.args).args(&command_args);
+        match command.output() {
+            Ok(output) => parse_capture_batch(
+                pane_ids,
+                &framing,
+                &String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            ),
+            Err(error) => {
+                let message = error.to_string();
+                pane_ids
+                    .iter()
+                    .map(|pane_id| {
+                        (
+                            pane_id.clone(),
+                            Err(anyhow::anyhow!(
+                                "run tmux capture-pane batch for {pane_id}: {message}"
+                            )),
+                        )
+                    })
+                    .collect()
+            }
+        }
     }
 
     pub fn process_working_directories(&self, pids: &[u32]) -> HashMap<u32, String> {
@@ -625,8 +768,84 @@ fn normalized_socket_path(path: &Path) -> PathBuf {
     })
 }
 
-fn visible_capture_args(pane_id: &str) -> [&str; 4] {
-    ["capture-pane", "-p", "-t", pane_id]
+struct CaptureBatchFraming {
+    nonce: String,
+}
+
+impl CaptureBatchFraming {
+    fn fresh() -> Self {
+        let sequence = CAPTURE_BATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        Self {
+            nonce: format!("{:x}-{:x}-{sequence:x}", std::process::id(), timestamp),
+        }
+    }
+
+    fn begin(&self, index: usize) -> String {
+        format!("__TMUX_AGENT_CAPTURE_{}_{}_BEGIN__", self.nonce, index)
+    }
+
+    fn end(&self, index: usize) -> String {
+        format!("__TMUX_AGENT_CAPTURE_{}_{}_END__", self.nonce, index)
+    }
+}
+
+fn capture_batch_args(pane_ids: &[String], framing: &CaptureBatchFraming) -> Vec<String> {
+    let mut args = Vec::with_capacity(pane_ids.len() * 16);
+    for (index, pane_id) in pane_ids.iter().enumerate() {
+        if !args.is_empty() {
+            args.push(";".into());
+        }
+        args.extend([
+            "display-message".into(),
+            "-p".into(),
+            framing.begin(index),
+            ";".into(),
+            "if-shell".into(),
+            "-F".into(),
+            "1".into(),
+            format!("capture-pane -p -t {pane_id}"),
+            ";".into(),
+            "display-message".into(),
+            "-p".into(),
+            framing.end(index),
+        ]);
+    }
+    args
+}
+
+fn parse_capture_batch(
+    pane_ids: &[String],
+    framing: &CaptureBatchFraming,
+    output: &str,
+    error: &str,
+) -> HashMap<String, Result<String>> {
+    let mut captures = HashMap::new();
+    let mut remaining = output;
+    for (index, pane_id) in pane_ids.iter().enumerate() {
+        let begin = format!("{}\n", framing.begin(index));
+        let end = format!("{}\n", framing.end(index));
+        let captured = remaining.find(&begin).and_then(|begin_at| {
+            let after_begin = &remaining[begin_at + begin.len()..];
+            let end_at = after_begin.find(&end)?;
+            let screen = &after_begin[..end_at];
+            remaining = &after_begin[end_at + end.len()..];
+            (!screen.is_empty()).then(|| screen.to_string())
+        });
+        let result = captured.ok_or_else(|| {
+            let detail = if error.is_empty() {
+                "capture produced no framed output"
+            } else {
+                error
+            };
+            anyhow::anyhow!("tmux capture-pane failed for {pane_id}: {detail}")
+        });
+        captures.insert(pane_id.clone(), result);
+    }
+    captures
 }
 
 fn parse_pane_visibility(line: &str, pane_id: &str) -> Result<bool> {
@@ -682,7 +901,42 @@ fn pane_is_visible(window_active: &str, session_attached: &str) -> bool {
     window_active == "1" && session_attached != "0"
 }
 
-fn parse_process(line: &str) -> Option<Process> {
+#[cfg(target_os = "macos")]
+fn parse_processes(output: &str, terminal_names: &MacosTerminalNames) -> Vec<Process> {
+    parse_macos_processes_with(output, terminal_names, macos_device_name)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_processes_with<F>(
+    output: &str,
+    terminal_names: &MacosTerminalNames,
+    mut lookup: F,
+) -> Vec<Process>
+where
+    F: FnMut(libc::dev_t) -> Option<String>,
+{
+    output
+        .lines()
+        .filter_map(|line| {
+            parse_process_with_terminal_resolver(line, |terminal| {
+                terminal_names.resolve_with(terminal, &mut lookup)
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parse_processes(output: &str) -> Vec<Process> {
+    output
+        .lines()
+        .filter_map(|line| parse_process_with_terminal_resolver(line, named_terminal))
+        .collect()
+}
+
+fn parse_process_with_terminal_resolver<F>(line: &str, resolve_terminal: F) -> Option<Process>
+where
+    F: FnOnce(&str) -> Option<String>,
+{
     let mut fields = line.split_whitespace();
     let uid = fields.next()?.parse().ok()?;
     let pid = fields.next()?.parse().ok()?;
@@ -694,10 +948,7 @@ fn parse_process(line: &str) -> Option<Process> {
         .ok()
         .and_then(|value| u32::try_from(value).ok())
         .filter(|value| *value > 0);
-    let terminal = fields
-        .next()
-        .filter(|value| !matches!(*value, "??" | "?"))
-        .map(str::to_string);
+    let terminal = resolve_terminal(fields.next()?);
     fields.next()?;
     let args = fields.collect::<Vec<_>>().join(" ");
     Some(Process {
@@ -709,6 +960,40 @@ fn parse_process(line: &str) -> Option<Process> {
         terminal,
         args,
     })
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn named_terminal(value: &str) -> Option<String> {
+    (!matches!(value, "??" | "?")).then(|| value.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_terminal_with<F>(value: &str, lookup: F) -> Option<String>
+where
+    F: FnOnce(libc::dev_t) -> Option<String>,
+{
+    let (major, minor) = value.split_once('/')?;
+    let major = major.parse::<i32>().ok()?;
+    let minor = minor.parse::<i32>().ok()?;
+    if major < 0 || minor < 0 {
+        return None;
+    }
+    lookup(libc::makedev(major, minor))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_device_name(device: libc::dev_t) -> Option<String> {
+    let _guard = DEVNAME_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let name = unsafe { libc::devname(device, libc::S_IFCHR) };
+    if name.is_null() {
+        return None;
+    }
+    unsafe { CStr::from_ptr(name) }
+        .to_str()
+        .ok()
+        .map(str::to_string)
 }
 
 fn parse_process_start(line: &str) -> Option<(u32, u64)> {
@@ -1241,9 +1526,11 @@ mod tests {
 
     #[test]
     fn parses_ps_rows_with_full_arguments() {
-        let process =
-            parse_process("  502 123 10 123 123 ttys003 01:02 /usr/bin/codex --model smart")
-                .unwrap();
+        let process = parse_process_with_terminal_resolver(
+            "  502 123 10 123 123 ttys003 01:02 /usr/bin/codex --model smart",
+            named_terminal,
+        )
+        .unwrap();
         assert_eq!(process.uid, 502);
         assert_eq!(process.pid, 123);
         assert_eq!(process.parent_pid, 10);
@@ -1254,6 +1541,175 @@ mod tests {
         assert_eq!(parse_elapsed_ms("01:02"), Some(62_000));
         assert_eq!(parse_elapsed_ms("02:03:04"), Some(7_384_000));
         assert_eq!(parse_elapsed_ms("1-02:03:04"), Some(93_784_000));
+    }
+
+    #[test]
+    fn process_parser_applies_an_independent_terminal_fixture() {
+        let process = parse_process_with_terminal_resolver(
+            "  502 123 10 123 123 16/3 01:02 /usr/bin/codex --model smart",
+            |terminal| {
+                assert_eq!(terminal, "16/3");
+                Some("ttys003".into())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(process.terminal.as_deref(), Some("ttys003"));
+        assert_eq!(process.args, "/usr/bin/codex --model smart");
+    }
+
+    #[test]
+    fn process_inventory_cache_refreshes_after_one_second_and_reprojects_panes() {
+        fn process(pid: u32, process_group: u32, foreground_group: u32, args: &str) -> Process {
+            Process {
+                uid: unsafe { libc::geteuid() },
+                pid,
+                parent_pid: 1,
+                process_group,
+                foreground_group: Some(foreground_group),
+                terminal: None,
+                args: args.into(),
+            }
+        }
+
+        fn inventory() -> ProcessInventory {
+            ProcessInventory {
+                processes: vec![
+                    process(100, 100, 200, "shell"),
+                    process(200, 200, 200, "codex --model smart"),
+                    process(300, 300, 400, "shell"),
+                    process(400, 400, 400, "claude --model fast"),
+                ],
+                process_started_at_ms: HashMap::new(),
+                tcp_connections: HashMap::new(),
+                parent_pids: HashMap::new(),
+                ssh_connections: HashMap::new(),
+            }
+        }
+
+        let tmux = Tmux::new(&Config::default());
+        let base = std::time::Instant::now();
+        let moments = std::cell::RefCell::new(std::collections::VecDeque::from([
+            base,
+            base + std::time::Duration::from_millis(750),
+            base + std::time::Duration::from_millis(900),
+            base + std::time::Duration::from_millis(1_750),
+            base + std::time::Duration::from_millis(2_500),
+        ]));
+        let mut now = || moments.borrow_mut().pop_front().unwrap();
+        let refreshes = std::cell::Cell::new(0);
+        let mut current_pane = pane("%1", "main", "agent");
+        current_pane.pane_pid = 100;
+
+        let first = tmux
+            .process_snapshot_with(&[current_pane.clone()], &mut now, || {
+                refreshes.set(refreshes.get() + 1);
+                Ok(inventory())
+            })
+            .unwrap();
+        assert_eq!(first.panes["%1"], "codex --model smart");
+        assert_eq!(refreshes.get(), 1);
+
+        current_pane.pane_pid = 300;
+        let cached = tmux
+            .process_snapshot_with(&[current_pane.clone()], &mut now, || {
+                panic!("inventory refreshed inside its one-second lifetime")
+            })
+            .unwrap();
+        assert_eq!(cached.panes["%1"], "claude --model fast");
+        assert_eq!(refreshes.get(), 1);
+
+        let refreshed = tmux
+            .process_snapshot_with(&[current_pane], &mut now, || {
+                refreshes.set(refreshes.get() + 1);
+                Ok(inventory())
+            })
+            .unwrap();
+        assert_eq!(refreshed.panes["%1"], "claude --model fast");
+        assert_eq!(refreshes.get(), 2);
+        assert!(moments.borrow().is_empty());
+    }
+
+    #[test]
+    fn expired_process_inventory_refresh_error_is_not_hidden_by_stale_data() {
+        fn empty_inventory() -> ProcessInventory {
+            ProcessInventory {
+                processes: Vec::new(),
+                process_started_at_ms: HashMap::new(),
+                tcp_connections: HashMap::new(),
+                parent_pids: HashMap::new(),
+                ssh_connections: HashMap::new(),
+            }
+        }
+
+        let tmux = Tmux::new(&Config::default());
+        let base = Instant::now();
+        let moments = std::cell::RefCell::new(std::collections::VecDeque::from([
+            base,
+            base,
+            base + Duration::from_secs(1),
+            base + Duration::from_millis(1_001),
+            base + Duration::from_millis(1_001),
+        ]));
+        let mut now = || moments.borrow_mut().pop_front().unwrap();
+        tmux.process_snapshot_with(&[], &mut now, || Ok(empty_inventory()))
+            .unwrap();
+
+        let error = tmux
+            .process_snapshot_with(&[], &mut now, || {
+                Err(anyhow::anyhow!("process inventory failed"))
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "process inventory failed");
+
+        tmux.process_snapshot_with(&[], &mut now, || Ok(empty_inventory()))
+            .unwrap();
+        assert!(moments.borrow().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_process_columns_request_numeric_terminal_devices() {
+        assert!(PROCESS_COLUMNS.contains("tdev="));
+        assert!(!PROCESS_COLUMNS.contains("tty="));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_terminal_device_fixture_maps_back_to_the_tty_name() {
+        let terminal = resolve_macos_terminal_with("16/3", |device| {
+            assert_eq!(libc::major(device), 16);
+            assert_eq!(libc::minor(device), 3);
+            Some("ttys003".into())
+        });
+
+        assert_eq!(terminal.as_deref(), Some("ttys003"));
+        assert!(resolve_macos_terminal_with("??", |_| unreachable!()).is_none());
+        assert!(resolve_macos_terminal_with("16/not-a-number", |_| unreachable!()).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_terminal_names_persist_across_process_snapshots() {
+        let cache = MacosTerminalNames::default();
+        let snapshots = [
+            "502 123 10 123 123 16/3 00:01 codex\n502 124 10 124 124 16/4 00:01 shell",
+            "502 223 10 223 223 16/3 00:01 codex\n502 224 10 224 224 16/4 00:01 shell",
+        ];
+        let mut lookups = Vec::new();
+
+        let parsed = snapshots.map(|snapshot| {
+            parse_macos_processes_with(snapshot, &cache, |device| {
+                lookups.push((libc::major(device), libc::minor(device)));
+                (libc::minor(device) == 3).then(|| "ttys003".into())
+            })
+        });
+
+        assert_eq!(lookups, [(16, 3), (16, 4)]);
+        for snapshot in parsed {
+            assert_eq!(snapshot[0].terminal.as_deref(), Some("ttys003"));
+            assert_eq!(snapshot[1].terminal, None);
+        }
     }
 
     #[test]
@@ -1467,10 +1923,117 @@ mod tests {
 
     #[test]
     fn capture_uses_only_the_live_visible_pane() {
-        let args = visible_capture_args("%42");
-        assert_eq!(args, ["capture-pane", "-p", "-t", "%42"]);
-        assert!(!args.contains(&"-S"));
-        assert!(!args.contains(&"-M"));
+        let framing = CaptureBatchFraming {
+            nonce: "fixture".into(),
+        };
+        let args = capture_batch_args(&["%42".into()], &framing);
+        let capture = args
+            .iter()
+            .find(|arg| arg.starts_with("capture-pane"))
+            .unwrap();
+        assert_eq!(capture, "capture-pane -p -t %42");
+        assert!(!capture.contains(" -S"));
+        assert!(!capture.contains(" -M"));
+    }
+
+    #[test]
+    fn batched_capture_preserves_successes_when_one_pane_disappears() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket_name = format!("tmux-agent-capture-{}-{nonce}", std::process::id());
+        let config = Config {
+            tmux_args: vec!["-L".into(), socket_name.clone()],
+            ..Config::default()
+        };
+        let started = Command::new("tmux")
+            .args([
+                "-L",
+                &socket_name,
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "capture-test",
+                "printf 'first-pane\\n'; sleep 30",
+            ])
+            .status()
+            .unwrap();
+        assert!(started.success());
+        let split = Command::new("tmux")
+            .args([
+                "-L",
+                &socket_name,
+                "split-window",
+                "-d",
+                "-t",
+                "capture-test",
+                "printf 'second-pane\\n'; sleep 30",
+            ])
+            .status()
+            .unwrap();
+        assert!(split.success());
+        let pane_output = Command::new("tmux")
+            .args([
+                "-L",
+                &socket_name,
+                "list-panes",
+                "-t",
+                "capture-test",
+                "-F",
+                "#{pane_id}",
+            ])
+            .output()
+            .unwrap();
+        assert!(pane_output.status.success());
+        let pane_ids = String::from_utf8(pane_output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(pane_ids.len(), 2);
+        for (pane_id, expected) in pane_ids.iter().zip(["first-pane", "second-pane"]) {
+            let ready = (0..100).any(|_| {
+                let output = Command::new("tmux")
+                    .args(["-L", &socket_name, "capture-pane", "-p", "-t", pane_id])
+                    .output()
+                    .unwrap();
+                if String::from_utf8_lossy(&output.stdout).contains(expected) {
+                    true
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    false
+                }
+            });
+            assert!(ready, "pane {pane_id} did not render {expected}");
+        }
+        let missing = "%999999".to_string();
+        let requested = vec![pane_ids[0].clone(), missing.clone(), pane_ids[1].clone()];
+
+        let captures = Tmux::new(&config).capture_visible_batch(&requested);
+
+        let _ = Command::new("tmux")
+            .args(["-L", &socket_name, "kill-server"])
+            .status();
+        assert!(
+            captures[&pane_ids[0]]
+                .as_ref()
+                .unwrap()
+                .contains("first-pane"),
+            "first capture was {:?}",
+            captures[&pane_ids[0]]
+        );
+        assert!(
+            captures[&pane_ids[1]]
+                .as_ref()
+                .unwrap()
+                .contains("second-pane"),
+            "second capture was {:?}",
+            captures[&pane_ids[1]]
+        );
+        assert!(captures[&missing].is_err());
     }
 
     #[test]
