@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::model::{
-    AgentRecord, SshConnection, SshTransport, TmuxTarget, trim_braille_activity_prefix,
+    AgentRecord, SshConnection, SshTransport, TmuxTarget, terminal_safe,
+    trim_braille_activity_prefix,
 };
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
@@ -19,6 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const SEPARATOR: char = '\u{1f}';
 const ESCAPED_SEPARATOR: &str = r"\037";
 const UI_SELECTION_OPTION: &str = "@tmux_agent_selection";
+const REMOTE_HOST_OPTION: &str = "@tmux_agent_remote_host";
+const REMOTE_SESSION_OPTION: &str = "@tmux_agent_remote_session";
 const PROCESS_INVENTORY_TTL: Duration = Duration::from_secs(1);
 static CAPTURE_BATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
@@ -85,6 +88,13 @@ pub struct Pane {
     pub is_agent_ui: bool,
     pub mirror_host: Option<String>,
     pub mirror_session: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePaneBinding {
+    pub pane_id: String,
+    pub remote: String,
+    pub session: String,
 }
 
 #[derive(Debug, Clone)]
@@ -192,10 +202,20 @@ impl MacosTerminalNames {
 struct FocusTargetMissing {
     alias: String,
     title: String,
+    session: Option<String>,
 }
 
 impl fmt::Display for FocusTargetMissing {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(session) = &self.session {
+            let alias = terminal_safe(&self.alias);
+            let session = terminal_safe(session);
+            return write!(
+                formatter,
+                "no local pane is bound to {}/{}; run tmux-agent remote bind {} {} --pane <local-pane-id> on this machine",
+                alias, session, alias, session
+            );
+        }
         write!(
             formatter,
             "no unique local SSH pane for {} with title {:?}",
@@ -571,6 +591,7 @@ impl Tmux {
             return Err(FocusTargetMissing {
                 alias: alias.clone(),
                 title: record.title.clone(),
+                session: record.is_tmux().then(|| record.session_name.clone()),
             }
             .into());
         }
@@ -597,6 +618,90 @@ impl Tmux {
     pub fn set_ui_marker(&self, pane_id: &str, enabled: bool) -> Result<()> {
         let value = if enabled { "1" } else { "" };
         self.status(&["set-option", "-p", "-t", pane_id, "@tmux_agent_ui", value])
+    }
+
+    pub fn bind_remote_pane(
+        &self,
+        target: Option<&str>,
+        remote: &str,
+        session: &str,
+    ) -> Result<String> {
+        let pane = self.binding_pane(target, false)?;
+        self.status(&[
+            "set-option",
+            "-p",
+            "-t",
+            &pane.pane_id,
+            REMOTE_HOST_OPTION,
+            remote,
+        ])?;
+        self.status(&[
+            "set-option",
+            "-p",
+            "-t",
+            &pane.pane_id,
+            REMOTE_SESSION_OPTION,
+            session,
+        ])?;
+        Ok(pane.pane_id)
+    }
+
+    pub fn unbind_remote_pane(&self, target: Option<&str>) -> Result<String> {
+        let pane = self.binding_pane(target, true)?;
+        self.status(&[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            &pane.pane_id,
+            REMOTE_HOST_OPTION,
+        ])?;
+        self.status(&[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            &pane.pane_id,
+            REMOTE_SESSION_OPTION,
+        ])?;
+        Ok(pane.pane_id)
+    }
+
+    pub fn remote_pane_bindings(&self) -> Result<Vec<RemotePaneBinding>> {
+        Ok(self
+            .list_panes()?
+            .into_iter()
+            .filter_map(|pane| {
+                Some(RemotePaneBinding {
+                    pane_id: pane.pane_id,
+                    remote: pane.mirror_host?,
+                    session: pane.mirror_session?,
+                })
+            })
+            .collect())
+    }
+
+    fn binding_pane(&self, target: Option<&str>, allow_ui: bool) -> Result<Pane> {
+        let pane_id = match target {
+            Some(target) if !target.trim().is_empty() => target.to_string(),
+            Some(_) => bail!("local pane ID cannot be empty"),
+            None => env::var("TMUX_PANE")
+                .ok()
+                .filter(|pane_id| !pane_id.trim().is_empty())
+                .context("no current local tmux pane; pass --pane <local-pane-id>")?,
+        };
+        let pane = self
+            .list_panes()?
+            .into_iter()
+            .find(|pane| pane.pane_id == pane_id)
+            .with_context(|| format!("no local tmux pane has ID {pane_id}"))?;
+        if pane.dead {
+            bail!("{pane_id} is dead");
+        }
+        if pane.is_agent_ui && !allow_ui {
+            bail!("{pane_id} is a tmux-agent UI pane");
+        }
+        Ok(pane)
     }
 
     pub fn broadcast_ui_selection(&self, agent_id: &str) -> Result<()> {
@@ -2226,9 +2331,24 @@ mod tests {
         let missing = anyhow::Error::new(FocusTargetMissing {
             alias: "remote-mac".into(),
             title: "project".into(),
+            session: None,
         });
         assert!(is_focus_target_missing(&missing));
         assert!(!is_focus_target_missing(&anyhow::anyhow!("tmux failed")));
+    }
+
+    #[test]
+    fn missing_remote_tmux_binding_reports_the_exact_bind_command() {
+        let missing = FocusTargetMissing {
+            alias: "thinkcat".into(),
+            title: "project".into(),
+            session: Some("tmux-agent-res".into()),
+        };
+
+        assert_eq!(
+            missing.to_string(),
+            "no local pane is bound to thinkcat/tmux-agent-res; run tmux-agent remote bind thinkcat tmux-agent-res --pane <local-pane-id> on this machine"
+        );
     }
 
     #[test]

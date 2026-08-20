@@ -245,10 +245,16 @@ pane. Public mirror markers provide an explicit fallback:
 @tmux_agent_remote_session
 ```
 
+`tmux-agent remote bind` and `remote unbind` manage these pane-local markers.
+This gives nested tmux over mosh an exact local focus target without screen or
+title inference. The daemon protocol and persisted state do not carry the
+binding.
+
 ## Security boundaries
 
 - Runtime directories use mode `0700` and files use mode `0600`.
-- Remote transport remains SSH.
+- Federation transport remains SSH. An explicit focus binding may point at a
+  local SSH or mosh pane.
 - Captured pane contents remain on the owning machine.
 - Normal federation does not transport child transcript content.
 - Opening a remote Codex child uses a separate, explicit SSH viewer session.
