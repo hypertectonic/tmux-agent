@@ -1,7 +1,7 @@
 use crate::codex::{self, CodexOwnership, ReconciliationFrame, ThreadTracker};
 use crate::config::Config;
 use crate::detect;
-use crate::detect::stabilize::StateTracker;
+use crate::detect::stabilize::{ObservationFreshness, StateTracker};
 use crate::model::{
     AgentOrigin, AgentRecord, AgentState, Attention, EvidenceSource, GoalInfo, GoalState,
     PROTOCOL_VERSION, PersistedState, Snapshot, SubagentInfo,
@@ -12,9 +12,98 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SUBAGENT_RETENTION_MS: u64 = 30_000;
+const BACKGROUND_CAPTURE_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CaptureIdentity {
+    pane_pid: u32,
+    process_group: u32,
+    process_started_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CaptureCandidate<'a> {
+    pane_id: &'a str,
+    identity: CaptureIdentity,
+    foreground: bool,
+}
+
+#[derive(Debug)]
+struct CaptureEntry {
+    identity: CaptureIdentity,
+    attempted_at: Instant,
+    screen: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct CaptureCache {
+    entries: HashMap<String, CaptureEntry>,
+}
+
+impl CaptureCache {
+    fn due_panes<'a>(
+        &mut self,
+        candidates: impl IntoIterator<Item = CaptureCandidate<'a>>,
+        now: Instant,
+    ) -> Vec<String> {
+        let mut eligible = HashSet::new();
+        let mut due = Vec::new();
+        for candidate in candidates {
+            eligible.insert(candidate.pane_id.to_string());
+            let should_capture = self.entries.get(candidate.pane_id).is_none_or(|entry| {
+                entry.identity != candidate.identity
+                    || candidate.foreground
+                    || now.saturating_duration_since(entry.attempted_at)
+                        >= BACKGROUND_CAPTURE_INTERVAL
+            });
+            if should_capture {
+                if let Some(entry) = self.entries.get_mut(candidate.pane_id) {
+                    if entry.identity == candidate.identity {
+                        entry.attempted_at = now;
+                    } else {
+                        *entry = CaptureEntry {
+                            identity: candidate.identity,
+                            attempted_at: now,
+                            screen: None,
+                        };
+                    }
+                } else {
+                    self.entries.insert(
+                        candidate.pane_id.to_string(),
+                        CaptureEntry {
+                            identity: candidate.identity,
+                            attempted_at: now,
+                            screen: None,
+                        },
+                    );
+                }
+                due.push(candidate.pane_id.to_string());
+            }
+        }
+        self.entries.retain(|pane_id, _| eligible.contains(pane_id));
+        due
+    }
+
+    fn apply_results(&mut self, pane_ids: &[String], results: &HashMap<String, Result<String>>) {
+        for pane_id in pane_ids {
+            if let Some(entry) = self.entries.get_mut(pane_id) {
+                entry.screen = results
+                    .get(pane_id)
+                    .and_then(|result| result.as_ref().ok())
+                    .cloned();
+            }
+        }
+    }
+
+    fn screen(&self, pane_id: &str) -> Option<&str> {
+        self.entries
+            .get(pane_id)
+            .and_then(|entry| entry.screen.as_deref())
+    }
+}
 
 pub struct Scanner {
     tmux: Tmux,
@@ -27,6 +116,7 @@ pub struct Scanner {
     codex_threads: ThreadTracker,
     codex_ownership: CodexOwnership,
     record_starts: HashMap<String, (String, u64)>,
+    captures: CaptureCache,
     revision: u64,
     tmux_server_observed: bool,
 }
@@ -72,6 +162,7 @@ impl Scanner {
             codex_threads: ThreadTracker::from_environment(),
             codex_ownership,
             record_starts: HashMap::new(),
+            captures: CaptureCache::default(),
             revision: 0,
             tmux_server_observed,
         })
@@ -90,7 +181,7 @@ impl Scanner {
         };
         let processes = self.tmux.process_snapshot(&panes)?;
         let runner_states = runner::load_states(&self.runner_directory, &processes.live_pids);
-        let capture_pane_ids = panes
+        let capture_candidates = panes
             .iter()
             .filter(|pane| !pane.is_agent_ui && !pane.dead)
             .filter(|pane| runner_for_pane(&runner_states, &processes, &pane.pane_id).is_none())
@@ -102,9 +193,30 @@ impl Scanner {
                     .unwrap_or(&pane.current_command);
                 detect::looks_like_agent(process)
             })
-            .map(|pane| pane.pane_id.clone())
+            .map(|pane| {
+                let process_group = processes
+                    .pane_groups
+                    .get(&pane.pane_id)
+                    .copied()
+                    .unwrap_or(pane.pane_pid);
+                CaptureCandidate {
+                    pane_id: &pane.pane_id,
+                    identity: CaptureIdentity {
+                        pane_pid: pane.pane_pid,
+                        process_group,
+                        process_started_at_ms: processes
+                            .process_started_at_ms
+                            .get(&process_group)
+                            .copied(),
+                    },
+                    foreground: pane.visible,
+                }
+            })
             .collect::<Vec<_>>();
+        let capture_pane_ids = self.captures.due_panes(capture_candidates, Instant::now());
         let captured_screens = self.tmux.capture_visible_batch(&capture_pane_ids);
+        self.captures
+            .apply_results(&capture_pane_ids, &captured_screens);
         let now = now_ms();
         let mut next = HashMap::new();
         let mut record_pids = HashMap::<String, HashSet<u32>>::new();
@@ -125,22 +237,26 @@ impl Scanner {
             if wrapped.is_none() && !detect::looks_like_agent(process) {
                 continue;
             }
-            let mut detection = if let Some(wrapped) = wrapped {
+            let (mut detection, observation_freshness) = if let Some(wrapped) = wrapped {
                 claimed_runners.insert(wrapped.run_id.clone());
-                wrapped.as_detection()
+                (wrapped.as_detection(), ObservationFreshness::Fresh)
             } else {
-                let captured_screen = captured_screens.get(&pane.pane_id);
-                let screen = captured_screen
-                    .and_then(|capture| capture.as_ref().ok())
-                    .map(String::as_str)
-                    .unwrap_or_default();
+                let screen = self.captures.screen(&pane.pane_id).unwrap_or_default();
                 let Some(mut detection) = detect::detect(process, &pane.title, screen) else {
                     continue;
                 };
-                if captured_screen.is_none_or(Result::is_err) {
+                if self.captures.screen(&pane.pane_id).is_none() {
                     preserve_on_capture_failure(&mut detection);
                 }
-                detection
+                let freshness = if captured_screens
+                    .get(&pane.pane_id)
+                    .is_some_and(Result::is_ok)
+                {
+                    ObservationFreshness::Fresh
+                } else {
+                    ObservationFreshness::Replayed
+                };
+                (detection, freshness)
             };
             let id = format!("{}/{}/{}", self.host, self.server, pane.pane_id);
             let old = self.previous.get(&id);
@@ -166,9 +282,14 @@ impl Scanner {
                 now,
             );
             remember_record_start(&mut self.record_starts, &id, &identity, observed_start);
-            detection = self
-                .detection_state
-                .stabilize(&id, &identity, detection, old, now);
+            detection = self.detection_state.stabilize_observation(
+                &id,
+                &identity,
+                detection,
+                old,
+                now,
+                observation_freshness,
+            );
             let seen = next_seen(old, detection.state, pane.visible);
             let attention = attention(detection.state, seen);
             let goal = goal_lifecycle(old, detection.state, detection.goal, now);
@@ -992,7 +1113,182 @@ mod tests {
     use super::*;
     use crate::codex::{RootRollout, ThreadRollout};
     use std::fs;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
+
+    fn capture_candidate<'a>(
+        pane_id: &'a str,
+        process_group: u32,
+        foreground: bool,
+    ) -> CaptureCandidate<'a> {
+        CaptureCandidate {
+            pane_id,
+            identity: CaptureIdentity {
+                pane_pid: 10,
+                process_group,
+                process_started_at_ms: Some(1_000),
+            },
+            foreground,
+        }
+    }
+
+    #[test]
+    fn foreground_is_due_every_pass_while_background_waits_one_second() {
+        let started_at = Instant::now();
+        let mut captures = CaptureCache::default();
+        let foreground = capture_candidate("%1", 20, true);
+        let background = capture_candidate("%2", 30, false);
+
+        let due = captures.due_panes([foreground, background], started_at);
+        assert_eq!(due, ["%1", "%2"]);
+        captures.apply_results(
+            &due,
+            &HashMap::from([
+                ("%1".into(), Ok("foreground screen".into())),
+                ("%2".into(), Ok("background screen".into())),
+            ]),
+        );
+
+        assert_eq!(
+            captures.due_panes(
+                [foreground, background],
+                started_at + Duration::from_millis(999)
+            ),
+            ["%1"]
+        );
+        assert_eq!(captures.screen("%2"), Some("background screen"));
+        assert_eq!(
+            captures.due_panes(
+                [foreground, background],
+                started_at + Duration::from_secs(1)
+            ),
+            ["%1", "%2"]
+        );
+    }
+
+    #[test]
+    fn replaced_process_identity_is_captured_without_reusing_its_screen() {
+        let started_at = Instant::now();
+        let mut captures = CaptureCache::default();
+        let original = capture_candidate("%1", 20, false);
+        let due = captures.due_panes([original], started_at);
+        assert_eq!(due, ["%1"]);
+        captures.apply_results(
+            &due,
+            &HashMap::from([("%1".into(), Ok("original screen".into()))]),
+        );
+
+        let mut replacement = original;
+        replacement.identity.process_started_at_ms = Some(2_000);
+        assert_eq!(
+            captures.due_panes([replacement], started_at + Duration::from_millis(100)),
+            ["%1"]
+        );
+        assert_eq!(captures.screen("%1"), None);
+    }
+
+    #[test]
+    fn panes_that_stop_being_capture_candidates_are_pruned() {
+        let started_at = Instant::now();
+        let mut captures = CaptureCache::default();
+        let pane = capture_candidate("%1", 20, false);
+        let due = captures.due_panes([pane], started_at);
+        captures.apply_results(&due, &HashMap::from([("%1".into(), Ok("screen".into()))]));
+
+        assert!(captures.due_panes([], started_at).is_empty());
+        assert_eq!(captures.screen("%1"), None);
+    }
+
+    #[test]
+    fn failed_background_capture_drops_stale_screen_and_retries_after_one_second() {
+        let started_at = Instant::now();
+        let mut captures = CaptureCache::default();
+        let pane = capture_candidate("%1", 20, false);
+        let due = captures.due_panes([pane], started_at);
+        captures.apply_results(&due, &HashMap::from([("%1".into(), Ok("screen".into()))]));
+
+        let due = captures.due_panes([pane], started_at + Duration::from_secs(1));
+        assert_eq!(due, ["%1"]);
+        captures.apply_results(
+            &due,
+            &HashMap::from([("%1".into(), Err(anyhow::anyhow!("capture failed")))]),
+        );
+
+        assert_eq!(captures.screen("%1"), None);
+        assert!(
+            captures
+                .due_panes([pane], started_at + Duration::from_millis(1_999))
+                .is_empty()
+        );
+        assert_eq!(
+            captures.due_panes([pane], started_at + Duration::from_secs(2)),
+            ["%1"]
+        );
+    }
+
+    #[test]
+    fn cached_quiet_screen_does_not_count_as_a_second_idle_observation() {
+        let started_at = Instant::now();
+        let pane = capture_candidate("%1", 20, false);
+        let mut captures = CaptureCache::default();
+        let mut tracker = StateTracker::default();
+        let previous = old(AgentState::Working, true);
+
+        let first_due = captures.due_panes([pane], started_at);
+        captures.apply_results(&first_due, &HashMap::from([("%1".into(), Ok("".into()))]));
+        let first = tracker.stabilize_observation(
+            &previous.id,
+            "Codex:20",
+            detect::detect("codex", "", captures.screen("%1").unwrap()).unwrap(),
+            Some(&previous),
+            1_000,
+            ObservationFreshness::Fresh,
+        );
+        assert_eq!(first.state, AgentState::Working);
+
+        let cached_due = captures.due_panes([pane], started_at + Duration::from_millis(300));
+        assert!(cached_due.is_empty());
+        let cached = tracker.stabilize_observation(
+            &previous.id,
+            "Codex:20",
+            detect::detect("codex", "", captures.screen("%1").unwrap()).unwrap(),
+            Some(&previous),
+            1_300,
+            ObservationFreshness::Replayed,
+        );
+        assert_eq!(cached.state, AgentState::Working);
+
+        let second_due = captures.due_panes([pane], started_at + Duration::from_secs(1));
+        captures.apply_results(&second_due, &HashMap::from([("%1".into(), Ok("".into()))]));
+        let second = tracker.stabilize_observation(
+            &previous.id,
+            "Codex:20",
+            detect::detect("codex", "", captures.screen("%1").unwrap()).unwrap(),
+            Some(&previous),
+            2_000,
+            ObservationFreshness::Fresh,
+        );
+        assert_eq!(second.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn cached_screen_still_applies_current_title_evidence() {
+        let previous = old(AgentState::Working, true);
+        let mut tracker = StateTracker::default();
+        let detection = detect::detect("codex", "Action Required", "").unwrap();
+
+        let result = tracker.stabilize_observation(
+            &previous.id,
+            "Codex:20",
+            detection,
+            Some(&previous),
+            1_300,
+            ObservationFreshness::Replayed,
+        );
+
+        assert_eq!(result.state, AgentState::Blocked);
+        assert_eq!(result.source, EvidenceSource::Title);
+    }
 
     fn old(state: AgentState, seen: bool) -> AgentRecord {
         AgentRecord {

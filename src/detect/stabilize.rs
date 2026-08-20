@@ -4,6 +4,12 @@ use std::collections::{HashMap, HashSet};
 
 const INFERRED_IDLE_OBSERVATIONS: u8 = 2;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservationFreshness {
+    Fresh,
+    Replayed,
+}
+
 #[derive(Debug, Default)]
 pub struct StateTracker {
     observations: HashMap<String, Observation>,
@@ -25,9 +31,28 @@ impl StateTracker {
         &mut self,
         id: &str,
         identity: &str,
+        detection: Detection,
+        previous: Option<&AgentRecord>,
+        now_ms: u64,
+    ) -> Detection {
+        self.stabilize_observation(
+            id,
+            identity,
+            detection,
+            previous,
+            now_ms,
+            ObservationFreshness::Fresh,
+        )
+    }
+
+    pub fn stabilize_observation(
+        &mut self,
+        id: &str,
+        identity: &str,
         mut detection: Detection,
         previous: Option<&AgentRecord>,
         _now_ms: u64,
+        freshness: ObservationFreshness,
     ) -> Detection {
         let observation = self
             .observations
@@ -81,6 +106,17 @@ impl StateTracker {
 
         if !inferred_idle || !previous_was_active {
             observation.pending_idle = None;
+            return detection;
+        }
+
+        if freshness == ObservationFreshness::Replayed {
+            let previous = previous.expect("active transition has a previous record");
+            hold(
+                &mut detection,
+                previous.state,
+                previous.source,
+                "waiting_for_fresh_quiet_observation",
+            );
             return detection;
         }
 
