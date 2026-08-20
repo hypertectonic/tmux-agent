@@ -19,10 +19,20 @@ only on the machine that owns them.
 
 The daemon refreshes the global process table and process-derived socket
 inventory at most once per second. Every scan still reads current tmux pane
-metadata, projects those panes against the latest process inventory, and
-captures candidate terminal surfaces. Process starts, exits, and SSH connection
-changes can therefore take about one second to appear, while tmux metadata and
-screen-derived state remain on the normal scan cadence.
+metadata and projects those panes against the latest process inventory.
+Candidate panes in a window displayed by any attached tmux client are captured
+on every normal scan. Candidate panes in hidden windows reuse their last
+successful screen and are captured on the first scan at least one second after
+the previous attempt, normally about 1.0 to 1.3 seconds with the default 300 ms
+scan interval. Newly eligible panes and panes whose foreground process identity
+changes are captured immediately. A failed hidden capture discards the cached
+screen and waits for the same background interval before retrying. Replaying a
+cached quiet screen does not count as a new idle observation, while current
+tmux metadata and title evidence are still evaluated on every scan.
+
+Process starts, exits, and SSH connection changes can therefore take about one
+second to appear. Tmux metadata and screen-derived state in displayed windows
+remain on the normal scan cadence.
 
 Codex, Claude, OpenCode, Grok, OMP, and Pi each have a typed detector backed by
 minimal synthetic fixtures. Detectors emit semantic state and derived evidence
