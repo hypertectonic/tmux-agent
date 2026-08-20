@@ -136,6 +136,8 @@ pub struct SshTransport {
     pub remote_session: Option<String>,
     pub title: String,
     pub label: Option<String>,
+    #[serde(default)]
+    pub visible: bool,
     pub target: TmuxTarget,
 }
 
@@ -679,6 +681,7 @@ mod tests {
                 remote_session: Some("remote-session".into()),
                 title: "project".into(),
                 label: Some("private local label".into()),
+                visible: false,
                 target: TmuxTarget {
                     session_name: "local-session".into(),
                     window_id: "@1".into(),
