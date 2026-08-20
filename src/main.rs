@@ -290,10 +290,18 @@ async fn main() -> Result<()> {
             transcript::run(record)
         }
         Command::Scan { json } => {
-            let server_key = tmux.server_key()?.unwrap_or_else(|| tmux.runtime_key());
+            let discovered_server_key = tmux.server_key()?;
+            let tmux_server_observed = discovered_server_key.is_some();
+            let server_key = discovered_server_key.unwrap_or_else(|| tmux.runtime_key());
             let persisted = store::load(&paths.state).unwrap_or_default();
-            let mut scanner =
-                Scanner::new(&config, tmux, &server_key, paths.runners.clone(), persisted)?;
+            let mut scanner = Scanner::new(
+                &config,
+                tmux,
+                &server_key,
+                paths.runners.clone(),
+                persisted,
+                tmux_server_observed,
+            )?;
             let snapshot = scanner.scan()?;
             print_snapshot(&snapshot, json)
         }

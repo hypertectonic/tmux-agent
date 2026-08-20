@@ -7,7 +7,7 @@ use crate::model::{
     PROTOCOL_VERSION, PersistedState, Snapshot, SubagentInfo,
 };
 use crate::runner::{self, RunnerState};
-use crate::tmux::{ProcessSnapshot, TerminalJob, Tmux};
+use crate::tmux::{ProcessSnapshot, TerminalJob, Tmux, is_server_missing};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -28,6 +28,7 @@ pub struct Scanner {
     codex_ownership: CodexOwnership,
     record_starts: HashMap<String, (String, u64)>,
     revision: u64,
+    tmux_server_observed: bool,
 }
 
 impl Scanner {
@@ -37,6 +38,7 @@ impl Scanner {
         server_key: &str,
         runner_directory: PathBuf,
         persisted: Option<PersistedState>,
+        tmux_server_observed: bool,
     ) -> Result<Self> {
         let host = config.host_name.clone().unwrap_or_else(discover_host);
         let server = config.server_name.clone().unwrap_or_else(|| {
@@ -71,11 +73,21 @@ impl Scanner {
             codex_ownership,
             record_starts: HashMap::new(),
             revision: 0,
+            tmux_server_observed,
         })
     }
 
     pub fn scan(&mut self) -> Result<Snapshot> {
-        let panes = self.tmux.list_panes()?;
+        // A daemon started without tmux still discovers ordinary terminals. Once its
+        // configured tmux server has been observed, losing that server is a lifecycle event.
+        let panes = match self.tmux.list_panes() {
+            Ok(panes) => {
+                self.tmux_server_observed = true;
+                panes
+            }
+            Err(error) if is_server_missing(&error) && !self.tmux_server_observed => Vec::new(),
+            Err(error) => return Err(error),
+        };
         let processes = self.tmux.process_snapshot(&panes)?;
         let runner_states = runner::load_states(&self.runner_directory, &processes.live_pids);
         let now = now_ms();
