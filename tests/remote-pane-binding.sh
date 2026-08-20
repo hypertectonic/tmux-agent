@@ -3,8 +3,8 @@ set -euo pipefail
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 command -v tmux >/dev/null 2>&1 || {
-	printf '%s\n' 'tmux is required for remote pane binding tests' >&2
-	exit 1
+    printf '%s\n' 'tmux is required for remote pane binding tests' >&2
+    exit 1
 }
 real_tmux=$(command -v tmux)
 cargo build --locked
@@ -17,10 +17,10 @@ binary="$root/target/debug/tmux-agent"
 config="$test_root/config.toml"
 
 cleanup() {
-	exit_code=$?
-	"${tmux_test[@]}" kill-server >/dev/null 2>&1 || true
-	rm -rf -- "$test_root"
-	return "$exit_code"
+    exit_code=$?
+    "${tmux_test[@]}" kill-server >/dev/null 2>&1 || true
+    rm -rf -- "$test_root"
+    return "$exit_code"
 }
 trap cleanup EXIT
 
@@ -34,25 +34,25 @@ command = ["ssh", "thinkcat", "tmux-agent", "watch", "--jsonl", "--local-only"]
 EOF
 
 run_isolated() {
-	env \
-		HOME="$test_root/home" \
-		TMUX_TMPDIR="$tmux_tmp" \
-		XDG_RUNTIME_DIR="$test_root/runtime" \
-		XDG_STATE_HOME="$test_root/state" \
-		"$binary" --config "$config" "$@"
+    env \
+        HOME="$test_root/home" \
+        TMUX_TMPDIR="$tmux_tmp" \
+        XDG_RUNTIME_DIR="$test_root/runtime" \
+        XDG_STATE_HOME="$test_root/state" \
+        "$binary" --config "$config" "$@"
 }
 
 transport_pane=$(
-	"${tmux_test[@]}" new-session -d -x 100 -y 30 -s local \
-		-P -F '#{pane_id}' 'sleep 300'
+    "${tmux_test[@]}" new-session -d -x 100 -y 30 -s local \
+        -P -F '#{pane_id}' 'sleep 300'
 )
 ui_pane=$("${tmux_test[@]}" split-window -d -t "$transport_pane" -P -F '#{pane_id}' 'sleep 300')
 "${tmux_test[@]}" set-option -pt "$ui_pane" @tmux_agent_ui 1
 
 if run_isolated remote bind unknown remote-session --pane "$transport_pane" \
-	>"$test_root/unknown.stdout" 2>"$test_root/unknown.stderr"; then
-	printf '%s\n' 'unknown remote alias must be rejected' >&2
-	exit 1
+    >"$test_root/unknown.stdout" 2>"$test_root/unknown.stderr"; then
+    printf '%s\n' 'unknown remote alias must be rejected' >&2
+    exit 1
 fi
 grep -F 'no configured remote named "unknown"' "$test_root/unknown.stderr" >/dev/null
 
@@ -63,9 +63,9 @@ bound=$(run_isolated remote bind thinkcat tmux-agent-res --pane "$transport_pane
 [[ $(run_isolated remote bindings) == "$transport_pane thinkcat tmux-agent-res" ]]
 
 if run_isolated remote bind thinkcat other-session --pane "$ui_pane" \
-	>"$test_root/ui.stdout" 2>"$test_root/ui.stderr"; then
-	printf '%s\n' 'tmux-agent UI panes must not become remote bindings' >&2
-	exit 1
+    >"$test_root/ui.stdout" 2>"$test_root/ui.stderr"; then
+    printf '%s\n' 'tmux-agent UI panes must not become remote bindings' >&2
+    exit 1
 fi
 grep -F "$ui_pane is a tmux-agent UI pane" "$test_root/ui.stderr" >/dev/null
 
