@@ -64,6 +64,11 @@ enum Command {
     Explain { target: String },
     /// Mark an agent's completion as seen.
     Acknowledge { target: String },
+    /// Manage explicit local-pane mappings for remote tmux sessions.
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
     /// Open the internal read-only Codex subagent transcript viewer.
     #[command(name = "subagent-view", hide = true)]
     SubagentView {
@@ -160,6 +165,26 @@ enum DaemonCommand {
     Stop,
     /// Stop the current daemon and start it again with this binary.
     Restart,
+}
+
+#[derive(Debug, Subcommand)]
+enum RemoteCommand {
+    /// Bind a local tmux pane to one configured remote tmux session.
+    Bind {
+        remote: String,
+        session: String,
+        /// Local pane ID. Defaults to the current local TMUX_PANE.
+        #[arg(long, value_name = "PANE_ID")]
+        pane: Option<String>,
+    },
+    /// Remove a remote-session binding from a local tmux pane.
+    Unbind {
+        /// Local pane ID. Defaults to the current local TMUX_PANE.
+        #[arg(long, value_name = "PANE_ID")]
+        pane: Option<String>,
+    },
+    /// List explicit local-pane mappings for remote tmux sessions.
+    Bindings,
 }
 
 #[tokio::main]
@@ -283,6 +308,54 @@ async fn main() -> Result<()> {
             println!("acknowledged {id}");
             Ok(())
         }
+        Command::Remote {
+            command:
+                RemoteCommand::Bind {
+                    remote,
+                    session,
+                    pane,
+                },
+        } => {
+            if !configured_remote(&config, &remote) {
+                bail!("no configured remote named {remote:?}");
+            }
+            if session.trim().is_empty() {
+                bail!("remote tmux session cannot be empty");
+            }
+            let pane_id = tmux.bind_remote_pane(pane.as_deref(), &remote, &session)?;
+            println!(
+                "bound {} to {}/{}",
+                terminal_safe(&pane_id),
+                terminal_safe(&remote),
+                terminal_safe(&session)
+            );
+            Ok(())
+        }
+        Command::Remote {
+            command: RemoteCommand::Unbind { pane },
+        } => {
+            let pane_id = tmux.unbind_remote_pane(pane.as_deref())?;
+            println!("unbound {pane_id}");
+            Ok(())
+        }
+        Command::Remote {
+            command: RemoteCommand::Bindings,
+        } => {
+            let bindings = tmux.remote_pane_bindings()?;
+            if bindings.is_empty() {
+                println!("No remote pane bindings.");
+            } else {
+                for binding in bindings {
+                    println!(
+                        "{} {} {}",
+                        terminal_safe(&binding.pane_id),
+                        terminal_safe(&binding.remote),
+                        terminal_safe(&binding.session)
+                    );
+                }
+            }
+            Ok(())
+        }
         Command::SubagentView { target, local_only } => {
             daemon::ensure_running(&config_path, &paths).await?;
             let snapshot = ipc::snapshot(&paths.socket, local_only).await?;
@@ -290,10 +363,18 @@ async fn main() -> Result<()> {
             transcript::run(record)
         }
         Command::Scan { json } => {
-            let server_key = tmux.server_key()?.unwrap_or_else(|| tmux.runtime_key());
+            let discovered_server_key = tmux.server_key()?;
+            let tmux_server_observed = discovered_server_key.is_some();
+            let server_key = discovered_server_key.unwrap_or_else(|| tmux.runtime_key());
             let persisted = store::load(&paths.state).unwrap_or_default();
-            let mut scanner =
-                Scanner::new(&config, tmux, &server_key, paths.runners.clone(), persisted)?;
+            let mut scanner = Scanner::new(
+                &config,
+                tmux,
+                &server_key,
+                paths.runners.clone(),
+                persisted,
+                tmux_server_observed,
+            )?;
             let snapshot = scanner.scan()?;
             print_snapshot(&snapshot, json)
         }
@@ -317,6 +398,11 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn configured_remote(config: &Config, name: &str) -> bool {
+    config.machines.iter().any(|machine| machine.name == name)
+        || config.remotes.iter().any(|remote| remote.name == name)
 }
 
 fn provider_command(provider: &str, arguments: Vec<OsString>) -> Vec<OsString> {

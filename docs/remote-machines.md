@@ -118,6 +118,27 @@ agent because another SSH pane can have the same title.
 If no unique local SSH or mirror pane can be resolved, tmux-agent reports the
 ambiguity or missing focus target instead of guessing.
 
+Nested remote tmux over mosh, or over an SSH connection that cannot be matched
+to the remote agent process, needs an explicit local-pane binding. Run this on
+the local machine before entering the remote shell, or pass the local pane ID
+from another local pane:
+
+```sh
+tmux-agent remote bind build-host agents --pane %42
+```
+
+The command writes the two public marker options above. The binding belongs to
+that pane and disappears with it. Inspect or remove bindings with:
+
+```sh
+tmux-agent remote bindings
+tmux-agent remote unbind --pane %42
+```
+
+When `--pane` is omitted, bind and unbind use the current local `$TMUX_PANE`.
+The bind command rejects names that are not present in the local tmux-agent
+configuration and never chooses between several mosh or SSH panes by title.
+
 A local transport pane can also provide the label shown beside its remote
 agent:
 

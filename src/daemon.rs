@@ -5,7 +5,10 @@ use crate::model::{
     Snapshot, SshTransport,
 };
 use crate::scanner::{Scanner, now_ms};
-use crate::{store, tmux::Tmux};
+use crate::{
+    store,
+    tmux::{Tmux, is_server_missing},
+};
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -21,6 +24,47 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::{RwLock, watch};
+
+const MISSING_SERVER_EXIT_THRESHOLD: u8 = 3;
+
+enum ScanLoopExit {
+    ServerMissing,
+}
+
+enum ScanErrorAction {
+    Retry,
+    Exit,
+    Report,
+}
+
+#[derive(Default)]
+struct MissingServerPolicy {
+    consecutive: u8,
+}
+
+impl MissingServerPolicy {
+    fn success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    fn error(&mut self, error: &anyhow::Error) -> ScanErrorAction {
+        if !is_server_missing(error) {
+            self.consecutive = 0;
+            return ScanErrorAction::Report;
+        }
+        self.consecutive += 1;
+        if self.consecutive >= MISSING_SERVER_EXIT_THRESHOLD {
+            ScanErrorAction::Exit
+        } else {
+            ScanErrorAction::Retry
+        }
+    }
+}
+
+enum RemoteStreamExit {
+    Ended,
+    Shutdown,
+}
 
 struct Aggregate {
     local: Snapshot,
@@ -315,21 +359,28 @@ pub async fn run(config: Config, paths: RuntimePaths, tmux: Tmux) -> Result<()> 
             .with_context(|| format!("remove stale socket {}", paths.socket.display()))?;
     }
 
-    let server_key = tmux.server_key()?.unwrap_or_else(|| tmux.runtime_key());
+    let discovered_server_key = tmux.server_key()?;
+    let tmux_server_observed = discovered_server_key.is_some();
+    let server_key = discovered_server_key.unwrap_or_else(|| tmux.runtime_key());
     let persisted = store::load(&paths.state).unwrap_or_default();
     let acknowledgements = store::load_acknowledged(&paths.acknowledgements)
         .ok()
         .filter(|state| state.protocol == PROTOCOL_VERSION)
         .map(Acknowledgements::from_state)
         .unwrap_or_default();
-    let mut scanner = Scanner::new(
+    let scanner = Scanner::new(
         &config,
         tmux.clone(),
         &server_key,
         paths.runners.clone(),
         persisted,
+        tmux_server_observed,
     )?;
-    let first = scanner.scan()?;
+    let scan_interval = Duration::from_millis(config.scan_interval_ms());
+    let (scanner, first) = match bootstrap_scan(scanner, scan_interval).await? {
+        Some(ready) => ready,
+        None => return Ok(()),
+    };
     store::save(&paths.state, &scanner.persisted())?;
     let collectors = config.collectors();
     let shared = Shared::new(
@@ -338,15 +389,22 @@ pub async fn run(config: Config, paths: RuntimePaths, tmux: Tmux) -> Result<()> 
         acknowledgements,
         paths.acknowledgements.clone(),
     )?;
-    for remote in collectors {
-        tokio::spawn(remote_loop(remote, shared.clone()));
-    }
-
     let listener = UnixListener::bind(&paths.socket)
         .with_context(|| format!("bind daemon socket {}", paths.socket.display()))?;
     #[cfg(unix)]
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("secure daemon socket {}", paths.socket.display()))?;
+    let (collector_shutdown, collector_shutdown_rx) = watch::channel(false);
+    let collector_tasks = collectors
+        .into_iter()
+        .map(|remote| {
+            tokio::spawn(remote_loop(
+                remote,
+                shared.clone(),
+                collector_shutdown_rx.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
     let mut listener_task = tokio::spawn(accept_clients(
         listener,
@@ -357,14 +415,17 @@ pub async fn run(config: Config, paths: RuntimePaths, tmux: Tmux) -> Result<()> 
         scanner,
         shared.clone(),
         paths.state.clone(),
-        Duration::from_millis(config.scan_interval_ms()),
+        scan_interval,
     ));
+    let mut listener_finished = false;
+    let mut scanner_finished = false;
     let outcome = tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             signal.context("wait for shutdown signal")
         }
         _ = shutdown_rx.recv() => Ok(()),
         result = &mut listener_task => {
+            listener_finished = true;
             match result {
                 Ok(Ok(())) => Err(anyhow::anyhow!("daemon listener stopped unexpectedly")),
                 Ok(Err(error)) => Err(error.context("daemon listener stopped")),
@@ -372,17 +433,26 @@ pub async fn run(config: Config, paths: RuntimePaths, tmux: Tmux) -> Result<()> 
             }
         }
         result = &mut scanner_task => {
+            scanner_finished = true;
             match result {
-                Ok(Ok(())) => Err(anyhow::anyhow!("daemon scanner stopped unexpectedly")),
+                Ok(Ok(ScanLoopExit::ServerMissing)) => Ok(()),
                 Ok(Err(error)) => Err(error.context("daemon scanner stopped")),
                 Err(error) => Err(anyhow::Error::new(error).context("join daemon scanner task")),
             }
         }
     };
-    listener_task.abort();
-    scanner_task.abort();
-    let _ = listener_task.await;
-    let _ = scanner_task.await;
+    collector_shutdown.send_replace(true);
+    if !listener_finished {
+        listener_task.abort();
+        let _ = listener_task.await;
+    }
+    if !scanner_finished {
+        scanner_task.abort();
+        let _ = scanner_task.await;
+    }
+    for collector_task in collector_tasks {
+        let _ = collector_task.await;
+    }
     if paths.socket.exists() {
         fs::remove_file(&paths.socket)
             .with_context(|| format!("remove daemon socket {}", paths.socket.display()))?;
@@ -390,32 +460,65 @@ pub async fn run(config: Config, paths: RuntimePaths, tmux: Tmux) -> Result<()> 
     outcome
 }
 
+async fn bootstrap_scan(
+    mut scanner: Scanner,
+    scan_interval: Duration,
+) -> Result<Option<(Scanner, Snapshot)>> {
+    let mut missing_server = MissingServerPolicy::default();
+    loop {
+        let (next_scanner, result) = scan_once(scanner).await?;
+        scanner = next_scanner;
+        match result {
+            Ok(snapshot) => {
+                missing_server.success();
+                return Ok(Some((scanner, snapshot)));
+            }
+            Err(error) => match missing_server.error(&error) {
+                ScanErrorAction::Retry => tokio::time::sleep(scan_interval).await,
+                ScanErrorAction::Exit => return Ok(None),
+                ScanErrorAction::Report => return Err(error),
+            },
+        }
+    }
+}
+
+async fn scan_once(scanner: Scanner) -> Result<(Scanner, Result<Snapshot>)> {
+    tokio::task::spawn_blocking(move || {
+        let mut scanner = scanner;
+        let result = scanner.scan();
+        (scanner, result)
+    })
+    .await
+    .context("join local scanner")
+}
+
 async fn scan_loop(
     mut scanner: Scanner,
     shared: Arc<Shared>,
     state_path: PathBuf,
     scan_interval: Duration,
-) -> Result<()> {
+) -> Result<ScanLoopExit> {
     let mut interval = tokio::time::interval(scan_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut missing_server = MissingServerPolicy::default();
     loop {
         interval.tick().await;
-        let (next_scanner, result) = tokio::task::spawn_blocking(move || {
-            let result = scanner.scan();
-            (scanner, result)
-        })
-        .await
-        .context("join local scanner")?;
+        let (next_scanner, result) = scan_once(scanner).await?;
         scanner = next_scanner;
         match result {
             Ok(snapshot) => {
+                missing_server.success();
                 if shared.publish_local(snapshot).await
                     && let Err(error) = store::save(&state_path, &scanner.persisted())
                 {
                     eprintln!("tmux-agent: persist state: {error:#}");
                 }
             }
-            Err(error) => eprintln!("tmux-agent: scan failed: {error:#}"),
+            Err(error) => match missing_server.error(&error) {
+                ScanErrorAction::Retry => {}
+                ScanErrorAction::Exit => return Ok(ScanLoopExit::ServerMissing),
+                ScanErrorAction::Report => eprintln!("tmux-agent: scan failed: {error:#}"),
+            },
         }
     }
 }
@@ -744,19 +847,37 @@ async fn write_response(
         .context("write daemon response")
 }
 
-async fn remote_loop(remote: RemoteConfig, shared: Arc<Shared>) {
+async fn remote_loop(
+    remote: RemoteConfig,
+    shared: Arc<Shared>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     loop {
-        let result = stream_remote(&remote, shared.clone()).await;
-        let message = match result {
-            Ok(()) => "remote stream ended".to_string(),
+        if *shutdown.borrow() {
+            return;
+        }
+        let message = match stream_remote(&remote, shared.clone(), &mut shutdown).await {
+            Ok(RemoteStreamExit::Ended) => "remote stream ended".to_string(),
+            Ok(RemoteStreamExit::Shutdown) => return,
             Err(error) => concise_error(&error),
         };
         shared.peer_error(&remote.name, message).await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
     }
 }
 
-async fn stream_remote(remote: &RemoteConfig, shared: Arc<Shared>) -> Result<()> {
+async fn stream_remote(
+    remote: &RemoteConfig,
+    shared: Arc<Shared>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<RemoteStreamExit> {
     let executable = remote.command.first().context("remote command is empty")?;
     let mut child = Command::new(executable)
         .args(&remote.command[1..])
@@ -768,17 +889,30 @@ async fn stream_remote(remote: &RemoteConfig, shared: Arc<Shared>) -> Result<()>
         .with_context(|| format!("start remote collector {}", remote.name))?;
     let stdout = child.stdout.take().context("capture remote stdout")?;
     let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await.context("read remote stream")? {
-        let snapshot: Snapshot = serde_json::from_str(&line)
-            .with_context(|| format!("parse snapshot from {}", remote.name))?;
-        validate_remote_snapshot(&remote.name, &snapshot)?;
-        shared.publish_remote(&remote.name, snapshot).await;
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    child.kill().await.context("stop remote collector")?;
+                    return Ok(RemoteStreamExit::Shutdown);
+                }
+            }
+            line = lines.next_line() => {
+                let Some(line) = line.context("read remote stream")? else {
+                    break;
+                };
+                let snapshot: Snapshot = serde_json::from_str(&line)
+                    .with_context(|| format!("parse snapshot from {}", remote.name))?;
+                validate_remote_snapshot(&remote.name, &snapshot)?;
+                shared.publish_remote(&remote.name, snapshot).await;
+            }
+        }
     }
     let status = child.wait().await.context("wait for remote collector")?;
     if !status.success() {
         bail!("remote collector exited with {status}");
     }
-    Ok(())
+    Ok(RemoteStreamExit::Ended)
 }
 
 fn validate_remote_snapshot(alias: &str, snapshot: &Snapshot) -> Result<()> {

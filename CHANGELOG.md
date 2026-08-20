@@ -6,6 +6,28 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+## [0.8.0] - 2026-08-20
+
+### Added
+
+- Bind an SSH or Mosh transport pane to a specific nested remote tmux session
+  with `tmux-agent remote bind`, with commands to inspect and remove bindings.
+
+### Changed
+
+- Batch pane captures, cache macOS terminal resolution, and reuse the global
+  process inventory for one second while keeping current pane metadata fresh.
+- Keep displayed-window captures on the normal scan cadence while reusing
+  hidden-window screens for one second. Replayed screens do not advance idle
+  confirmation without fresh evidence.
+
+### Fixed
+
+- Exit a daemon after its tmux server remains missing for three scans, remove
+  its runtime socket, and stop its process discovery and remote collectors.
+- Focus the intended nested remote tmux pane when an explicit transport
+  binding is configured.
+
 ## [0.7.0] - 2026-08-17
 
 ### Added
