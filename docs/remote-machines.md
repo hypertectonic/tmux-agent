@@ -125,9 +125,9 @@ completion seen. Ambiguous and unresolved transports keep the peer's reported
 visibility and attention state.
 
 Nested remote tmux over mosh, or over an SSH connection that cannot be matched
-to the remote agent process, needs an explicit local-pane binding. Run this on
-the local machine before entering the remote shell, or pass the local pane ID
-from another local pane:
+to the remote agent process, needs an initial explicit local-pane binding. Run
+this on the local machine before entering the remote shell, or pass the local
+pane ID from another local pane:
 
 ```sh
 tmux-agent remote bind build-host agents --pane %42
@@ -143,7 +143,11 @@ tmux-agent remote unbind --pane %42
 
 When `--pane` is omitted, bind and unbind use the current local `$TMUX_PANE`.
 The bind command rejects names that are not present in the local tmux-agent
-configuration and never chooses between several mosh or SSH panes by title.
+configuration and never chooses between several mosh or SSH panes by title. If
+the bound remote tmux session is later recreated under a different name,
+focusing its agent repairs the session marker only when that host has one live,
+non-UI bound pane with a matching normalized title. Zero or multiple matches
+leave the binding unchanged and report the normal focus error.
 
 A local transport pane can also provide the label shown beside its remote
 agent:

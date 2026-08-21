@@ -119,7 +119,7 @@ pane by title alone. Use `tmux-agent explain <id-or-pane>` and `tmux-agent
 doctor` to inspect the derived target without exposing pane contents.
 
 For nested remote tmux over mosh, bind the correct local transport pane
-explicitly. Run the command on the local machine, not inside the remote tmux
+initially. Run the command on the local machine, not inside the remote tmux
 session:
 
 ```sh
@@ -127,7 +127,11 @@ tmux-agent remote bind <configured-remote> <remote-tmux-session> --pane <local-p
 ```
 
 Use `tmux-agent remote bindings` to inspect current mappings and `tmux-agent
-remote unbind --pane <local-pane-id>` to remove one.
+remote unbind --pane <local-pane-id>` to remove one. A stale remote session name
+self-heals during focus when exactly one live pane is already bound to that host
+and its normalized title matches the selected agent. If no pane or several
+panes match, tmux-agent leaves every binding unchanged and reports the focus
+failure.
 
 ## A completion remains visible
 
