@@ -218,7 +218,7 @@ impl fmt::Display for FocusTargetMissing {
         }
         write!(
             formatter,
-            "no unique local SSH pane for {} with title {:?}",
+            "no unique local SSH or mosh pane for {} with title {:?}",
             self.alias, self.title
         )
     }
@@ -1554,14 +1554,14 @@ fn find_transport_pane<'a>(
                 .get(&pane.pane_id)
                 .map(String::as_str)
                 .unwrap_or(&pane.current_command);
-            ssh_destination(processes).is_some_and(|host| host == remote_alias)
+            transport_destination(processes).is_some_and(|host| host == remote_alias)
         })
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [] => Ok(None),
         [pane] => Ok(Some(*pane)),
         _ => bail!(
-            "multiple local SSH panes match {remote_alias} with title {title:?}: {}",
+            "multiple local transport panes match {remote_alias} with title {title:?}: {}",
             matches
                 .iter()
                 .map(|pane| pane.pane_id.as_str())
@@ -1572,26 +1572,47 @@ fn find_transport_pane<'a>(
 }
 
 pub(crate) fn normalize_transport_title(value: &str) -> String {
-    trim_braille_activity_prefix(value).trim_end().to_string()
+    let title = value.trim();
+    let title = title
+        .strip_prefix("[mosh]")
+        .map(str::trim_start)
+        .unwrap_or(title);
+    let title = title
+        .strip_prefix('·')
+        .map(str::trim_start)
+        .unwrap_or(title);
+    trim_braille_activity_prefix(title).trim_end().to_string()
 }
 
 fn normalize_bound_transport_title(value: &str) -> String {
-    let title = normalize_transport_title(value);
-    let Some(rest) = title.strip_prefix("[mosh]") else {
-        return title;
-    };
-    rest.trim_start()
-        .strip_prefix('·')
-        .unwrap_or(rest.trim_start())
-        .trim_start()
-        .to_string()
+    normalize_transport_title(value)
 }
 
-fn ssh_destination(processes: &str) -> Option<&str> {
+fn transport_destination(processes: &str) -> Option<&str> {
     processes
         .lines()
         .next()
-        .and_then(ssh_destination_for_command)
+        .and_then(transport_destination_for_command)
+}
+
+fn transport_destination_for_command(command: &str) -> Option<&str> {
+    ssh_destination_for_command(command).or_else(|| mosh_destination_for_command(command))
+}
+
+fn mosh_destination_for_command(command: &str) -> Option<&str> {
+    let fields = command.split_whitespace().collect::<Vec<_>>();
+    let executable = fields.first()?;
+    let program = executable.rsplit('/').next().unwrap_or(executable);
+    if program != "mosh-client" {
+        return None;
+    }
+    let separator = fields.iter().position(|field| *field == "|")?;
+    let alias = separator
+        .checked_sub(1)
+        .and_then(|index| fields.get(index))?;
+    fields.get(separator + 1)?;
+    fields.get(separator + 2)?;
+    (!alias.starts_with('-')).then(|| alias.rsplit('@').next().unwrap_or(alias))
 }
 
 fn ssh_destination_for_command(command: &str) -> Option<&str> {
@@ -1724,6 +1745,14 @@ mod tests {
         }
     }
 
+    fn remote_terminal_record(title: &str) -> AgentRecord {
+        let mut record = remote_tmux_record("terminal", title);
+        record.id = "remote/remote-mac/terminal/synthetic-tty".into();
+        record.origin = AgentOrigin::Terminal;
+        record.terminal = Some("synthetic-tty".into());
+        record
+    }
+
     fn test_tmux_output(socket_name: &str, args: &[&str]) -> std::process::Output {
         let output = Command::new("tmux")
             .arg("-L")
@@ -1748,6 +1777,15 @@ mod tests {
     }
 
     fn new_test_tmux_pane(socket_name: &str, session: &str, target: Option<&str>) -> String {
+        new_test_tmux_command_pane(socket_name, session, target, "sleep 30")
+    }
+
+    fn new_test_tmux_command_pane(
+        socket_name: &str,
+        session: &str,
+        target: Option<&str>,
+        command: &str,
+    ) -> String {
         match target {
             None => test_tmux_value(
                 socket_name,
@@ -1758,10 +1796,14 @@ mod tests {
                     "-d",
                     "-s",
                     session,
+                    "-x",
+                    "200",
+                    "-y",
+                    "80",
                     "-P",
                     "-F",
                     "#{pane_id}",
-                    "sleep 30",
+                    command,
                 ],
             ),
             Some(target) => test_tmux_value(
@@ -1774,10 +1816,14 @@ mod tests {
                     "-P",
                     "-F",
                     "#{pane_id}",
-                    "sleep 30",
+                    command,
                 ],
             ),
         }
+    }
+
+    fn set_test_pane_title(socket_name: &str, pane_id: &str, title: &str) {
+        test_tmux_output(socket_name, &["select-pane", "-t", pane_id, "-T", title]);
     }
 
     fn mark_test_remote_pane(
@@ -1917,6 +1963,155 @@ mod tests {
             .args([
                 "--exact",
                 "tmux::tests::remote_tmux_focus_repairs_only_a_unique_stale_mosh_binding",
+                "--nocapture",
+            ])
+            .env(SOCKET_ENV, &socket_name)
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .output()
+            .unwrap();
+        let _ = Command::new("tmux")
+            .args(["-L", &socket_name, "kill-server"])
+            .status();
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn remote_terminal_focus_resolves_a_unique_mosh_process_without_binding() {
+        const SOCKET_ENV: &str = "TMUX_AGENT_REMOTE_TERMINAL_FOCUS_TEST_SOCKET";
+        if let Some(socket_name) = std::env::var_os(SOCKET_ENV) {
+            let socket_name = socket_name.to_string_lossy().into_owned();
+            let mosh_command = |alias: &str| {
+                format!(
+                    "/bin/bash -c 'exec -a \"mosh-client -# --no-init {alias} | <address> <port>\" sleep 30'"
+                )
+            };
+            let ssh_command = "/bin/bash -c 'exec -a \"ssh remote-mac\" sleep 30'".to_string();
+
+            let unrelated = new_test_tmux_command_pane(
+                &socket_name,
+                "local",
+                None,
+                &mosh_command("other-remote"),
+            );
+            let unique = new_test_tmux_command_pane(
+                &socket_name,
+                "local",
+                Some(&unrelated),
+                &mosh_command("remote-mac"),
+            );
+            let marked = new_test_tmux_command_pane(
+                &socket_name,
+                "local",
+                Some(&unrelated),
+                &mosh_command("remote-mac"),
+            );
+            let ssh =
+                new_test_tmux_command_pane(&socket_name, "local", Some(&unrelated), &ssh_command);
+            let ambiguous_one = new_test_tmux_command_pane(
+                &socket_name,
+                "local",
+                Some(&unrelated),
+                &mosh_command("remote-mac"),
+            );
+            let ambiguous_two = new_test_tmux_command_pane(
+                &socket_name,
+                "local",
+                Some(&unrelated),
+                &mosh_command("remote-mac"),
+            );
+
+            set_test_pane_title(&socket_name, &unrelated, "[mosh] ⣸ project");
+            set_test_pane_title(&socket_name, &unique, "[mosh] ⣸ project");
+            mark_test_remote_pane(
+                &socket_name,
+                &marked,
+                "remote-mac",
+                "nested-session",
+                "[mosh] ⣸ project",
+            );
+            set_test_pane_title(&socket_name, &ssh, "ssh-project");
+            set_test_pane_title(&socket_name, &ambiguous_one, "[mosh] ⣴ ambiguous");
+            set_test_pane_title(&socket_name, &ambiguous_two, "[mosh] ⣴ ambiguous");
+            test_tmux_output(&socket_name, &["select-pane", "-t", &unrelated]);
+
+            let config = Config {
+                tmux_args: vec!["-L".into(), socket_name.clone()],
+                ..Config::default()
+            };
+            let tmux = Tmux::new(&config);
+
+            tmux.focus_agent(&remote_terminal_record("⣹ project"))
+                .unwrap();
+            assert_eq!(
+                test_tmux_value(
+                    &socket_name,
+                    &["display-message", "-p", "-t", &unique, "#{pane_active}"],
+                ),
+                "1"
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &unique, REMOTE_HOST_OPTION),
+                ""
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &unique, REMOTE_SESSION_OPTION),
+                ""
+            );
+
+            tmux.focus_agent(&remote_terminal_record("ssh-project"))
+                .unwrap();
+            assert_eq!(
+                test_tmux_value(
+                    &socket_name,
+                    &["display-message", "-p", "-t", &ssh, "#{pane_active}"],
+                ),
+                "1"
+            );
+
+            test_tmux_output(&socket_name, &["select-pane", "-t", &unrelated]);
+            let error = tmux
+                .focus_agent(&remote_terminal_record("ambiguous"))
+                .unwrap_err();
+            assert!(error.to_string().contains(&ambiguous_one));
+            assert!(error.to_string().contains(&ambiguous_two));
+            assert_eq!(
+                test_tmux_value(
+                    &socket_name,
+                    &["display-message", "-p", "-t", &unrelated, "#{pane_active}",],
+                ),
+                "1"
+            );
+            for pane_id in [&ambiguous_one, &ambiguous_two] {
+                assert_eq!(
+                    test_pane_option(&socket_name, pane_id, REMOTE_HOST_OPTION),
+                    ""
+                );
+                assert_eq!(
+                    test_pane_option(&socket_name, pane_id, REMOTE_SESSION_OPTION),
+                    ""
+                );
+            }
+            return;
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket_name = format!(
+            "tmux-agent-remote-terminal-focus-{}-{nonce}",
+            std::process::id()
+        );
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tmux::tests::remote_terminal_focus_resolves_a_unique_mosh_process_without_binding",
                 "--nocapture",
             ])
             .env(SOCKET_ENV, &socket_name)
@@ -2532,6 +2727,8 @@ mod tests {
     fn transport_titles_ignore_provider_braille_spinners() {
         assert_eq!(normalize_transport_title("⠂ project"), "project");
         assert_eq!(normalize_transport_title("⠸ project"), "project");
+        assert_eq!(normalize_transport_title("[mosh] ⠸ project"), "project");
+        assert_eq!(normalize_transport_title("[mosh] · ⣹ project"), "project");
         assert_eq!(normalize_transport_title("⠸"), "");
         assert_eq!(normalize_transport_title("⣿"), "⣿");
         assert_eq!(normalize_transport_title("⣿art"), "⣿art");
@@ -2613,23 +2810,44 @@ mod tests {
     }
 
     #[test]
-    fn ssh_destination_skips_options_and_user_prefix() {
+    fn transport_destination_preserves_ssh_options_and_user_prefix() {
         assert_eq!(
-            ssh_destination("/usr/bin/ssh -tt -o BatchMode=yes -p 22 agent@host"),
+            transport_destination("/usr/bin/ssh -tt -o BatchMode=yes -p 22 agent@host"),
             Some("host")
         );
-        assert_eq!(ssh_destination("ssh -vJ jump remote"), Some("remote"));
-        assert_eq!(ssh_destination("ssh -vJjump remote"), Some("remote"));
-        assert_eq!(ssh_destination("mosh remote-mac"), None);
-        assert_eq!(ssh_destination("ssh -p 22"), None);
+        assert_eq!(transport_destination("ssh -vJ jump remote"), Some("remote"));
+        assert_eq!(transport_destination("ssh -vJjump remote"), Some("remote"));
+        assert_eq!(transport_destination("mosh remote-mac"), None);
+        assert_eq!(transport_destination("ssh -p 22"), None);
     }
 
     #[test]
-    fn ssh_destination_requires_the_foreground_group_leader_to_be_ssh() {
-        assert_eq!(ssh_destination("git fetch\nssh remote-mac"), None);
+    fn transport_destination_requires_the_foreground_group_leader() {
+        assert_eq!(transport_destination("git fetch\nssh remote-mac"), None);
         assert_eq!(
-            ssh_destination("ssh remote-mac\nhelper process"),
+            transport_destination("ssh remote-mac\nhelper process"),
             Some("remote-mac")
+        );
+    }
+
+    #[test]
+    fn mosh_destination_comes_from_the_client_process_title() {
+        assert_eq!(
+            transport_destination(
+                "mosh-client -# --no-init remote-mac | <address> <port>\nhelper process"
+            ),
+            Some("remote-mac")
+        );
+        assert_eq!(
+            transport_destination(
+                "/usr/local/bin/mosh-client -# --no-init user@remote-mac | <address> <port>"
+            ),
+            Some("remote-mac")
+        );
+        assert_eq!(transport_destination("mosh remote-mac"), None);
+        assert_eq!(
+            transport_destination("mosh-client -# --no-init remote-mac | <address>"),
+            None
         );
     }
 
