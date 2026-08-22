@@ -118,6 +118,12 @@ agent because another SSH pane can have the same title.
 If no unique local SSH or mirror pane can be resolved, tmux-agent reports the
 ambiguity or missing focus target instead of guessing.
 
+For a uniquely resolved remote agent, completion visibility requires both the
+remote agent pane and its local transport pane to be visible. A completion in a
+hidden local transport is shown as `done`. Opening that transport marks the
+completion seen. Ambiguous and unresolved transports keep the peer's reported
+visibility and attention state.
+
 Nested remote tmux over mosh, or over an SSH connection that cannot be matched
 to the remote agent process, needs an explicit local-pane binding. Run this on
 the local machine before entering the remote shell, or pass the local pane ID

@@ -854,6 +854,7 @@ fn local_ssh_transport(
         remote_session: pane.mirror_session.clone(),
         title: normalize_transport_title(&pane.title),
         label: pane.label.clone(),
+        visible: pane.visible,
         target: TmuxTarget {
             session_name: pane.session_name.clone(),
             window_id: pane.window_id.clone(),
@@ -2260,6 +2261,7 @@ mod tests {
         assert_eq!(transport.remote_session.as_deref(), Some("remote-session"));
         assert_eq!(transport.title, "project-one");
         assert_eq!(transport.label.as_deref(), Some("testing env"));
+        assert!(transport.visible);
         assert_eq!(transport.target.pane_id, "%45");
     }
 
