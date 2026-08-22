@@ -99,7 +99,10 @@ persistence.
 
 When a remote session was reached through an SSH process inside local tmux,
 tmux-agent matches the two endpoints of that established connection and can
-focus the local pane carrying it.
+focus the local pane carrying it. An ordinary remote terminal reached through
+mosh can also be focused when exactly one live, unmarked local pane has a
+`mosh-client` process title naming the configured remote and its normalized
+pane title matches the selected agent. The process title stays local.
 
 An integration that provides mirror panes can set:
 
@@ -115,8 +118,11 @@ Set both markers on a local pane that attaches to a tmux session on the remote
 machine. tmux-agent does not use a matching title alone for a remote tmux
 agent because another SSH pane can have the same title.
 
-If no unique local SSH or mirror pane can be resolved, tmux-agent reports the
-ambiguity or missing focus target instead of guessing.
+Explicitly marked panes are reserved for remote tmux bindings and are not
+ordinary-terminal candidates. Dead panes and tmux-agent UI panes are also
+excluded. If no unique local SSH, mosh, or mirror pane can be resolved,
+tmux-agent reports the ambiguity or missing focus target instead of guessing.
+Ordinary mosh focus does not write pane options.
 
 For a uniquely resolved remote agent, completion visibility requires both the
 remote agent pane and its local transport pane to be visible. A completion in a

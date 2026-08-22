@@ -248,7 +248,12 @@ lines.
 
 Local records focus their stored tmux session, window, and pane. Remote focus
 matches the two endpoints of an established SSH connection to a local tmux
-pane. Public mirror markers provide an explicit fallback:
+pane. For an ordinary remote terminal over mosh, focus can instead resolve one
+live, unmarked, non-UI pane whose local `mosh-client` process title names the
+configured remote and whose normalized pane title matches the selected record.
+The resolver rejects zero or multiple candidates, does not persist process
+arguments, and does not write a binding. Public mirror markers provide an
+explicit fallback for remote tmux:
 
 ```text
 @tmux_agent_remote_host
