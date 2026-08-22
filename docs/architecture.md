@@ -257,8 +257,11 @@ pane. Public mirror markers provide an explicit fallback:
 
 `tmux-agent remote bind` and `remote unbind` manage these pane-local markers.
 This gives nested tmux over mosh an exact local focus target without screen or
-title inference. The daemon protocol and persisted state do not carry the
-binding.
+unmarked title inference. If a remote tmux session is recreated under a new
+name, focus can update the session marker when exactly one live, non-UI pane is
+already marked for that host and its normalized title matches the selected
+agent. Ambiguous matches are rejected. The daemon protocol and persisted state
+do not carry the binding.
 
 ## Security boundaries
 
