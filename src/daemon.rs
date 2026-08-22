@@ -4,7 +4,7 @@ use crate::model::{
     GoalAcknowledgement, GoalState, IpcRequest, IpcResponse, PROTOCOL_VERSION, PeerStatus,
     Snapshot, SshTransport,
 };
-use crate::scanner::{Scanner, now_ms};
+use crate::scanner::{Scanner, attention, next_seen, now_ms};
 use crate::{
     store,
     tmux::{Tmux, is_server_missing},
@@ -69,6 +69,9 @@ enum RemoteStreamExit {
 struct Aggregate {
     local: Snapshot,
     remotes: HashMap<String, Snapshot>,
+    // Peer snapshots keep peer-reported attention. This overlay exists only
+    // while a unique local transport lets this daemon observe visibility.
+    remote_seen: HashMap<String, HashMap<String, bool>>,
     peers: HashMap<String, PeerStatus>,
     acknowledgements: Acknowledgements,
     last_used_at_ms: HashMap<String, u64>,
@@ -152,6 +155,7 @@ impl Shared {
             inner: RwLock::new(Aggregate {
                 local,
                 remotes: HashMap::new(),
+                remote_seen: HashMap::new(),
                 peers,
                 acknowledgements,
                 last_used_at_ms: HashMap::new(),
@@ -179,6 +183,17 @@ impl Shared {
         }
         let local_revision = snapshot.revision;
         inner.local = snapshot;
+        let transports = inner.local.ssh_transports.clone();
+        let mut remote_seen = std::mem::take(&mut inner.remote_seen);
+        for (alias, remote) in &inner.remotes {
+            observe_remote_agents(
+                &remote.agents,
+                Some(&remote.agents),
+                &transports,
+                remote_seen.entry(alias.clone()).or_default(),
+            );
+        }
+        inner.remote_seen = remote_seen;
         prune_last_used(&mut inner);
         inner.revision += 1;
         let revision = inner.revision;
@@ -198,8 +213,25 @@ impl Shared {
         let protocol = snapshot.protocol;
         let capabilities = snapshot.capabilities.clone();
         let mut inner = self.inner.write().await;
+        let previous = inner.remotes.get(alias).map(|remote| remote.agents.clone());
+        let mut observed_seen = inner.remote_seen.remove(alias).unwrap_or_default();
+        observe_remote_agents(
+            &snapshot.agents,
+            previous.as_deref(),
+            &inner.local.ssh_transports,
+            &mut observed_seen,
+        );
         let acknowledgement_changed =
             apply_acknowledgements(&mut snapshot.agents, &mut inner.acknowledgements);
+        for agent in &snapshot.agents {
+            if observed_seen.contains_key(&agent.id)
+                && inner.acknowledgements.completions.contains(&agent.id)
+                && agent.state == AgentState::Idle
+            {
+                observed_seen.insert(agent.id.clone(), true);
+            }
+        }
+        inner.remote_seen.insert(alias.to_string(), observed_seen);
         inner.remotes.insert(alias.to_string(), snapshot);
         prune_last_used(&mut inner);
         if let Some(peer) = inner.peers.get_mut(alias) {
@@ -225,6 +257,7 @@ impl Shared {
             peer.last_error = Some(message);
         }
         inner.remotes.remove(alias);
+        inner.remote_seen.remove(alias);
         prune_last_used(&mut inner);
         inner.revision += 1;
         let revision = inner.revision;
@@ -251,6 +284,13 @@ impl Shared {
                 .acknowledgements
                 .completions
                 .insert(target.to_string());
+            if remote.persist_completion {
+                for observed_seen in inner.remote_seen.values_mut() {
+                    if let Some(seen) = observed_seen.get_mut(target) {
+                        *seen = true;
+                    }
+                }
+            }
         }
         if let Some(achievement_observed_at_ms) = local.goal_achievement.or(remote.goal_achievement)
         {
@@ -312,9 +352,13 @@ impl Shared {
         let mut snapshot = inner.local.clone();
         snapshot.revision = inner.revision;
         snapshot.generated_at_ms = now_ms();
-        for remote in inner.remotes.values() {
+        for (alias, remote) in &inner.remotes {
             let mut agents = remote.agents.clone();
-            reconcile_transports(&mut agents, &inner.local.ssh_transports);
+            reconcile_transports_with_observations(
+                &mut agents,
+                &inner.local.ssh_transports,
+                inner.remote_seen.get(alias),
+            );
             snapshot.agents.extend(agents);
         }
         snapshot.peers = inner.peers.values().cloned().collect();
@@ -642,66 +686,48 @@ enum UniqueTransport<'a> {
     Ambiguous,
 }
 
+enum TransportResolution<'a> {
+    None,
+    One {
+        transport: &'a SshTransport,
+        exact_connection: bool,
+    },
+    Ambiguous,
+}
+
+#[cfg(test)]
 fn reconcile_transports(agents: &mut [AgentRecord], transports: &[SshTransport]) {
-    let title_counts = agents
-        .iter()
-        .filter_map(|agent| {
-            let alias = agent.remote_alias.as_ref()?;
-            let title = crate::tmux::normalize_transport_title(&agent.title);
-            (!title.is_empty()).then(|| ((alias.clone(), title), 1_usize))
-        })
-        .fold(HashMap::new(), |mut counts, (key, count)| {
-            *counts.entry(key).or_insert(0) += count;
-            counts
-        });
+    reconcile_transports_with_observations(agents, transports, None);
+}
+
+fn reconcile_transports_with_observations(
+    agents: &mut [AgentRecord],
+    transports: &[SshTransport],
+    observed_seen: Option<&HashMap<String, bool>>,
+) {
+    let title_counts = remote_title_counts(agents);
 
     for agent in agents {
-        match exact_transport(agent, transports) {
-            UniqueTransport::One(transport) => {
-                apply_transport(agent, transport, true);
-                continue;
-            }
-            UniqueTransport::Ambiguous => continue,
-            UniqueTransport::None => {}
-        }
-
-        let Some(alias) = agent.remote_alias.as_deref() else {
-            continue;
-        };
-        if agent.is_tmux() {
-            match unique_transport(transports.iter().filter(|transport| {
-                transport.remote_host == alias
-                    && transport.remote_host_explicit
-                    && transport.remote_session.as_deref() == Some(agent.session_name.as_str())
-            })) {
-                UniqueTransport::One(transport) => {
-                    apply_transport(agent, transport, false);
-                    continue;
-                }
-                UniqueTransport::Ambiguous => continue,
-                UniqueTransport::None => {}
-            }
-            continue;
-        }
-
-        let title = crate::tmux::normalize_transport_title(&agent.title);
-        if title.is_empty() || title_counts.get(&(alias.to_string(), title.clone())) != Some(&1) {
-            continue;
-        }
-        if let UniqueTransport::One(transport) =
-            unique_transport(transports.iter().filter(|transport| {
-                transport.remote_host == alias
-                    && !transport.remote_host_explicit
-                    && transport.remote_session.is_none()
-                    && transport.title == title
-            }))
+        if let TransportResolution::One {
+            transport,
+            exact_connection,
+        } = resolve_transport(agent, transports, &title_counts)
         {
-            apply_transport(agent, transport, false);
+            apply_transport(agent, transport, exact_connection);
+            if let Some(seen) = observed_seen.and_then(|seen| seen.get(&agent.id)).copied() {
+                agent.seen = seen;
+                agent.attention = attention(agent.state, agent.seen);
+            }
         }
     }
 }
 
 fn apply_transport(agent: &mut AgentRecord, transport: &SshTransport, exact_connection: bool) {
+    agent.visible = agent.visible && transport.visible;
+    if agent.visible && agent.state == AgentState::Idle {
+        agent.seen = true;
+        agent.attention = Attention::Idle;
+    }
     if exact_connection {
         agent.focus_target = Some(transport.target.clone());
     }
@@ -712,6 +738,115 @@ fn apply_transport(agent: &mut AgentRecord, transport: &SshTransport, exact_conn
         .filter(|label| !label.is_empty())
     {
         agent.label = Some(label.to_string());
+    }
+}
+
+fn observe_remote_agents(
+    agents: &[AgentRecord],
+    previous: Option<&[AgentRecord]>,
+    transports: &[SshTransport],
+    observed_seen: &mut HashMap<String, bool>,
+) {
+    let title_counts = remote_title_counts(agents);
+    let previous = previous
+        .unwrap_or_default()
+        .iter()
+        .map(|agent| (agent.id.as_str(), agent))
+        .collect::<HashMap<_, _>>();
+    let current_ids = agents
+        .iter()
+        .map(|agent| agent.id.as_str())
+        .collect::<HashSet<_>>();
+    observed_seen.retain(|id, _| current_ids.contains(id.as_str()));
+    for agent in agents {
+        let transport = match resolve_transport(agent, transports, &title_counts) {
+            TransportResolution::One { transport, .. } => transport,
+            TransportResolution::None | TransportResolution::Ambiguous => {
+                observed_seen.remove(&agent.id);
+                continue;
+            }
+        };
+        let effective_visible = agent.visible && transport.visible;
+        let seen = if let Some(previous) = previous.get(agent.id.as_str()).copied() {
+            let mut previous = previous.clone();
+            previous.seen = observed_seen
+                .get(&agent.id)
+                .copied()
+                .unwrap_or(previous.seen);
+            next_seen(Some(&previous), agent.state, effective_visible)
+        } else if effective_visible {
+            true
+        } else {
+            agent.seen
+        };
+        observed_seen.insert(agent.id.clone(), seen);
+    }
+}
+
+fn remote_title_counts(agents: &[AgentRecord]) -> HashMap<(String, String), usize> {
+    agents
+        .iter()
+        .filter_map(|agent| {
+            let alias = agent.remote_alias.as_ref()?;
+            let title = crate::tmux::normalize_transport_title(&agent.title);
+            (!title.is_empty()).then(|| ((alias.clone(), title), 1_usize))
+        })
+        .fold(HashMap::new(), |mut counts, (key, count)| {
+            *counts.entry(key).or_insert(0) += count;
+            counts
+        })
+}
+
+fn resolve_transport<'a>(
+    agent: &AgentRecord,
+    transports: &'a [SshTransport],
+    title_counts: &HashMap<(String, String), usize>,
+) -> TransportResolution<'a> {
+    match exact_transport(agent, transports) {
+        UniqueTransport::One(transport) => {
+            return TransportResolution::One {
+                transport,
+                exact_connection: true,
+            };
+        }
+        UniqueTransport::Ambiguous => return TransportResolution::Ambiguous,
+        UniqueTransport::None => {}
+    }
+
+    let Some(alias) = agent.remote_alias.as_deref() else {
+        return TransportResolution::None;
+    };
+    if agent.is_tmux() {
+        return match unique_transport(transports.iter().filter(|transport| {
+            transport.remote_host == alias
+                && transport.remote_host_explicit
+                && transport.remote_session.as_deref() == Some(agent.session_name.as_str())
+        })) {
+            UniqueTransport::One(transport) => TransportResolution::One {
+                transport,
+                exact_connection: false,
+            },
+            UniqueTransport::Ambiguous => TransportResolution::Ambiguous,
+            UniqueTransport::None => TransportResolution::None,
+        };
+    }
+
+    let title = crate::tmux::normalize_transport_title(&agent.title);
+    if title.is_empty() || title_counts.get(&(alias.to_string(), title.clone())) != Some(&1) {
+        return TransportResolution::None;
+    }
+    match unique_transport(transports.iter().filter(|transport| {
+        transport.remote_host == alias
+            && !transport.remote_host_explicit
+            && transport.remote_session.is_none()
+            && transport.title == title
+    })) {
+        UniqueTransport::One(transport) => TransportResolution::One {
+            transport,
+            exact_connection: false,
+        },
+        UniqueTransport::Ambiguous => TransportResolution::Ambiguous,
+        UniqueTransport::None => TransportResolution::None,
     }
 }
 
@@ -1031,6 +1166,7 @@ mod tests {
             remote_session: None,
             title: title.into(),
             label: label.map(str::to_string),
+            visible: false,
             target: TmuxTarget {
                 session_name: session.into(),
                 window_id: format!("@{session}"),
@@ -1039,6 +1175,31 @@ mod tests {
                 pane_index: 0,
             },
         }
+    }
+
+    fn explicit_transport(session: &str) -> SshTransport {
+        let mut transport = transport(session, None, "work", None);
+        transport.remote_host_explicit = true;
+        transport.remote_session = Some("main".into());
+        transport
+    }
+
+    async fn publish_remote_tmux_completion(shared: &Shared) -> Snapshot {
+        let mut remote = Snapshot {
+            agents: vec![agent(
+                "shared-host/default/%1",
+                AgentState::Working,
+                Attention::Working,
+            )],
+            ..Snapshot::default()
+        };
+        remote.agents[0].visible = true;
+        shared.publish_remote("remote-mac", remote.clone()).await;
+        remote.agents[0].state = AgentState::Idle;
+        remote.agents[0].attention = Attention::Idle;
+        remote.agents[0].seen = true;
+        shared.publish_remote("remote-mac", remote.clone()).await;
+        remote
     }
 
     #[tokio::test]
@@ -1332,6 +1493,195 @@ mod tests {
         assert!(!shared.publish_local(local).await);
     }
 
+    #[tokio::test]
+    async fn hidden_local_transport_makes_remote_completion_unseen() {
+        let directory = tempdir().unwrap();
+        let shared = Shared::new(
+            Snapshot {
+                ssh_transports: vec![explicit_transport("transport")],
+                ..Snapshot::default()
+            },
+            &[],
+            Acknowledgements::default(),
+            directory.path().join("acknowledged.json"),
+        )
+        .unwrap();
+        let remote = publish_remote_tmux_completion(&shared).await;
+
+        let snapshot = shared.snapshot(false).await;
+        let completed = snapshot
+            .agents
+            .iter()
+            .find(|record| record.remote_alias.as_deref() == Some("remote-mac"))
+            .unwrap();
+        assert!(!completed.visible);
+        assert!(!completed.seen);
+        assert_eq!(completed.attention, Attention::Done);
+
+        assert!(shared.acknowledge(&completed.id).await.unwrap());
+        shared.publish_remote("remote-mac", remote).await;
+        let acknowledged = shared
+            .snapshot(false)
+            .await
+            .agents
+            .into_iter()
+            .find(|record| record.remote_alias.as_deref() == Some("remote-mac"))
+            .unwrap();
+        assert!(acknowledged.seen);
+        assert_eq!(acknowledged.attention, Attention::Idle);
+    }
+
+    #[tokio::test]
+    async fn visible_exact_transport_keeps_remote_completion_seen() {
+        let directory = tempdir().unwrap();
+        let connection = SshConnection {
+            client_address: "192.0.2.10".into(),
+            client_port: 64308,
+            server_address: "198.51.100.20".into(),
+            server_port: 22,
+        };
+        let mut binding = transport("transport", Some(connection.clone()), "work", None);
+        binding.visible = true;
+        let shared = Shared::new(
+            Snapshot {
+                ssh_transports: vec![binding],
+                ..Snapshot::default()
+            },
+            &[],
+            Acknowledgements::default(),
+            directory.path().join("acknowledged.json"),
+        )
+        .unwrap();
+        let mut remote = Snapshot {
+            agents: vec![agent(
+                "shared-host/terminal/ttys004/26621",
+                AgentState::Working,
+                Attention::Working,
+            )],
+            ..Snapshot::default()
+        };
+        remote.agents[0].origin = AgentOrigin::Terminal;
+        remote.agents[0].ssh_connection = Some(connection);
+        remote.agents[0].visible = true;
+        shared.publish_remote("remote-mac", remote.clone()).await;
+
+        remote.agents[0].state = AgentState::Idle;
+        remote.agents[0].attention = Attention::Idle;
+        remote.agents[0].seen = true;
+        shared.publish_remote("remote-mac", remote).await;
+
+        let snapshot = shared.snapshot(false).await;
+        let completed = snapshot
+            .agents
+            .iter()
+            .find(|record| record.remote_alias.as_deref() == Some("remote-mac"))
+            .unwrap();
+        assert!(completed.visible);
+        assert!(completed.seen);
+        assert_eq!(completed.attention, Attention::Idle);
+    }
+
+    #[tokio::test]
+    async fn showing_local_transport_marks_remote_completion_seen() {
+        let directory = tempdir().unwrap();
+        let mut local = Snapshot {
+            revision: 1,
+            ssh_transports: vec![explicit_transport("transport")],
+            ..Snapshot::default()
+        };
+        let shared = Shared::new(
+            local.clone(),
+            &[],
+            Acknowledgements::default(),
+            directory.path().join("acknowledged.json"),
+        )
+        .unwrap();
+        publish_remote_tmux_completion(&shared).await;
+        assert_eq!(
+            shared.snapshot(false).await.agents[0].attention,
+            Attention::Done
+        );
+
+        local.revision = 2;
+        local.ssh_transports[0].visible = true;
+        assert!(shared.publish_local(local).await);
+
+        let snapshot = shared.snapshot(false).await;
+        let completed = snapshot
+            .agents
+            .iter()
+            .find(|record| record.remote_alias.as_deref() == Some("remote-mac"))
+            .unwrap();
+        assert!(completed.visible);
+        assert!(completed.seen);
+        assert_eq!(completed.attention, Attention::Idle);
+    }
+
+    #[tokio::test]
+    async fn removing_hidden_transport_restores_remote_completion_state() {
+        let directory = tempdir().unwrap();
+        let mut local = Snapshot {
+            revision: 1,
+            ssh_transports: vec![explicit_transport("transport")],
+            ..Snapshot::default()
+        };
+        let shared = Shared::new(
+            local.clone(),
+            &[],
+            Acknowledgements::default(),
+            directory.path().join("acknowledged.json"),
+        )
+        .unwrap();
+        publish_remote_tmux_completion(&shared).await;
+        assert_eq!(
+            shared.snapshot(false).await.agents[0].attention,
+            Attention::Done
+        );
+
+        local.revision = 2;
+        local.ssh_transports.clear();
+        assert!(shared.publish_local(local).await);
+
+        let restored = shared.snapshot(false).await.agents.pop().unwrap();
+        assert!(restored.visible);
+        assert!(restored.seen);
+        assert_eq!(restored.attention, Attention::Idle);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_hidden_transport_restores_remote_completion_state() {
+        let directory = tempdir().unwrap();
+        let mut binding = explicit_transport("transport-one");
+        let mut local = Snapshot {
+            revision: 1,
+            ssh_transports: vec![binding.clone()],
+            ..Snapshot::default()
+        };
+        let shared = Shared::new(
+            local.clone(),
+            &[],
+            Acknowledgements::default(),
+            directory.path().join("acknowledged.json"),
+        )
+        .unwrap();
+        publish_remote_tmux_completion(&shared).await;
+        assert_eq!(
+            shared.snapshot(false).await.agents[0].attention,
+            Attention::Done
+        );
+
+        binding.target.session_name = "transport-two".into();
+        binding.target.pane_id = "%transport-two".into();
+        local.revision = 2;
+        local.ssh_transports.push(binding);
+        assert!(shared.publish_local(local).await);
+
+        let restored = shared.snapshot(false).await.agents.pop().unwrap();
+        assert!(restored.visible);
+        assert!(restored.seen);
+        assert_eq!(restored.attention, Attention::Idle);
+    }
+
     #[test]
     fn acknowledgement_survives_unknown_evidence() {
         let id = "remote/remote-mac/session";
@@ -1522,12 +1872,17 @@ mod tests {
             Attention::Unknown,
         );
         record.ssh_connection = Some(connection.clone());
+        record.visible = true;
         let transports = ["one", "two"]
             .map(|session| transport(session, Some(connection.clone()), "work", None));
         assert!(matches!(
             exact_transport(&record, &transports),
             UniqueTransport::Ambiguous
         ));
+
+        reconcile_transports(std::slice::from_mut(&mut record), &transports);
+
+        assert!(record.visible);
     }
 
     #[test]
@@ -1667,6 +2022,7 @@ mod tests {
         record.remote_alias = Some("remote-mac".into());
         record.session_name = "session-b".into();
         record.title = "same-project".into();
+        record.visible = true;
         let mut marked = transport("transport", None, "same-project", Some("wrong"));
         marked.remote_host_explicit = true;
         marked.remote_session = Some("session-a".into());
@@ -1676,6 +2032,7 @@ mod tests {
 
         assert!(record.label.is_none());
         assert!(record.focus_target.is_none());
+        assert!(record.visible);
     }
 
     #[test]

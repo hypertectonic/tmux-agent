@@ -614,7 +614,7 @@ impl Scanner {
     }
 }
 
-fn next_seen(old: Option<&AgentRecord>, state: AgentState, visible: bool) -> bool {
+pub(crate) fn next_seen(old: Option<&AgentRecord>, state: AgentState, visible: bool) -> bool {
     if visible {
         return true;
     }
@@ -688,7 +688,7 @@ fn goal_lifecycle(
     }
 }
 
-fn attention(state: AgentState, seen: bool) -> Attention {
+pub(crate) fn attention(state: AgentState, seen: bool) -> Attention {
     match state {
         AgentState::Blocked => Attention::Blocked,
         AgentState::Working => Attention::Working,

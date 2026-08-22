@@ -113,13 +113,16 @@ protocol version. Restart the central daemon after correcting configuration.
 ## Remote focus fails
 
 Remote focus requires a unique local tmux pane carrying the matching SSH
-connection or a mirror pane with the public remote marker options. Multiple
-matching panes are rejected. A remote tmux agent is not matched to a local SSH
+connection, an ordinary-terminal mosh pane whose client process names the
+configured remote and whose normalized title matches, or a mirror pane with
+the public remote marker options. Multiple matching panes are rejected. Mosh
+focus never uses title alone, never claims an explicitly marked pane, and does
+not write a binding. A remote tmux agent is not matched to a local transport
 pane by title alone. Use `tmux-agent explain <id-or-pane>` and `tmux-agent
 doctor` to inspect the derived target without exposing pane contents.
 
 For nested remote tmux over mosh, bind the correct local transport pane
-explicitly. Run the command on the local machine, not inside the remote tmux
+initially. Run the command on the local machine, not inside the remote tmux
 session:
 
 ```sh
@@ -127,7 +130,11 @@ tmux-agent remote bind <configured-remote> <remote-tmux-session> --pane <local-p
 ```
 
 Use `tmux-agent remote bindings` to inspect current mappings and `tmux-agent
-remote unbind --pane <local-pane-id>` to remove one.
+remote unbind --pane <local-pane-id>` to remove one. A stale remote session name
+self-heals during focus when exactly one live pane is already bound to that host
+and its normalized title matches the selected agent. If no pane or several
+panes match, tmux-agent leaves every binding unchanged and reports the focus
+failure.
 
 ## A completion remains visible
 
