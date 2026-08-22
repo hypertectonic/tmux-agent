@@ -6,6 +6,17 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+## [0.8.1] - 2026-08-22
+
+### Fixed
+
+- Mark remote completions unseen when the uniquely resolved local SSH or Mosh
+  transport is hidden, then mark them seen when that transport becomes visible.
+- Repair a stale nested tmux session binding during focus when exactly one
+  host-marked Mosh pane has the matching restored session title.
+- Focus ordinary remote terminal sessions through a unique matching Mosh
+  transport while preserving fail-closed ambiguity and existing SSH behavior.
+
 ## [0.8.0] - 2026-08-20
 
 ### Added
