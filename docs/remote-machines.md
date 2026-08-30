@@ -130,18 +130,27 @@ hidden local transport is shown as `done`. Opening that transport marks the
 completion seen. Ambiguous and unresolved transports keep the peer's reported
 visibility and attention state.
 
-For a detached default-server tmux session, focus can create the initial mosh
-binding when exactly one unmarked pane names the configured remote and its
-shell working-directory title matches the remote agent directory. tmux-agent
-selects the exact remote window and pane, types the attach command into that
-shell, verifies that the local pane adopts the selected agent title, then writes
-the markers and focuses it. It does not try this when the host already has a
-binding, the session uses a named tmux server, or zero or multiple shells match.
+An exact host and session binding takes priority. Without one, focus can adopt
+exactly one live, unmarked mosh pane that names the configured remote and is
+already displaying the selected agent with the nested tmux title shape
+`[mosh] · ...`. The ordinary-terminal shape `[mosh] title` is not adopted as a
+tmux binding. A binding for another session on the same host does not block
+this recovery. Zero or multiple matching panes are left unmarked.
+
+For a detached default-server tmux session, focus can instead create the
+initial mosh binding when exactly one unmarked pane names the configured remote
+and its shell working-directory title matches the remote agent directory.
+tmux-agent selects the exact remote window and pane, types the attach command
+into that shell, verifies that the local pane adopts the selected agent title,
+then writes the markers and focuses it. Another binding on the host does not
+block a unique alias and working-directory match. Named tmux servers and zero
+or multiple shell matches fail closed.
 
 Other nested remote tmux connections, including SSH connections that cannot be
-matched to the remote agent process, need an initial explicit local-pane
-binding. Run this on the local machine before entering the remote shell, or pass
-the local pane ID from another local pane:
+matched to the remote agent process or mosh panes without the nested title
+shape, need an initial explicit local-pane binding. Run this on the local
+machine before entering the remote shell, or pass the local pane ID from
+another local pane:
 
 ```sh
 tmux-agent remote bind build-host agents --pane %42
