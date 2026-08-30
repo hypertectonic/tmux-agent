@@ -117,13 +117,17 @@ connection, an ordinary-terminal mosh pane whose client process names the
 configured remote and whose normalized title matches, or a mirror pane with
 the public remote marker options. Multiple matching panes are rejected. Mosh
 focus never uses title alone, never claims an explicitly marked pane, and does
-not write a binding. A remote tmux agent is not matched to a local transport
-pane by title alone. Use `tmux-agent explain <id-or-pane>` and `tmux-agent
+not write a binding. Use `tmux-agent explain <id-or-pane>` and `tmux-agent
 doctor` to inspect the derived target without exposing pane contents.
 
-For nested remote tmux over mosh, bind the correct local transport pane
-initially. Run the command on the local machine, not inside the remote tmux
-session:
+For a detached default-server tmux session, tmux-agent can recover one idle,
+unmarked mosh shell when both its configured destination and displayed working
+directory match the remote record. It verifies the resulting agent title before
+writing a binding. Existing host bindings, named servers, zero matches, and
+multiple matches are not guessed.
+
+For other nested remote tmux cases, bind the correct local transport pane
+initially. Run the command on the local machine, not inside the remote tmux session:
 
 ```sh
 tmux-agent remote bind <configured-remote> <remote-tmux-session> --pane <local-pane-id>
