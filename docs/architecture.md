@@ -262,11 +262,26 @@ explicit fallback for remote tmux:
 
 `tmux-agent remote bind` and `remote unbind` manage these pane-local markers.
 This gives nested tmux over mosh an exact local focus target without screen or
-unmarked title inference. If a remote tmux session is recreated under a new
-name, focus can update the session marker when exactly one live, non-UI pane is
-already marked for that host and its normalized title matches the selected
-agent. Ambiguous matches are rejected. The daemon protocol and persisted state
-do not carry the binding.
+unmarked title inference. An exact host and session binding is always used
+first. If a remote tmux session is recreated under a new name, focus can update
+the session marker when exactly one live, non-UI pane is already marked for
+that host and its normalized title matches the selected agent.
+
+Without an exact or repairable binding, focus can adopt one live, unmarked,
+non-UI mosh pane whose client destination matches the configured remote and
+whose title uses the established nested tmux shape, `[mosh] · ...`, for the
+selected agent. An ordinary `[mosh] title` pane is not adopted as tmux. A
+binding for another session on the same host does not disqualify a unique
+candidate. Zero or multiple candidates leave all markers unchanged.
+
+If the selected default-server session is detached, focus can instead recover
+through one unmarked mosh shell whose client destination and shell
+working-directory title both match the remote record, including when another
+session on that host is already bound. Focus selects the exact remote window
+and pane, attaches the remote tmux client, waits for the local pane to adopt the
+selected agent title, then writes the binding and selects the pane. Zero or
+multiple shell matches, named remote servers, and an unverified attach all fail
+closed. The daemon protocol and persisted state do not carry the binding.
 
 ## Security boundaries
 
