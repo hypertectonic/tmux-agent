@@ -267,10 +267,12 @@ first. If a remote tmux session is recreated under a new name, focus can update
 the session marker when exactly one live, non-UI pane is already marked for
 that host and its normalized title matches the selected agent.
 
-Without an exact or repairable binding, focus can adopt one live, unmarked,
-non-UI mosh pane whose client destination matches the configured remote and
-whose title uses the established nested tmux shape, `[mosh] · ...`, for the
-selected agent. An ordinary `[mosh] title` pane is not adopted as tmux. A
+Without an exact or repairable binding, focus can adopt one live, non-UI mosh
+pane whose client destination matches the configured remote and whose title
+uses the established nested tmux shape, `[mosh] · ...`, for the selected agent.
+The pane may be unmarked or carry a complete stale binding for a different
+host; the live client destination must prove the selected remote before both
+markers are replaced. An ordinary `[mosh] title` pane is not adopted as tmux. A
 binding for another session on the same host does not disqualify a unique
 candidate. Zero or multiple candidates leave all markers unchanged.
 

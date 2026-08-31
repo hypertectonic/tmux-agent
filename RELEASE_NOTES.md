@@ -14,6 +14,8 @@ terminals.
   shell, with the attached title verified before binding markers are written.
 - An active nested tmux session can focus across local windows even when
   another session on the same remote host is already bound.
+- A reused Mosh pane can replace stale host and session markers when its live
+  destination and nested agent title uniquely identify the selected session.
 - Missing or ambiguous transport evidence still fails closed without writing a
   binding.
 

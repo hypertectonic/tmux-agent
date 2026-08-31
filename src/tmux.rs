@@ -1661,7 +1661,11 @@ fn find_running_mosh_mirror<'a>(
     let matches = panes
         .iter()
         .filter(|pane| !pane.dead && !pane.is_agent_ui)
-        .filter(|pane| pane.mirror_host.is_none() && pane.mirror_session.is_none())
+        .filter(|pane| match (&pane.mirror_host, &pane.mirror_session) {
+            (None, None) => true,
+            (Some(marked_host), Some(_)) => marked_host != remote_alias,
+            _ => false,
+        })
         .filter(|pane| nested_mosh_title(&pane.title) == Some(title.as_str()))
         .filter(|pane| {
             pane_processes
@@ -2522,6 +2526,31 @@ exit 1
                 "mosh-client -# --no-init remote-mac",
             );
             set_test_pane_title(&socket_name, &inferred_other, "[mosh] · other-project");
+            let stale_cross_host = test_tmux_value(
+                &socket_name,
+                &[
+                    "new-window",
+                    "-d",
+                    "-t",
+                    "local",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    mosh_command,
+                ],
+            );
+            wait_for_test_process_title(
+                &socket_name,
+                &stale_cross_host,
+                "mosh-client -# --no-init remote-mac",
+            );
+            mark_test_remote_pane(
+                &socket_name,
+                &stale_cross_host,
+                "old-remote",
+                "old-project",
+                "[mosh] · renamed-project",
+            );
             let running = test_tmux_value(
                 &socket_name,
                 &[
@@ -2568,6 +2597,30 @@ exit 1
             assert_eq!(
                 test_pane_option(&socket_name, &inferred_other, REMOTE_HOST_OPTION),
                 ""
+            );
+
+            tmux.focus_agent(&remote_tmux_record("new-session", "renamed-project"))
+                .unwrap();
+            assert_eq!(
+                test_tmux_value(
+                    &socket_name,
+                    &[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &stale_cross_host,
+                        "#{pane_active}"
+                    ],
+                ),
+                "1"
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &stale_cross_host, REMOTE_HOST_OPTION),
+                "remote-mac"
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &stale_cross_host, REMOTE_SESSION_OPTION),
+                "new-session"
             );
 
             tmux.focus_agent(&remote_tmux_record(
@@ -2711,6 +2764,42 @@ exit 1
                     ""
                 );
             }
+
+            mark_test_remote_pane(
+                &socket_name,
+                &ambiguous_one,
+                "old-remote",
+                "old-first",
+                "[mosh] · ambiguous-project",
+            );
+            mark_test_remote_pane(
+                &socket_name,
+                &ambiguous_two,
+                "old-remote",
+                "old-second",
+                "[mosh] · ambiguous-project",
+            );
+            let error = tmux
+                .focus_agent(&remote_tmux_record("fresh-stale", "ambiguous-project"))
+                .unwrap_err();
+            assert!(error.to_string().contains(&ambiguous_one));
+            assert!(error.to_string().contains(&ambiguous_two));
+            assert_eq!(
+                test_pane_option(&socket_name, &ambiguous_one, REMOTE_HOST_OPTION),
+                "old-remote"
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &ambiguous_one, REMOTE_SESSION_OPTION),
+                "old-first"
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &ambiguous_two, REMOTE_HOST_OPTION),
+                "old-remote"
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &ambiguous_two, REMOTE_SESSION_OPTION),
+                "old-second"
+            );
             return;
         }
 
