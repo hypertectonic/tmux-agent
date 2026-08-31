@@ -120,11 +120,18 @@ focus never uses title alone, never claims an explicitly marked pane, and does
 not write a binding. Use `tmux-agent explain <id-or-pane>` and `tmux-agent
 doctor` to inspect the derived target without exposing pane contents.
 
+For an already attached nested tmux session, tmux-agent can adopt one live,
+unmarked mosh pane when its configured destination matches and its title uses
+the `[mosh] · ...` nested shape for the selected agent. An ordinary
+`[mosh] title` pane is not adopted. Existing bindings for other sessions on the
+host do not block a unique match. Zero or multiple matches remain unmarked.
+
 For a detached default-server tmux session, tmux-agent can recover one idle,
 unmarked mosh shell when both its configured destination and displayed working
 directory match the remote record. It verifies the resulting agent title before
-writing a binding. Existing host bindings, named servers, zero matches, and
-multiple matches are not guessed.
+writing a binding. Another session binding on the host does not block a unique
+alias and working-directory match. Named servers, zero matches, and multiple
+matches are not guessed.
 
 For other nested remote tmux cases, bind the correct local transport pane
 initially. Run the command on the local machine, not inside the remote tmux session:
