@@ -265,8 +265,14 @@ This gives nested tmux over mosh an exact local focus target without screen or
 unmarked title inference. If a remote tmux session is recreated under a new
 name, focus can update the session marker when exactly one live, non-UI pane is
 already marked for that host and its normalized title matches the selected
-agent. Ambiguous matches are rejected. The daemon protocol and persisted state
-do not carry the binding.
+agent. When no pane is marked for the host, a detached default-server session
+can recover through one unmarked mosh shell whose client destination and shell
+working-directory title both match the remote record. Focus selects the exact
+remote window and pane, attaches the remote tmux client, waits for the local
+pane to adopt the selected agent title, then writes the binding and selects the
+pane. Existing host markers, zero or multiple shell matches, named remote
+servers, and an unverified attach all fail closed. The daemon protocol and
+persisted state do not carry the binding.
 
 ## Security boundaries
 
