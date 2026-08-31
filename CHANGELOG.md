@@ -6,7 +6,7 @@ The project uses semantic versioning.
 
 ## Unreleased
 
-## [0.8.1] - 2026-08-22
+## [0.8.1] - 2026-08-31
 
 ### Fixed
 
@@ -16,6 +16,10 @@ The project uses semantic versioning.
   host-marked Mosh pane has the matching restored session title.
 - Focus ordinary remote terminal sessions through a unique matching Mosh
   transport while preserving fail-closed ambiguity and existing SSH behavior.
+- Recover a detached nested tmux session through one unique idle Mosh shell,
+  verifying the attached session title before persisting its binding.
+- Focus an active nested tmux session across local windows when one unique
+  unmarked Mosh pane matches, even when another same-host session is bound.
 
 ## [0.8.0] - 2026-08-20
 

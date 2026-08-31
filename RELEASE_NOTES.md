@@ -1,5 +1,6 @@
 tmux-agent v0.8.1 makes remote completion and focus behavior more reliable for
-SSH, Mosh, restored nested tmux sessions, and ordinary remote terminals.
+SSH, Mosh, restored and detached nested tmux sessions, and ordinary remote
+terminals.
 
 ## Highlights
 
@@ -9,6 +10,10 @@ SSH, Mosh, restored nested tmux sessions, and ordinary remote terminals.
   focus when the host and session-title evidence identify exactly one pane.
 - Ordinary remote terminal rows can focus through a unique matching Mosh
   transport, with existing SSH behavior preserved.
+- A detached nested tmux session can recover through one unique idle Mosh
+  shell, with the attached title verified before binding markers are written.
+- An active nested tmux session can focus across local windows even when
+  another session on the same remote host is already bound.
 - Missing or ambiguous transport evidence still fails closed without writing a
   binding.
 
