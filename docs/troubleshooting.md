@@ -115,16 +115,19 @@ protocol version. Restart the central daemon after correcting configuration.
 Remote focus requires a unique local tmux pane carrying the matching SSH
 connection, an ordinary-terminal mosh pane whose client process names the
 configured remote and whose normalized title matches, or a mirror pane with
-the public remote marker options. Multiple matching panes are rejected. Mosh
-focus never uses title alone, never claims an explicitly marked pane, and does
-not write a binding. Use `tmux-agent explain <id-or-pane>` and `tmux-agent
-doctor` to inspect the derived target without exposing pane contents.
+the public remote marker options. Multiple matching panes are rejected.
+Ordinary-terminal mosh focus never uses title alone, never claims an explicitly
+marked pane, and does not write a binding. Use `tmux-agent explain <id-or-pane>`
+and `tmux-agent doctor` to inspect the derived target without exposing pane
+contents.
 
-For an already attached nested tmux session, tmux-agent can adopt one live,
-unmarked mosh pane when its configured destination matches and its title uses
-the `[mosh] · ...` nested shape for the selected agent. An ordinary
+For an already attached nested tmux session, tmux-agent can adopt one live mosh
+pane when its configured destination matches and its title uses the
+`[mosh] · ...` nested shape for the selected agent. The pane may be unmarked or
+carry a stale complete binding for a different host; the live mosh destination
+must prove the selected remote before both markers are replaced. An ordinary
 `[mosh] title` pane is not adopted. Existing bindings for other sessions on the
-host do not block a unique match. Zero or multiple matches remain unmarked.
+host do not block a unique match. Zero or multiple matches remain unchanged.
 
 For a detached default-server tmux session, tmux-agent can recover one idle,
 unmarked mosh shell when both its configured destination and displayed working
@@ -143,9 +146,10 @@ tmux-agent remote bind <configured-remote> <remote-tmux-session> --pane <local-p
 Use `tmux-agent remote bindings` to inspect current mappings and `tmux-agent
 remote unbind --pane <local-pane-id>` to remove one. A stale remote session name
 self-heals during focus when exactly one live pane is already bound to that host
-and its normalized title matches the selected agent. If no pane or several
-panes match, tmux-agent leaves every binding unchanged and reports the focus
-failure.
+and its normalized title matches the selected agent. A stale host and session
+pair can also self-heal when one live mosh destination and nested title match.
+If no pane or several panes match, tmux-agent leaves every binding unchanged
+and reports the focus failure.
 
 ## A completion remains visible
 
