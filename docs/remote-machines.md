@@ -131,11 +131,13 @@ completion seen. Ambiguous and unresolved transports keep the peer's reported
 visibility and attention state.
 
 An exact host and session binding takes priority. Without one, focus can adopt
-exactly one live, unmarked mosh pane that names the configured remote and is
-already displaying the selected agent with the nested tmux title shape
-`[mosh] · ...`. The ordinary-terminal shape `[mosh] title` is not adopted as a
-tmux binding. A binding for another session on the same host does not block
-this recovery. Zero or multiple matching panes are left unmarked.
+exactly one live mosh pane that names the configured remote and is already
+displaying the selected agent with the nested tmux title shape `[mosh] · ...`.
+The pane may be unmarked or carry a complete stale binding for a different
+host; the live mosh destination must prove the configured remote before both
+markers are replaced. The ordinary-terminal shape `[mosh] title` is not
+adopted as a tmux binding. A binding for another session on the same host does
+not block this recovery. Zero or multiple matching panes are left unchanged.
 
 For a detached default-server tmux session, focus can instead create the
 initial mosh binding when exactly one unmarked pane names the configured remote
@@ -167,10 +169,12 @@ tmux-agent remote unbind --pane %42
 When `--pane` is omitted, bind and unbind use the current local `$TMUX_PANE`.
 The bind command rejects names that are not present in the local tmux-agent
 configuration and never chooses between several mosh or SSH panes. If the bound
-remote tmux session is later recreated under a different name,
-focusing its agent repairs the session marker only when that host has one live,
-non-UI bound pane with a matching normalized title. Zero or multiple matches
-leave the binding unchanged and report the normal focus error.
+remote tmux session is later recreated under a different name, focusing its
+agent repairs the session marker only when that host has one live, non-UI bound
+pane with a matching normalized title. Reusing a pane for another configured
+mosh destination can repair both markers when the live destination and nested
+title identify one unique pane. Zero or multiple matches leave the binding
+unchanged and report the normal focus error.
 
 A local transport pane can also provide the label shown beside its remote
 agent:
