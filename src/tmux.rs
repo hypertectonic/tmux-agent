@@ -1842,12 +1842,92 @@ fn mosh_destination_for_command(command: &str) -> Option<&str> {
         return None;
     }
     let separator = fields.iter().position(|field| *field == "|")?;
-    let alias = separator
-        .checked_sub(1)
-        .and_then(|index| fields.get(index))?;
+    let mut destination_index = 1;
+    while destination_index < separator {
+        let field = fields[destination_index];
+        if field == "--" {
+            destination_index += 1;
+            break;
+        }
+        if !field.starts_with('-') {
+            break;
+        }
+        let takes_value = matches!(
+            field,
+            "--client"
+                | "--server"
+                | "--predict"
+                | "--port"
+                | "-p"
+                | "--family"
+                | "--ssh"
+                | "--bind-server"
+                | "--experimental-remote-ip"
+        );
+        let flag = matches!(
+            field,
+            "-#" | "-a"
+                | "-n"
+                | "-o"
+                | "-4"
+                | "-6"
+                | "--predict-overwrite"
+                | "--no-predict-overwrite"
+                | "--ssh-pty"
+                | "--no-ssh-pty"
+                | "--init"
+                | "--no-init"
+                | "--local"
+                | "--help"
+                | "--version"
+                | "--fake-proxy"
+                | "--no-fake-proxy"
+        );
+        let has_attached_value = (field.starts_with("-p=") && field.len() > 3)
+            || [
+                "--client=",
+                "--server=",
+                "--predict=",
+                "--port=",
+                "--family=",
+                "--ssh=",
+                "--bind-server=",
+                "--experimental-remote-ip=",
+            ]
+            .iter()
+            .any(|prefix| field.starts_with(prefix));
+        destination_index += if takes_value {
+            2
+        } else if flag || has_attached_value {
+            1
+        } else {
+            return None;
+        };
+    }
+    if destination_index >= separator {
+        return None;
+    }
+    let mut remote_command_separators = fields[destination_index + 1..separator]
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, field)| (*field == "--").then_some(destination_index + 1 + offset));
+    let remote_command_separator = remote_command_separators.next();
+    if remote_command_separators.next().is_some() {
+        return None;
+    }
+    let alias = match remote_command_separator {
+        Some(index) if index == destination_index + 1 && index + 1 < separator => {
+            fields.get(destination_index)?
+        }
+        Some(_) => return None,
+        None => separator
+            .checked_sub(1)
+            .and_then(|index| fields.get(index))?,
+    };
     fields.get(separator + 1)?;
     fields.get(separator + 2)?;
-    (!alias.starts_with('-')).then(|| alias.rsplit('@').next().unwrap_or(alias))
+    let alias = alias.rsplit('@').next().unwrap_or(alias);
+    (!alias.is_empty() && !alias.starts_with('-')).then_some(alias)
 }
 
 fn ssh_destination_for_command(command: &str) -> Option<&str> {
@@ -2497,6 +2577,8 @@ exit 1
         if let Some(socket_name) = std::env::var_os(SOCKET_ENV) {
             let socket_name = socket_name.to_string_lossy().into_owned();
             let mosh_command = "/bin/bash -c 'exec -a \"mosh-client -# --no-init remote-mac | <address> <port>\" sleep 30'";
+            let restored_mosh_command = "/bin/bash -c 'exec -a \"mosh-client -# --no-init remote-mac -- tmux attach-session -t work | <address> <port>\" sleep 30'";
+            let wrong_host_command = "/bin/bash -c 'exec -a \"mosh-client -# --no-init other-remote -- tmux attach-session -t work | <address> <port>\" sleep 30'";
             let current = new_test_tmux_pane(&socket_name, "local", None);
             let other_session =
                 new_test_tmux_command_pane(&socket_name, "local", Some(&current), mosh_command);
@@ -2561,15 +2643,27 @@ exit 1
                     "-P",
                     "-F",
                     "#{pane_id}",
-                    mosh_command,
+                    restored_mosh_command,
                 ],
             );
             wait_for_test_process_title(
                 &socket_name,
                 &running,
-                "mosh-client -# --no-init remote-mac",
+                "mosh-client -# --no-init remote-mac -- tmux attach-session -t work",
             );
             set_test_pane_title(&socket_name, &running, "[mosh] · ⣹ sample-robot-project");
+            let wrong_host = new_test_tmux_command_pane(
+                &socket_name,
+                "local",
+                Some(&running),
+                wrong_host_command,
+            );
+            wait_for_test_process_title(
+                &socket_name,
+                &wrong_host,
+                "mosh-client -# --no-init other-remote -- tmux attach-session -t work",
+            );
+            set_test_pane_title(&socket_name, &wrong_host, "[mosh] · ⣹ sample-robot-project");
             test_tmux_output(&socket_name, &["select-window", "-t", "local:0"]);
             test_tmux_output(&socket_name, &["select-pane", "-t", &current]);
 
@@ -2654,6 +2748,14 @@ exit 1
             assert_eq!(
                 test_pane_option(&socket_name, &other_session, REMOTE_SESSION_OPTION),
                 "other-session"
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &wrong_host, REMOTE_HOST_OPTION),
+                ""
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &wrong_host, REMOTE_SESSION_OPTION),
+                ""
             );
             return;
         }
@@ -3695,6 +3797,60 @@ exit 1
                 "/usr/local/bin/mosh-client -# --no-init user@remote-mac | <address> <port>"
             ),
             Some("remote-mac")
+        );
+        assert_eq!(
+            transport_destination("mosh-client -# --no-init -- build-host | <address> <port>"),
+            Some("build-host")
+        );
+        assert_eq!(
+            transport_destination("mosh-client -# --no-init -- user@build-host | <address> <port>"),
+            Some("build-host")
+        );
+        assert_eq!(
+            transport_destination("mosh-client -# -p 60000 -- build-host | <address> <port>"),
+            Some("build-host")
+        );
+        assert_eq!(
+            transport_destination("mosh-client -# -p 60000 -- user@build-host | <address> <port>"),
+            Some("build-host")
+        );
+        assert_eq!(
+            transport_destination("mosh-client -# -p=60000 -- build-host | <address> <port>"),
+            Some("build-host")
+        );
+        assert_eq!(
+            transport_destination(
+                "mosh-client -# --ssh=ssh -J jump -- build-host | <address> <port>"
+            ),
+            None
+        );
+        assert_eq!(
+            transport_destination(
+                "mosh-client -# -pretend build-host -- tmux attach-session | <address> <port>"
+            ),
+            None
+        );
+        assert_eq!(
+            transport_destination(
+                "mosh-client -# build-host -- tmux attach-session -t work | <address> <port>"
+            ),
+            Some("build-host")
+        );
+        assert_eq!(
+            transport_destination(
+                "mosh-client -# user@build-host -- tmux attach-session -t work | <address> <port>"
+            ),
+            Some("build-host")
+        );
+        assert_eq!(
+            transport_destination("mosh-client -# build-host -- | <address> <port>"),
+            None
+        );
+        assert_eq!(
+            transport_destination(
+                "mosh-client -# build-host -- tmux -- attach-session | <address> <port>"
+            ),
+            None
         );
         assert_eq!(transport_destination("mosh remote-mac"), None);
         assert_eq!(
