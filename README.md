@@ -123,6 +123,7 @@ tmux-agent ui
 | `Backspace` | Edit the active search |
 | `Enter` | Focus, acknowledge, or open a Codex child |
 | Left click | Activate a row |
+| `a` | Mark all currently unread completions as read in normal mode |
 | `r` | Refresh |
 | `q` | Close in normal mode; type `q` during search |
 | `Esc` | Clear the active search, otherwise close |

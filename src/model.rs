@@ -421,6 +421,7 @@ pub enum IpcRequest {
     Snapshot { local_only: bool },
     Watch { local_only: bool },
     Acknowledge { target: String },
+    MarkAllRead,
     MarkUsed { target: String },
     Shutdown,
 }
@@ -430,6 +431,7 @@ pub enum IpcRequest {
 pub enum IpcResponse {
     Snapshot { snapshot: Snapshot },
     Ack,
+    Acknowledged { count: usize },
     Error { message: String },
 }
 

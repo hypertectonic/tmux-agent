@@ -96,6 +96,7 @@ JSON object per line:
 - `snapshot` returns the current state
 - `watch` sends the initial snapshot and later revisions
 - `acknowledge` marks a completion seen
+- `mark_all_read` marks every unread completion in the combined snapshot seen
 - `mark_used` records a successful top-level focus for local idle ordering
 - `shutdown` stops the daemon cleanly
 
