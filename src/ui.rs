@@ -304,6 +304,7 @@ impl UiMessage {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct AgentListState {
     searching: bool,
+    confirming_quit: bool,
     query: String,
     selected_id: Option<String>,
     selected_position: usize,
@@ -497,6 +498,19 @@ fn handle_list_key(key: KeyEvent, list: &mut AgentListState, agents: &[AgentReco
     if key.code == KeyCode::F(UI_SELECTION_WAKE_KEY) {
         return ListAction::SyncSharedSelection;
     }
+    if list.confirming_quit {
+        list.confirming_quit = false;
+        return match key.code {
+            KeyCode::Char('y' | 'Y')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                ListAction::Close
+            }
+            _ => ListAction::None,
+        };
+    }
     let action = if list.searching {
         match key.code {
             KeyCode::Esc => list.leave_search(),
@@ -518,7 +532,8 @@ fn handle_list_key(key: KeyEvent, list: &mut AgentListState, agents: &[AgentReco
         ListAction::None
     } else {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return ListAction::Close,
+            KeyCode::Char('q') => list.confirming_quit = true,
+            KeyCode::Esc => return ListAction::Close,
             KeyCode::Char('j') | KeyCode::Down => list.move_selection(agents, 1),
             KeyCode::Char('k') | KeyCode::Up => list.move_selection(agents, -1),
             KeyCode::Char('g') | KeyCode::Home => list.select_visible(agents, 0),
@@ -1529,7 +1544,9 @@ fn render_agent_list(
         }
         frame.render_widget(Paragraph::new(Line::from(peers)), chunks[2]);
     }
-    let footer = if !message.is_empty() {
+    let footer = if list.confirming_quit {
+        "Quit tmux-agent? [y/N]".to_string()
+    } else if !message.is_empty() {
         terminal_safe(message)
     } else if list.searching {
         "↑/↓ move  enter focus/view  backspace edit  esc clear".to_string()
@@ -1796,9 +1813,10 @@ fn display_title(agent: &AgentRecord) -> String {
     } else {
         None
     };
-    let title = stable_grok_title.unwrap_or_else(|| trim_braille_activity_prefix(&agent.title));
+    let title =
+        stable_grok_title.unwrap_or_else(|| trim_provider_title(&agent.agent, &agent.title));
     let title = if title.is_empty() {
-        trim_braille_activity_prefix(&agent.window_name)
+        trim_provider_title(&agent.agent, &agent.window_name)
     } else {
         title
     };
@@ -1812,6 +1830,21 @@ fn display_title(agent: &AgentRecord) -> String {
         (false, _) => title.to_string(),
         (true, Some(label)) => label.to_string(),
         (true, None) => String::new(),
+    }
+}
+
+fn trim_provider_title<'a>(agent: &str, value: &'a str) -> &'a str {
+    let title = trim_braille_activity_prefix(value);
+    if !agent.eq_ignore_ascii_case("claude") {
+        return title;
+    }
+    let Some(remainder) = title.strip_prefix('✳') else {
+        return title;
+    };
+    match remainder.chars().next() {
+        None => "",
+        Some(character) if character.is_whitespace() => remainder.trim(),
+        Some(_) => title,
     }
 }
 
@@ -2012,6 +2045,33 @@ mod tests {
             row_text(&terminal, footer_row),
             "j/k move  / search  enter focus/view  a mark all read  r refresh  q close"
         );
+    }
+
+    #[test]
+    fn quit_confirmation_replaces_the_footer_message() {
+        let snapshot = Snapshot::default();
+        let list = AgentListState {
+            confirming_quit: true,
+            ..AgentListState::default()
+        };
+        let area = Rect::new(0, 0, 80, 10);
+        let footer_row = ui_layout(area, false)[3].y;
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_agent_list(
+                    frame,
+                    &snapshot,
+                    &list,
+                    "refreshed",
+                    0,
+                    snapshot.generated_at_ms,
+                )
+            })
+            .unwrap();
+
+        assert_eq!(row_text(&terminal, footer_row), "Quit tmux-agent? [y/N]");
     }
 
     #[test]
@@ -2476,6 +2536,20 @@ mod tests {
     }
 
     #[test]
+    fn display_title_removes_claude_status_glyphs() {
+        let mut agent = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        agent.title = "✳ Startup website section animations".into();
+        assert_eq!(display_title(&agent), "Startup website section animations");
+
+        agent.attention = Attention::Working;
+        agent.title = "⠦ Startup website section animations".into();
+        assert_eq!(display_title(&agent), "Startup website section animations");
+
+        agent.title = "✳art direction".into();
+        assert_eq!(display_title(&agent), "✳art direction");
+    }
+
+    #[test]
     fn display_title_keeps_grok_working_directory_stable() {
         let mut agent = test_agent("Grok", Attention::Working, AgentOrigin::Tmux);
         agent.cwd = "/work/sample-project".into();
@@ -2582,8 +2656,19 @@ mod tests {
                 &mut list,
                 &agents,
             ),
-            ListAction::Close
+            ListAction::None
         );
+        assert!(list.confirming_quit);
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::None
+        );
+        assert!(!list.confirming_quit);
+        assert!(!list.searching);
         assert_eq!(
             handle_list_key(
                 KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
@@ -2616,6 +2701,70 @@ mod tests {
         );
         assert!(!list.searching);
         assert!(list.query.is_empty());
+    }
+
+    #[test]
+    fn quit_confirmation_only_accepts_y() {
+        let agents = vec![test_agent("Codex", Attention::Working, AgentOrigin::Tmux)];
+
+        for confirmation in ['y', 'Y'] {
+            let mut list = AgentListState::default();
+            assert_eq!(
+                handle_list_key(
+                    KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                    &mut list,
+                    &agents,
+                ),
+                ListAction::None
+            );
+            assert!(list.confirming_quit);
+            assert_eq!(
+                handle_list_key(
+                    KeyEvent::new(KeyCode::Char(confirmation), KeyModifiers::NONE),
+                    &mut list,
+                    &agents,
+                ),
+                ListAction::Close
+            );
+        }
+    }
+
+    #[test]
+    fn quit_confirmation_cancels_without_running_the_key_action() {
+        let agents = vec![
+            test_agent("Codex", Attention::Working, AgentOrigin::Tmux),
+            test_agent("Claude", Attention::Idle, AgentOrigin::Tmux),
+        ];
+
+        for key in [
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('q'),
+            KeyCode::Char('r'),
+            KeyCode::Char('/'),
+            KeyCode::Down,
+        ] {
+            let mut list = AgentListState::default();
+            list.reconcile_selection(&agents);
+            let selected = list.selected_id.clone();
+            assert_eq!(
+                handle_list_key(
+                    KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                    &mut list,
+                    &agents,
+                ),
+                ListAction::None
+            );
+            assert_eq!(
+                handle_list_key(KeyEvent::new(key, KeyModifiers::NONE), &mut list, &agents),
+                ListAction::None
+            );
+            assert!(!list.confirming_quit, "key {key:?}");
+            assert!(!list.searching, "key {key:?}");
+            assert_eq!(list.selected_id, selected, "key {key:?}");
+        }
     }
 
     #[test]
@@ -2725,6 +2874,7 @@ mod tests {
         let agents = vec![test_agent("Codex", Attention::Working, AgentOrigin::Tmux)];
         let mut list = AgentListState::default();
         list.reconcile_selection(&agents);
+        list.confirming_quit = true;
 
         assert_eq!(
             handle_list_key(
@@ -2734,6 +2884,7 @@ mod tests {
             ),
             ListAction::SyncSharedSelection
         );
+        assert!(list.confirming_quit);
     }
 
     #[test]
