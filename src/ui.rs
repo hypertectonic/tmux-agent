@@ -478,6 +478,7 @@ enum ListAction {
     Close,
     Activate,
     ActivateShortcut(usize),
+    MarkAllRead,
     SyncSharedSelection,
     Refresh,
 }
@@ -525,6 +526,7 @@ fn handle_list_key(key: KeyEvent, list: &mut AgentListState, agents: &[AgentReco
                 list.select_visible(agents, list.visible_indices(agents).len().saturating_sub(1));
             }
             KeyCode::Enter => return ListAction::Activate,
+            KeyCode::Char('a') => return ListAction::MarkAllRead,
             KeyCode::Char('r') => return ListAction::Refresh,
             KeyCode::Char('/') => list.enter_search(),
             KeyCode::Char(character)
@@ -722,6 +724,10 @@ async fn run_loop(
                                 }
                             };
                             pending_shared_selection = Some(agent_id);
+                        }
+                        ListAction::MarkAllRead => {
+                            mark_all_read(paths, &mut message).await;
+                            schedule.view_changed();
                         }
                         ListAction::Refresh => {
                             let (next_watch, next_snapshot) =
@@ -1151,6 +1157,15 @@ async fn acknowledge_record(
     Ok(())
 }
 
+async fn mark_all_read(paths: &RuntimePaths, message: &mut UiMessage) {
+    let text = match ipc::mark_all_read(&paths.socket).await {
+        Ok(0) => "no unread completions".to_string(),
+        Ok(count) => format!("marked {count} read"),
+        Err(error) => format!("{error:#}"),
+    };
+    message.set_transient(text, Instant::now());
+}
+
 #[cfg(test)]
 fn render(
     frame: &mut Frame,
@@ -1519,7 +1534,7 @@ fn render_agent_list(
     } else if list.searching {
         "↑/↓ move  enter focus/view  backspace edit  esc clear".to_string()
     } else {
-        "j/k move  / search  enter focus/view  r refresh  q close".to_string()
+        "j/k move  / search  enter focus/view  a mark all read  r refresh  q close".to_string()
     };
     frame.render_widget(
         Paragraph::new(truncate(
@@ -1995,7 +2010,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             row_text(&terminal, footer_row),
-            "j/k move  / search  enter focus/view  r refresh  q close"
+            "j/k move  / search  enter focus/view  a mark all read  r refresh  q close"
         );
     }
 
@@ -2579,7 +2594,7 @@ mod tests {
         );
         assert!(list.searching);
 
-        for character in ['j', 'k', 'r', 'q'] {
+        for character in ['a', 'j', 'k', 'r', 'q'] {
             assert_eq!(
                 handle_list_key(
                     KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
@@ -2589,7 +2604,7 @@ mod tests {
                 ListAction::None
             );
         }
-        assert_eq!(list.query, "jkrq");
+        assert_eq!(list.query, "ajkrq");
 
         assert_eq!(
             handle_list_key(
@@ -2601,6 +2616,73 @@ mod tests {
         );
         assert!(!list.searching);
         assert!(list.query.is_empty());
+    }
+
+    #[test]
+    fn a_requests_mark_all_read_only_outside_search() {
+        let agents = vec![test_agent("Codex", Attention::Done, AgentOrigin::Tmux)];
+        let mut list = AgentListState::default();
+        list.reconcile_selection(&agents);
+        let selected = list.selected_id.clone();
+
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::MarkAllRead
+        );
+        assert_eq!(list.selected_id, selected);
+
+        list.enter_search();
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::None
+        );
+        assert_eq!(list.query, "a");
+    }
+
+    #[tokio::test]
+    async fn mark_all_read_reports_the_marked_count_or_an_empty_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths {
+            socket: directory.path().join("daemon.sock"),
+            runners: directory.path().join("runners"),
+            state: directory.path().join("state.json"),
+            acknowledgements: directory.path().join("acknowledged.json"),
+            log: directory.path().join("daemon.log"),
+        };
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let server = tokio::spawn(async move {
+            for count in [3, 0] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                assert!(matches!(
+                    serde_json::from_str(&line).unwrap(),
+                    crate::model::IpcRequest::MarkAllRead
+                ));
+                let mut response =
+                    serde_json::to_vec(&crate::model::IpcResponse::Acknowledged { count }).unwrap();
+                response.push(b'\n');
+                writer.write_all(&response).await.unwrap();
+            }
+        });
+        let mut message = UiMessage::default();
+
+        mark_all_read(&paths, &mut message).await;
+        assert_eq!(message.text(), "marked 3 read");
+
+        mark_all_read(&paths, &mut message).await;
+        assert_eq!(message.text(), "no unread completions");
+        server.await.unwrap();
     }
 
     #[test]

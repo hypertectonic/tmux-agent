@@ -320,6 +320,73 @@ impl Shared {
         Ok(true)
     }
 
+    async fn mark_all_read(&self) -> Result<usize> {
+        let mut inner = self.inner.write().await;
+        let local = acknowledge_all_records(&mut inner.local.agents);
+        let local_count = local.len();
+        let remote_targets = inner
+            .remotes
+            .iter()
+            .flat_map(|(alias, snapshot)| {
+                let mut agents = snapshot.agents.clone();
+                reconcile_transports_with_observations(
+                    &mut agents,
+                    &inner.local.ssh_transports,
+                    inner.remote_seen.get(alias),
+                );
+                acknowledgement_targets(&agents)
+                    .into_iter()
+                    .map(|id| (alias.clone(), id))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut remote = Vec::with_capacity(remote_targets.len());
+        for (alias, id) in remote_targets {
+            if let Some(snapshot) = inner.remotes.get_mut(&alias) {
+                let result = acknowledge_records(&mut snapshot.agents, &id);
+                remote.push((id, result));
+            }
+        }
+        let count = local_count + remote.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        for (id, result) in local.iter().chain(&remote) {
+            if result.persist_completion {
+                inner.acknowledgements.completions.insert(id.clone());
+            }
+            if let Some(achievement_observed_at_ms) = result.goal_achievement {
+                inner
+                    .acknowledgements
+                    .goal_achievements
+                    .insert(id.clone(), achievement_observed_at_ms);
+            }
+        }
+        for (id, result) in &remote {
+            if result.persist_completion {
+                for observed_seen in inner.remote_seen.values_mut() {
+                    if let Some(seen) = observed_seen.get_mut(id) {
+                        *seen = true;
+                    }
+                }
+            }
+        }
+        store::save_acknowledged(&self.acknowledgements_path, &inner.acknowledgements.state())?;
+        if local_count > 0 {
+            inner.local.revision += 1;
+        }
+        inner.revision += 1;
+        let revision = inner.revision;
+        let local_revision = inner.local.revision;
+        drop(inner);
+        self.changed.send_replace(revision);
+        if local_count > 0 {
+            self.local_changed.send_replace(local_revision);
+        }
+        Ok(count)
+    }
+
     async fn mark_used(&self, target: &str) -> bool {
         let mut inner = self.inner.write().await;
         let is_top_level = inner
@@ -647,6 +714,10 @@ async fn serve_client(
                 .await?;
             }
         }
+        IpcRequest::MarkAllRead => {
+            let count = shared.mark_all_read().await?;
+            write_response(&mut writer, &IpcResponse::Acknowledged { count }).await?;
+        }
         IpcRequest::MarkUsed { target } => {
             if shared.mark_used(&target).await {
                 write_response(&mut writer, &IpcResponse::Ack).await?;
@@ -968,6 +1039,31 @@ fn acknowledge_records(agents: &mut [AgentRecord], target: &str) -> AcknowledgeR
         persist_completion: idle || goal_achievement.is_some(),
         goal_achievement,
     }
+}
+
+fn acknowledge_all_records(agents: &mut [AgentRecord]) -> Vec<(String, AcknowledgeResult)> {
+    acknowledgement_targets(agents)
+        .into_iter()
+        .map(|id| {
+            let result = acknowledge_records(agents, &id);
+            (id, result)
+        })
+        .collect()
+}
+
+fn acknowledgement_targets(agents: &[AgentRecord]) -> Vec<String> {
+    agents
+        .iter()
+        .filter(|agent| {
+            let pending_goal = agent
+                .goal
+                .is_some_and(|goal| goal.state == GoalState::Achieved && goal.achievement_pending);
+            (agent.state == AgentState::Idle && agent.attention == Attention::Done)
+                || (!matches!(agent.state, AgentState::Working | AgentState::Blocked)
+                    && pending_goal)
+        })
+        .map(|agent| agent.id.clone())
+        .collect()
 }
 
 async fn write_response(
@@ -1343,6 +1439,234 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn mark_all_read_acknowledges_the_current_local_and_remote_snapshot() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let acknowledgements_path = directory.path().join("acknowledged.json");
+
+        let mut local_done = agent(
+            "shared-host/default/done",
+            AgentState::Idle,
+            Attention::Done,
+        );
+        let mut local_goal = agent(
+            "shared-host/default/goal",
+            AgentState::Idle,
+            Attention::Idle,
+        );
+        local_goal.goal = Some(GoalInfo {
+            state: GoalState::Achieved,
+            elapsed_seconds: 42,
+            achievement_pending: true,
+            achievement_observed_at_ms: 100,
+        });
+        let mut working = agent(
+            "shared-host/default/working",
+            AgentState::Working,
+            Attention::Working,
+        );
+        working.goal = Some(GoalInfo {
+            state: GoalState::Achieved,
+            elapsed_seconds: 42,
+            achievement_pending: true,
+            achievement_observed_at_ms: 200,
+        });
+        let mut blocked = agent(
+            "shared-host/default/blocked",
+            AgentState::Blocked,
+            Attention::Blocked,
+        );
+        blocked.goal = Some(GoalInfo {
+            state: GoalState::Achieved,
+            elapsed_seconds: 42,
+            achievement_pending: true,
+            achievement_observed_at_ms: 250,
+        });
+        let mut unknown = agent(
+            "shared-host/default/unknown",
+            AgentState::Unknown,
+            Attention::Unknown,
+        );
+        unknown.goal = Some(GoalInfo {
+            state: GoalState::Achieved,
+            elapsed_seconds: 42,
+            achievement_pending: true,
+            achievement_observed_at_ms: 300,
+        });
+        let plain_unknown = agent(
+            "shared-host/default/plain-unknown",
+            AgentState::Unknown,
+            Attention::Unknown,
+        );
+        let already_read = agent(
+            "shared-host/default/read",
+            AgentState::Idle,
+            Attention::Idle,
+        );
+        local_done.seen = false;
+
+        let shared = Shared::new(
+            Snapshot {
+                revision: 1,
+                agents: vec![
+                    local_done,
+                    local_goal,
+                    working,
+                    blocked,
+                    unknown,
+                    plain_unknown,
+                    already_read,
+                ],
+                ..Snapshot::default()
+            },
+            &[],
+            Acknowledgements::default(),
+            acknowledgements_path.clone(),
+        )
+        .unwrap();
+        let mut remote_done = agent(
+            "remote-host/default/done",
+            AgentState::Idle,
+            Attention::Done,
+        );
+        remote_done.seen = false;
+        let mut remote_goal = agent(
+            "remote-host/default/goal",
+            AgentState::Idle,
+            Attention::Idle,
+        );
+        remote_goal.goal = Some(GoalInfo {
+            state: GoalState::Achieved,
+            elapsed_seconds: 84,
+            achievement_pending: true,
+            achievement_observed_at_ms: 400,
+        });
+        shared
+            .publish_remote(
+                "remote-mac",
+                Snapshot {
+                    agents: vec![remote_done, remote_goal],
+                    ..Snapshot::default()
+                },
+            )
+            .await;
+
+        let (shutdown, _) = tokio::sync::mpsc::channel(1);
+        let server = tokio::spawn(accept_clients(listener, shared.clone(), shutdown));
+        let mut first_watch = SnapshotWatch::connect(&socket, false).await.unwrap();
+        let mut second_watch = SnapshotWatch::connect(&socket, false).await.unwrap();
+        first_watch.next_snapshot().await.unwrap().unwrap();
+        second_watch.next_snapshot().await.unwrap().unwrap();
+
+        assert_eq!(crate::ipc::mark_all_read(&socket).await.unwrap(), 5);
+
+        for watch in [&mut first_watch, &mut second_watch] {
+            let changed = tokio::time::timeout(Duration::from_secs(1), watch.next_snapshot())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            for id in [
+                "shared-host/default/done",
+                "shared-host/default/goal",
+                "remote/remote-mac/remote-host/default/done",
+                "remote/remote-mac/remote-host/default/goal",
+            ] {
+                let marked = changed.agents.iter().find(|agent| agent.id == id).unwrap();
+                assert!(marked.seen, "{id}");
+                assert_eq!(marked.attention, Attention::Idle, "{id}");
+                assert!(
+                    marked.goal.is_none_or(|goal| !goal.achievement_pending),
+                    "{id}"
+                );
+            }
+            for id in ["shared-host/default/working", "shared-host/default/blocked"] {
+                let unchanged = changed.agents.iter().find(|agent| agent.id == id).unwrap();
+                assert_ne!(unchanged.attention, Attention::Idle, "{id}");
+                assert!(unchanged.goal.unwrap().achievement_pending, "{id}");
+            }
+            let unknown = changed
+                .agents
+                .iter()
+                .find(|agent| agent.id == "shared-host/default/unknown")
+                .unwrap();
+            assert_eq!(unknown.state, AgentState::Unknown);
+            assert_eq!(unknown.attention, Attention::Unknown);
+            assert!(!unknown.goal.unwrap().achievement_pending);
+            let plain_unknown = changed
+                .agents
+                .iter()
+                .find(|agent| agent.id == "shared-host/default/plain-unknown")
+                .unwrap();
+            assert_eq!(plain_unknown.state, AgentState::Unknown);
+            assert_eq!(plain_unknown.attention, Attention::Unknown);
+            assert!(plain_unknown.goal.is_none());
+            let already_read = changed
+                .agents
+                .iter()
+                .find(|agent| agent.id == "shared-host/default/read")
+                .unwrap();
+            assert!(already_read.seen);
+            assert_eq!(already_read.attention, Attention::Idle);
+        }
+
+        assert_eq!(crate::ipc::mark_all_read(&socket).await.unwrap(), 0);
+
+        let persisted = store::load_acknowledged(&acknowledgements_path).unwrap();
+        assert_eq!(persisted.ids.len(), 5);
+        assert_eq!(persisted.goal_achievements.len(), 3);
+        assert!(
+            persisted
+                .ids
+                .iter()
+                .any(|id| id == "shared-host/default/unknown")
+        );
+        assert!(persisted.goal_achievements.iter().any(|goal| {
+            goal.id == "shared-host/default/unknown" && goal.achievement_observed_at_ms == 300
+        }));
+        assert!(
+            !persisted
+                .ids
+                .iter()
+                .any(|id| id == "shared-host/default/plain-unknown")
+        );
+
+        let mut later = shared.snapshot(true).await;
+        let done = later
+            .agents
+            .iter_mut()
+            .find(|agent| agent.id == "shared-host/default/done")
+            .unwrap();
+        done.state = AgentState::Working;
+        done.attention = Attention::Working;
+        done.seen = true;
+        later.revision += 1;
+        assert!(shared.publish_local(later.clone()).await);
+        let done = later
+            .agents
+            .iter_mut()
+            .find(|agent| agent.id == "shared-host/default/done")
+            .unwrap();
+        done.state = AgentState::Idle;
+        done.attention = Attention::Done;
+        done.seen = false;
+        later.revision += 1;
+        assert!(shared.publish_local(later).await);
+        let later_completion = shared
+            .snapshot(false)
+            .await
+            .agents
+            .into_iter()
+            .find(|agent| agent.id == "shared-host/default/done")
+            .unwrap();
+        assert_eq!(later_completion.attention, Attention::Done);
+        assert!(!later_completion.seen);
+
+        server.abort();
+    }
+
     #[test]
     fn remote_ids_and_display_hosts_use_configured_alias() {
         let mut snapshot = Snapshot {
@@ -1529,6 +1853,47 @@ mod tests {
             .unwrap();
         assert!(acknowledged.seen);
         assert_eq!(acknowledged.attention, Attention::Idle);
+    }
+
+    #[tokio::test]
+    async fn mark_all_read_includes_a_remote_completion_derived_by_the_transport_overlay() {
+        let directory = tempdir().unwrap();
+        let shared = Shared::new(
+            Snapshot {
+                ssh_transports: vec![explicit_transport("transport")],
+                ..Snapshot::default()
+            },
+            &[],
+            Acknowledgements::default(),
+            directory.path().join("acknowledged.json"),
+        )
+        .unwrap();
+        let mut remote = publish_remote_tmux_completion(&shared).await;
+        let id = "remote/remote-mac/shared-host/default/%1";
+        let unread = shared.snapshot(false).await;
+        let unread = unread.agents.iter().find(|agent| agent.id == id).unwrap();
+        assert_eq!(unread.attention, Attention::Done);
+        assert!(!unread.seen);
+
+        assert_eq!(shared.mark_all_read().await.unwrap(), 1);
+
+        let marked = shared.snapshot(false).await;
+        let marked = marked.agents.iter().find(|agent| agent.id == id).unwrap();
+        assert_eq!(marked.attention, Attention::Idle);
+        assert!(marked.seen);
+
+        remote.agents[0].state = AgentState::Working;
+        remote.agents[0].attention = Attention::Working;
+        remote.agents[0].seen = true;
+        shared.publish_remote("remote-mac", remote.clone()).await;
+        remote.agents[0].state = AgentState::Idle;
+        remote.agents[0].attention = Attention::Idle;
+        shared.publish_remote("remote-mac", remote).await;
+
+        let later = shared.snapshot(false).await;
+        let later = later.agents.iter().find(|agent| agent.id == id).unwrap();
+        assert_eq!(later.attention, Attention::Done);
+        assert!(!later.seen);
     }
 
     #[tokio::test]
