@@ -54,7 +54,8 @@ enum Command {
     },
     /// Open the interactive agent view in the current terminal.
     Ui {
-        /// Adapt lifecycle for a tmux popup: do not mark a pane and exit after focus.
+        /// Adapt lifecycle for a tmux popup: do not mark a pane, exit after exact
+        /// focus, and remain open to report transport-only focus.
         #[arg(long)]
         popup: bool,
     },
@@ -291,7 +292,7 @@ async fn main() -> Result<()> {
             daemon::ensure_running(&config_path, &paths).await?;
             let snapshot = ipc::snapshot(&paths.socket, false).await?;
             let record = resolve(&snapshot, &target)?;
-            tmux.focus_agent(record)
+            tmux.focus_agent(record).map(|_| ())
         }
         Command::Explain { target } => {
             daemon::ensure_running(&config_path, &paths).await?;
@@ -509,6 +510,15 @@ mod tests {
         assert!(help.contains("tmux-agent run -- opencode"));
         assert!(help.contains("tmux-agent run -- omp"));
         assert!(help.contains("tmux-agent run -- pi"));
+
+        let command = Cli::command();
+        let ui = command
+            .find_subcommand("ui")
+            .expect("ui subcommand should exist");
+        let help = ui.clone().render_long_help().to_string();
+        assert!(
+            help.contains("exit after exact focus, and remain open to report transport-only focus")
+        );
     }
 
     #[test]

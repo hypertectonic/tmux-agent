@@ -4,7 +4,7 @@ use crate::model::{
     AgentOrigin, AgentRecord, AgentState, Attention, GoalInfo, GoalState, Snapshot, terminal_safe,
     trim_braille_activity_prefix,
 };
-use crate::tmux::{Tmux, is_focus_target_missing};
+use crate::tmux::{FocusOutcome, Tmux, is_focus_target_missing};
 use anyhow::{Context, Result};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
@@ -1037,7 +1037,7 @@ async fn activate_record(
     let focus_record = &record;
     if focus_record.is_tmux() || focus_record.remote_alias.is_some() {
         return match context.tmux.focus_agent(focus_record) {
-            Ok(()) => {
+            Ok(FocusOutcome::Exact) => {
                 // Usage ordering is optional metadata. A successful focus must
                 // remain successful when an older daemon cannot record it.
                 let _ = ipc::mark_used(&context.paths.socket, &record.id).await;
@@ -1049,6 +1049,19 @@ async fn activate_record(
                 }
                 message.set_transient(
                     format!("focused {}", focus_record.location()),
+                    Instant::now(),
+                );
+                Ok(Activation::Completed)
+            }
+            Ok(FocusOutcome::TransportOnly) => {
+                if activation_requires_acknowledgement(focus_record) {
+                    acknowledge_record(context.paths, snapshot, &record.id).await?;
+                }
+                message.set_transient(
+                    format!(
+                        "focused remote transport only; inner session unchanged ({})",
+                        focus_record.location()
+                    ),
                     Instant::now(),
                 );
                 Ok(Activation::Completed)
@@ -3772,18 +3785,197 @@ mod tests {
     }
 
     #[test]
-    fn successful_focus_remains_completed_when_mark_used_is_unsupported() {
-        const CHILD_ENV: &str = "TMUX_AGENT_ACTIVATION_TEST_CHILD";
+    fn popup_transport_only_activation_stays_open_to_report_degraded_focus() {
+        const CHILD_ENV: &str = "TMUX_AGENT_TRANSPORT_ONLY_UI_TEST_CHILD";
         if std::env::var_os(CHILD_ENV).is_some() {
             let runtime = tokio::runtime::Runtime::new().unwrap();
-            runtime.block_on(successful_focus_with_unsupported_mark_used_child());
+            runtime.block_on(popup_transport_only_activation_child());
             return;
         }
 
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "ui::tests::successful_focus_remains_completed_when_mark_used_is_unsupported",
+                "ui::tests::popup_transport_only_activation_stays_open_to_report_degraded_focus",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+    }
+
+    async fn popup_transport_only_activation_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket_name = format!(
+            "tmux-agent-ui-transport-only-{}-{nonce}",
+            std::process::id()
+        );
+        let config = Config {
+            tmux_args: vec!["-L".into(), socket_name.clone()],
+            ..Config::default()
+        };
+        let paths = RuntimePaths {
+            socket: directory.path().join("daemon.sock"),
+            runners: directory.path().join("runners"),
+            state: directory.path().join("state.json"),
+            acknowledgements: directory.path().join("acknowledged.json"),
+            log: directory.path().join("daemon.log"),
+        };
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let started = Command::new("tmux")
+            .args([
+                "-L",
+                &socket_name,
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "local",
+                "sleep 30",
+            ])
+            .status()
+            .unwrap();
+        assert!(started.success());
+        let pane = Command::new("tmux")
+            .args([
+                "-L",
+                &socket_name,
+                "display-message",
+                "-p",
+                "-t",
+                "local",
+                "#{pane_id}",
+            ])
+            .output()
+            .unwrap();
+        assert!(pane.status.success());
+        let pane_id = String::from_utf8(pane.stdout).unwrap().trim().to_string();
+        for (option, value) in [
+            ("@tmux_agent_remote_host", "remote-mac"),
+            ("@tmux_agent_remote_session", "other-session"),
+        ] {
+            let marked = Command::new("tmux")
+                .args([
+                    "-L",
+                    &socket_name,
+                    "set-option",
+                    "-p",
+                    "-t",
+                    &pane_id,
+                    option,
+                    value,
+                ])
+                .status()
+                .unwrap();
+            assert!(marked.success());
+        }
+
+        let mut remote = test_agent("Codex", Attention::Done, AgentOrigin::Tmux);
+        remote.id = "remote/remote-mac/host/default/%1".into();
+        remote.remote_alias = Some("remote-mac".into());
+        remote.session_name = "selected-session".into();
+        remote.title = "selected-project".into();
+        let expected_id = remote.id.clone();
+        let mut acknowledged_snapshot = Snapshot {
+            agents: vec![remote.clone()],
+            ..Snapshot::default()
+        };
+        acknowledged_snapshot.agents[0].attention = Attention::Idle;
+        acknowledged_snapshot.agents[0].seen = true;
+        let server = tokio::spawn(async move {
+            let mut marked = None;
+            let mut acknowledged = None;
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request = serde_json::from_str::<crate::model::IpcRequest>(&line).unwrap();
+                let (response, done) = match request {
+                    crate::model::IpcRequest::MarkUsed { target } => {
+                        marked = Some(target);
+                        (crate::model::IpcResponse::Ack, false)
+                    }
+                    crate::model::IpcRequest::Acknowledge { target } => {
+                        acknowledged = Some(target);
+                        (crate::model::IpcResponse::Ack, false)
+                    }
+                    crate::model::IpcRequest::Snapshot { .. } => (
+                        crate::model::IpcResponse::Snapshot {
+                            snapshot: acknowledged_snapshot.clone(),
+                        },
+                        true,
+                    ),
+                    request => panic!("unexpected request: {request:?}"),
+                };
+                let mut response = serde_json::to_vec(&response).unwrap();
+                response.push(b'\n');
+                writer.write_all(&response).await.unwrap();
+                if done {
+                    return (marked, acknowledged);
+                }
+            }
+        });
+        let tmux = Tmux::new(&config);
+        let mut snapshot = Snapshot {
+            agents: vec![remote],
+            ..Snapshot::default()
+        };
+        let context = ActivationContext {
+            paths: &paths,
+            tmux: &tmux,
+            config: &config,
+            config_path: Path::new("/tmp/tmux-agent-config.toml"),
+            exit_after_focus: true,
+        };
+        let mut message = UiMessage::default();
+
+        let activation = activate_record(&context, &mut snapshot, 0, &mut message)
+            .await
+            .unwrap();
+        let (marked, acknowledged) = tokio::time::timeout(Duration::from_millis(500), server)
+            .await
+            .expect("activation should finish acknowledgement IPC")
+            .unwrap();
+
+        let _ = Command::new("tmux")
+            .args(["-L", &socket_name, "kill-server"])
+            .status();
+        assert_eq!(activation, Activation::Completed);
+        assert!(
+            marked.is_none(),
+            "transport-only focus must not record usage"
+        );
+        assert_eq!(acknowledged.as_deref(), Some(expected_id.as_str()));
+        assert!(message.text().contains("focused remote transport only"));
+        assert!(message.text().contains("inner session unchanged"));
+        assert_eq!(snapshot.agents[0].attention, Attention::Idle);
+        assert!(snapshot.agents[0].seen);
+    }
+
+    #[test]
+    fn popup_exact_focus_closes_when_mark_used_is_unsupported() {
+        const CHILD_ENV: &str = "TMUX_AGENT_ACTIVATION_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(popup_exact_focus_with_unsupported_mark_used_child());
+            return;
+        }
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ui::tests::popup_exact_focus_closes_when_mark_used_is_unsupported",
                 "--nocapture",
             ])
             .env(CHILD_ENV, "1")
@@ -3794,7 +3986,7 @@ mod tests {
         assert!(status.success());
     }
 
-    async fn successful_focus_with_unsupported_mark_used_child() {
+    async fn popup_exact_focus_with_unsupported_mark_used_child() {
         let directory = tempfile::tempdir().unwrap();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3898,7 +4090,7 @@ mod tests {
             tmux: &tmux,
             config: &config,
             config_path: Path::new("/tmp/tmux-agent-config.toml"),
-            exit_after_focus: false,
+            exit_after_focus: true,
         };
         let mut message = UiMessage::default();
 
@@ -3910,7 +4102,7 @@ mod tests {
         let _ = Command::new("tmux")
             .args(["-L", &socket_name, "kill-server"])
             .status();
-        assert_eq!(activation, Activation::Completed);
+        assert_eq!(activation, Activation::Close);
         let (marked, acknowledged) = requests
             .expect("successful focus should finish optional usage and acknowledgement IPC")
             .unwrap();

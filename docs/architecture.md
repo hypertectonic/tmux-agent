@@ -127,11 +127,12 @@ Numeric shortcuts publish only their explicit selected agent ID to sibling
 persistent UIs in the same tmux server. Activation focuses first; selection
 fanout then runs in the background and wakes recipient panes concurrently.
 Ordinary navigation and tmux focus changes remain local to each UI process.
-Successful Enter, mouse, and numeric activation share the same focus seam. That
-seam reports usage on a best-effort basis only after tmux focus succeeds,
+Successful Enter, mouse, and numeric activation share the same focus seam. An
+exact focus reports usage on a best-effort basis after tmux focus succeeds,
 advancing the daemon watch so every persistent UI on the same tmux server
-receives the reordered snapshot. An unavailable usage operation never turns a
-successful focus into a failed activation.
+receives the reordered snapshot. A transport-only remote focus does not report
+usage. An unavailable usage operation never turns a successful exact focus into
+a failed activation.
 
 ## Plugin and managed-binary compatibility
 
@@ -285,6 +286,18 @@ and pane, attaches the remote tmux client, waits for the local pane to adopt the
 selected agent title, then writes the binding and selects the pane. Zero or
 multiple shell matches, named remote servers, and an unverified attach all fail
 closed. The daemon protocol and persisted state do not carry the binding.
+
+After those precise remote tmux paths fail, activation can degrade to the outer
+transport. Exactly one live, non-UI local pane must have complete markers for
+the selected host. Its session marker may name a different remote tmux session.
+Focus selects only that local pane and window, leaves both markers unchanged,
+and does not send an inner tmux command. Multiple same-host bindings are
+ambiguous. Dead panes, UI panes, and partial marker pairs do not qualify.
+
+This host-only rule belongs only to intentional focus. Daemon reconciliation
+continues to require its existing exact connection, exact host/session, or
+unmarked terminal title evidence for local labels, visibility, attention, and
+focus targets.
 
 ## Security boundaries
 

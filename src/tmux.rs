@@ -99,6 +99,12 @@ pub struct RemotePaneBinding {
     pub session: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusOutcome {
+    Exact,
+    TransportOnly,
+}
+
 #[derive(Debug, Clone)]
 struct Process {
     uid: u32,
@@ -570,25 +576,28 @@ impl Tmux {
             .unwrap_or_default()
     }
 
-    pub fn focus_agent(&self, record: &AgentRecord) -> Result<()> {
+    pub fn focus_agent(&self, record: &AgentRecord) -> Result<FocusOutcome> {
         if let Some(alias) = &record.remote_alias {
             if let Some(target) = &record.focus_target {
-                return self.focus_location(
-                    &target.session_name,
-                    &target.window_id,
-                    &target.pane_id,
-                );
+                self.focus_location(&target.session_name, &target.window_id, &target.pane_id)?;
+                return Ok(FocusOutcome::Exact);
             }
             if record.is_tmux() {
                 if let Some(mirror) = self.find_or_repair_mirror(alias, record)? {
-                    return self.focus_location(
-                        &mirror.session_name,
-                        &mirror.window_id,
-                        &mirror.pane_id,
-                    );
+                    self.focus_location(&mirror.session_name, &mirror.window_id, &mirror.pane_id)?;
+                    return Ok(FocusOutcome::Exact);
+                }
+                if let Some(transport) = self.find_bound_host_transport(alias)? {
+                    self.focus_location(
+                        &transport.session_name,
+                        &transport.window_id,
+                        &transport.pane_id,
+                    )?;
+                    return Ok(FocusOutcome::TransportOnly);
                 }
             } else if let Some(pane) = self.find_transport_pane(alias, &record.title)? {
-                return self.focus_location(&pane.session_name, &pane.window_id, &pane.pane_id);
+                self.focus_location(&pane.session_name, &pane.window_id, &pane.pane_id)?;
+                return Ok(FocusOutcome::Exact);
             }
             return Err(FocusTargetMissing {
                 alias: alias.clone(),
@@ -603,7 +612,8 @@ impl Tmux {
                 record.location()
             );
         }
-        self.focus_location(&record.session_name, &record.window_id, &record.pane_id)
+        self.focus_location(&record.session_name, &record.window_id, &record.pane_id)?;
+        Ok(FocusOutcome::Exact)
     }
 
     fn find_or_repair_mirror(
@@ -750,6 +760,10 @@ impl Tmux {
         let panes = self.list_panes()?;
         let processes = self.process_snapshot(&panes)?;
         Ok(find_transport_pane(&panes, &processes.panes, remote_alias, title)?.cloned())
+    }
+
+    fn find_bound_host_transport(&self, remote_alias: &str) -> Result<Option<Pane>> {
+        Ok(find_bound_host_transport(&self.list_panes()?, remote_alias)?.cloned())
     }
 
     pub fn set_ui_marker(&self, pane_id: &str, enabled: bool) -> Result<()> {
@@ -1624,6 +1638,32 @@ fn find_mirror_pane<'a>(
     }
 }
 
+fn find_bound_host_transport<'a>(
+    panes: &'a [Pane],
+    remote_alias: &str,
+) -> Result<Option<&'a Pane>> {
+    let matches = panes
+        .iter()
+        .filter(|pane| !pane.dead && !pane.is_agent_ui)
+        .filter(|pane| {
+            pane.mirror_host.as_deref() == Some(remote_alias) && pane.mirror_session.is_some()
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [pane] => Ok(Some(*pane)),
+        _ => bail!(
+            "multiple local transport panes are bound to {}: {}",
+            terminal_safe(remote_alias),
+            matches
+                .iter()
+                .map(|pane| terminal_safe(&pane.pane_id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 fn find_stale_mirror_pane<'a>(
     panes: &'a [Pane],
     remote_alias: &str,
@@ -2225,6 +2265,119 @@ mod tests {
     }
 
     #[test]
+    fn remote_tmux_focus_uses_one_same_host_binding_without_changing_its_session() {
+        const SOCKET_ENV: &str = "TMUX_AGENT_TRANSPORT_ONLY_FOCUS_TEST_SOCKET";
+        if let Some(socket_name) = std::env::var_os(SOCKET_ENV) {
+            let socket_name = socket_name.to_string_lossy().into_owned();
+            let current = new_test_tmux_pane(&socket_name, "local", None);
+            let transport = test_tmux_value(
+                &socket_name,
+                &[
+                    "new-window",
+                    "-d",
+                    "-t",
+                    "local",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "sleep 30",
+                ],
+            );
+            mark_test_remote_pane(
+                &socket_name,
+                &transport,
+                "remote-mac",
+                "other-session",
+                "[mosh] · other-project",
+            );
+            test_tmux_output(&socket_name, &["select-window", "-t", "local:0"]);
+            test_tmux_output(&socket_name, &["select-pane", "-t", &current]);
+
+            let config = Config {
+                tmux_args: vec!["-L".into(), socket_name.clone()],
+                ..Config::default()
+            };
+            let tmux = Tmux::new(&config);
+
+            let outcome = tmux
+                .focus_agent(&remote_tmux_record("selected-session", "selected-project"))
+                .unwrap();
+
+            assert_eq!(outcome, FocusOutcome::TransportOnly);
+            assert_eq!(
+                test_tmux_value(
+                    &socket_name,
+                    &[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &transport,
+                        "#{window_active}:#{pane_active}"
+                    ],
+                ),
+                "1:1"
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &transport, REMOTE_HOST_OPTION),
+                "remote-mac"
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &transport, REMOTE_SESSION_OPTION),
+                "other-session"
+            );
+
+            let second = new_test_tmux_pane(&socket_name, "local", Some(&transport));
+            mark_test_remote_pane(
+                &socket_name,
+                &second,
+                "remote-mac",
+                "second-session",
+                "[mosh] · second-project",
+            );
+            let error = tmux
+                .focus_agent(&remote_tmux_record("missing-session", "missing-project"))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("multiple local transport panes are bound to remote-mac")
+            );
+            assert!(error.to_string().contains(&transport));
+            assert!(error.to_string().contains(&second));
+            return;
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket_name = format!(
+            "tmux-agent-transport-only-focus-{}-{nonce}",
+            std::process::id()
+        );
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tmux::tests::remote_tmux_focus_uses_one_same_host_binding_without_changing_its_session",
+                "--nocapture",
+            ])
+            .env(SOCKET_ENV, &socket_name)
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .output()
+            .unwrap();
+        let _ = Command::new("tmux")
+            .args(["-L", &socket_name, "kill-server"])
+            .status();
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn remote_tmux_focus_repairs_only_a_unique_stale_mosh_binding() {
         const SOCKET_ENV: &str = "TMUX_AGENT_REMOTE_FOCUS_TEST_SOCKET";
         if let Some(socket_name) = std::env::var_os(SOCKET_ENV) {
@@ -2271,8 +2424,11 @@ mod tests {
                 "unrelated-title",
             );
             test_tmux_output(&socket_name, &["select-pane", "-t", &stale]);
-            tmux.focus_agent(&remote_tmux_record("fresh-exact", "exact-title"))
-                .unwrap();
+            assert_eq!(
+                tmux.focus_agent(&remote_tmux_record("fresh-exact", "exact-title"))
+                    .unwrap(),
+                FocusOutcome::Exact
+            );
             assert_eq!(
                 test_tmux_value(
                     &socket_name,
@@ -2304,11 +2460,10 @@ mod tests {
             let error = tmux
                 .focus_agent(&remote_tmux_record("fresh-ambiguous", "ambiguous-title"))
                 .unwrap_err();
-            assert!(is_focus_target_missing(&error));
             assert!(
                 error
                     .to_string()
-                    .contains("no local pane is bound to remote-mac/fresh-ambiguous")
+                    .contains("multiple local transport panes are bound to remote-mac")
             );
             assert_eq!(
                 test_pane_option(&socket_name, &first, REMOTE_SESSION_OPTION),
@@ -2455,14 +2610,18 @@ exit 1
             let mut named = remote_tmux_record("named-session", "recovered-project");
             named.server = "named".into();
             named.cwd = record.cwd.clone();
-            let error = tmux.focus_agent(&named).unwrap_err();
-            assert!(is_focus_target_missing(&error));
+            assert_eq!(
+                tmux.focus_agent(&named).unwrap(),
+                FocusOutcome::TransportOnly
+            );
             assert!(!log_path.exists());
 
             let mut missing = remote_tmux_record("missing-session", "missing-project");
             missing.cwd = "/Users/example/Developer/Omu/missing-project".into();
-            let error = tmux.focus_agent(&missing).unwrap_err();
-            assert!(is_focus_target_missing(&error));
+            assert_eq!(
+                tmux.focus_agent(&missing).unwrap(),
+                FocusOutcome::TransportOnly
+            );
 
             let mut ambiguous = remote_tmux_record("ambiguous-session", "ambiguous-project");
             ambiguous.cwd = "/Users/example/Developer/Omu/ambiguous-project".into();
@@ -3675,6 +3834,60 @@ exit 1
 
         let error = find_mirror_pane(&panes, "remote-mac", "wmtc-manual-48").unwrap_err();
         assert!(error.to_string().contains("%63, %64"));
+    }
+
+    #[test]
+    fn host_transport_fallback_rejects_ambiguous_bindings() {
+        let panes = ["%63", "%64"].map(|pane_id| {
+            let mut pane = pane(pane_id, "local", "remote session");
+            pane.mirror_host = Some("remote-mac".into());
+            pane.mirror_session = Some(format!("session-{pane_id}"));
+            pane
+        });
+
+        let error = find_bound_host_transport(&panes, "remote-mac").unwrap_err();
+
+        assert!(error.to_string().contains("remote-mac"));
+        assert!(error.to_string().contains("%63, %64"));
+    }
+
+    #[test]
+    fn host_transport_fallback_excludes_dead_ui_and_partial_bindings() {
+        let mut dead = pane("%dead", "local", "dead");
+        dead.dead = true;
+        dead.mirror_host = Some("remote-mac".into());
+        dead.mirror_session = Some("dead-session".into());
+
+        let mut ui = pane("%ui", "local", "ui");
+        ui.is_agent_ui = true;
+        ui.mirror_host = Some("remote-mac".into());
+        ui.mirror_session = Some("ui-session".into());
+
+        let mut host_only = pane("%host", "local", "host only");
+        host_only.mirror_host = Some("remote-mac".into());
+
+        let mut session_only = pane("%session", "local", "session only");
+        session_only.mirror_session = Some("remote-session".into());
+
+        let mut eligible = pane("%eligible", "local", "eligible");
+        eligible.mirror_host = Some("remote-mac".into());
+        eligible.mirror_session = Some("other-session".into());
+
+        let excluded = [dead, ui, host_only, session_only];
+        assert!(
+            find_bound_host_transport(&excluded, "remote-mac")
+                .unwrap()
+                .is_none()
+        );
+
+        let mut panes = excluded.to_vec();
+        panes.push(eligible);
+        assert_eq!(
+            find_bound_host_transport(&panes, "remote-mac")
+                .unwrap()
+                .map(|pane| pane.pane_id.as_str()),
+            Some("%eligible")
+        );
     }
 
     #[test]
