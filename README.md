@@ -125,8 +125,9 @@ tmux-agent ui
 | Left click | Activate a row |
 | `a` | Mark all currently unread completions as read in normal mode |
 | `r` | Refresh |
-| `q` | Close in normal mode; type `q` during search |
-| `Esc` | Clear the active search, otherwise close |
+| `q` | Ask to close in normal mode; type `q` during search |
+| `y`, `Y` | Confirm closing when the quit prompt is visible |
+| `Esc` | Cancel the quit prompt, clear the active search, or close |
 
 Search is case-insensitive and matches the displayed title, provider, label,
 state, location, and working directory. It remains local to the UI process.
