@@ -20,7 +20,12 @@ connection = re.search(r"MOSH CONNECT (\d+) (\S+)", bootstrap.stdout)
 if connection is None:
     raise SystemExit("Mosh bootstrap did not produce a connection")
 os.environ["MOSH_KEY"] = connection[2]
+client = sys.argv[3] if len(sys.argv) > 3 else "mosh-client"
+invocation = (
+    f"--client={client} --ssh=ssh -o BatchMode=yes "
+    "--no-init remote-host -- tmux attach-session |"
+)
 os.execvp(
-    "mosh-client",
-    ["mosh-client", "-#", "--no-init remote-host |", "127.0.0.1", connection[1]],
+    client,
+    [client, "-#", invocation, "127.0.0.1", connection[1]],
 )

@@ -111,6 +111,10 @@ Named tmux servers are supported when the configured remote collector targets
 that server. No launch wrapper, registry, extra service, or dotfile edit is
 needed.
 
+Custom Mosh clients are recognized when the original `--client` option names
+the exact running executable and its process title carries a numeric server
+endpoint. Custom executable paths containing whitespace are not supported.
+
 Session switches update the association on the next scan. Disconnect removes
 it; reconnect discovers a new client. Socket and process updates can take about
 one second. Dead panes and tmux-agent UI panes are excluded. Stale host/session

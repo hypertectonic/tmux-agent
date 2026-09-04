@@ -1649,7 +1649,8 @@ fn parse_lsof_udp_endpoints(output: &[u8]) -> HashMap<u32, MoshEndpoint> {
 }
 
 fn mosh_client_endpoint(command: &str) -> Option<(&str, MoshEndpoint)> {
-    if program_name(command) != Some("mosh-client") {
+    let destination = mosh_destination_for_command(command);
+    if !is_mosh_client(&command.split_whitespace().collect::<Vec<_>>()) {
         return None;
     }
     let (_, endpoint) = command.rsplit_once(" | ")?;
@@ -1660,9 +1661,45 @@ fn mosh_client_endpoint(command: &str) -> Option<(&str, MoshEndpoint)> {
     let address = address.parse::<std::net::IpAddr>().ok()?.to_string();
     let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
     Some((
-        mosh_destination_for_command(command).unwrap_or(fields[0]),
+        destination.unwrap_or(fields[0]),
         MoshEndpoint { address, port },
     ))
+}
+
+fn is_mosh_client(fields: &[&str]) -> bool {
+    let Some(executable) = fields.first() else {
+        return false;
+    };
+    if executable.rsplit('/').next() == Some("mosh-client") {
+        return true;
+    }
+    let Some(separator) = fields.iter().position(|field| *field == "|") else {
+        return false;
+    };
+    if fields.get(1) != Some(&"-#") || separator < 2 || fields.len() != separator + 3 {
+        return false;
+    }
+    // Mosh preserves its original --client option in the -# process title.
+    // Check its exact executable independently of host parsing: embedded SSH
+    // arguments lose their quoting in this title. Never inspect a remote command.
+    let options = &fields[2..separator];
+    let mut declared_client = None;
+    for (index, field) in options
+        .iter()
+        .take_while(|field| **field != "--")
+        .enumerate()
+    {
+        if *field == "--client" {
+            declared_client = options.get(index + 1).copied();
+        } else if let Some(client) = field.strip_prefix("--client=") {
+            declared_client = Some(client);
+        }
+    }
+    declared_client == Some(*executable)
+        && fields[separator + 1].parse::<std::net::IpAddr>().is_ok()
+        && fields[separator + 2]
+            .parse::<u16>()
+            .is_ok_and(|port| port != 0)
 }
 
 fn same_address(left: &str, right: &str) -> bool {
@@ -2136,9 +2173,7 @@ fn transport_destination_for_command(command: &str) -> Option<&str> {
 
 fn mosh_destination_for_command(command: &str) -> Option<&str> {
     let fields = command.split_whitespace().collect::<Vec<_>>();
-    let executable = fields.first()?;
-    let program = executable.rsplit('/').next().unwrap_or(executable);
-    if program != "mosh-client" {
+    if !is_mosh_client(&fields) {
         return None;
     }
     let separator = fields.iter().position(|field| *field == "|")?;
@@ -2320,6 +2355,46 @@ mod tests {
     }
 
     #[test]
+    fn custom_mosh_clients_require_the_exact_declared_executable() {
+        for option in [
+            "--client=/opt/bin/mobile-shell",
+            "--client /opt/bin/mobile-shell",
+        ] {
+            let command = format!(
+                "/opt/bin/mobile-shell -# {option} --no-init remote-host | 192.0.2.1 60001"
+            );
+            let (host, endpoint) = mosh_client_endpoint(&command).unwrap();
+            assert_eq!(host, "remote-host");
+            assert_eq!(endpoint.port, 60001);
+            assert_eq!(mosh_destination_for_command(&command), Some("remote-host"));
+        }
+        let command = "/opt/bin/mobile-shell -# --client=/opt/bin/mobile-shell --ssh=ssh -o BatchMode=yes remote-host -- tmux attach | 192.0.2.1 60001";
+        assert_eq!(
+            mosh_client_endpoint(command).unwrap().1.address,
+            "192.0.2.1"
+        );
+        for command in [
+            "/opt/bin/mobile-shell -# remote-host | 192.0.2.1 60001",
+            "/opt/bin/mobile-shell --client=/opt/bin/mobile-shell remote-host | 192.0.2.1 60001",
+            "/opt/bin/mobile-shell -# --client=/other/mobile-shell remote-host | 192.0.2.1 60001",
+            "/opt/bin/mobile-shell -# remote-host -- program --client=/opt/bin/mobile-shell | 192.0.2.1 60001",
+            "/opt/bin/mobile-shell -# --client=/opt/bin/mobile-shell remote-host | invalid 60001",
+            "/opt/bin/mobile-shell -# --client=/opt/bin/mobile-shell remote-host | 192.0.2.1 0",
+            "sleep 30 | 192.0.2.1 60001",
+            "/opt/bin/mobile-shell -# --client=/opt/bin/mobile-shell --client=/other/client remote-host | 192.0.2.1 60001",
+        ] {
+            assert!(
+                mosh_client_endpoint(command).is_none(),
+                "accepted {command}"
+            );
+            assert!(
+                mosh_destination_for_command(command).is_none(),
+                "accepted {command}"
+            );
+        }
+    }
+
+    #[test]
     fn live_mosh_attachments_focus_hidden_windows_and_follow_session_switches() {
         const SOCKET_ENV: &str = "TMUX_AGENT_LIVE_ATTACHMENT_TEST";
         if let Ok(local_socket) = env::var(SOCKET_ENV) {
@@ -2335,6 +2410,18 @@ mod tests {
                 }
             }
             let _servers = Servers(vec![remote_socket.clone(), local_socket.clone()]);
+            let custom_client_directory = tempdir().unwrap();
+            let custom_client = custom_client_directory.path().join("mobile-shell");
+            let installed_client = Command::new("sh")
+                .args(["-c", "command -v mosh-client"])
+                .output()
+                .unwrap();
+            assert!(installed_client.status.success());
+            std::os::unix::fs::symlink(
+                String::from_utf8(installed_client.stdout).unwrap().trim(),
+                &custom_client,
+            )
+            .unwrap();
             let local = Tmux::new(&Config {
                 tmux_args: vec!["-L".into(), local_socket.clone()],
                 ..Config::default()
@@ -2364,7 +2451,7 @@ mod tests {
                 );
             }
             let attach = |session: &str| {
-                let command = shell_join(&[
+                let mut args = vec![
                     "python3".into(),
                     format!(
                         "{}/tests/fixtures/mosh-attachment.py",
@@ -2372,7 +2459,11 @@ mod tests {
                     ),
                     remote_socket.clone(),
                     session.into(),
-                ]);
+                ];
+                if session == "t" {
+                    args.push(custom_client.to_string_lossy().into_owned());
+                }
+                let command = shell_join(&args);
                 test_tmux_value(
                     &local_socket,
                     &[
