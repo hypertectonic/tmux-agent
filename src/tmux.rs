@@ -332,6 +332,20 @@ impl Tmux {
         self.process_snapshot_with(panes, Instant::now, || self.refresh_process_inventory())
     }
 
+    pub fn fresh_process_snapshot(&self, panes: &[Pane]) -> Result<ProcessSnapshot> {
+        Ok(self.project_process_snapshot(panes, &self.refresh_process_inventory()?))
+    }
+
+    pub fn live_focus_transport(&self, record: &AgentRecord) -> Result<Option<SshTransport>> {
+        let panes = self.list_panes()?;
+        let processes = self.fresh_process_snapshot(&panes)?;
+        match session_transports(record, &processes.ssh_transports).as_slice() {
+            [transport] => Ok(Some((*transport).clone())),
+            [] => Ok(None),
+            _ => bail!("multiple live local transports; detach duplicate clients, then refresh"),
+        }
+    }
+
     pub fn session_connections(
         &self,
         processes: &ProcessSnapshot,
@@ -704,7 +718,7 @@ impl Tmux {
                 && let Some(connections) = &record.session_connections
             {
                 let panes = self.list_panes()?;
-                let processes = self.process_snapshot(&panes)?;
+                let processes = self.fresh_process_snapshot(&panes)?;
                 let transports = session_transports(record, &processes.ssh_transports);
                 let target = match transports.as_slice() {
                     [transport] => transport.target.clone(),
@@ -1059,7 +1073,7 @@ impl Tmux {
         Ok(())
     }
 
-    fn run(&self, command_args: &[&str]) -> Result<String> {
+    pub(crate) fn run(&self, command_args: &[&str]) -> Result<String> {
         let mut command = Command::new("tmux");
         command.args(&self.args).args(command_args);
         let output = command

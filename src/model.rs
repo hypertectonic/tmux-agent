@@ -6,10 +6,14 @@ pub const PROTOCOL_VERSION: u32 = 4;
 pub const LAUNCHER_PROTOCOL_VERSION: u32 = 1;
 pub const APPLICATION_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CAPABILITY_SUBAGENT_VIEW: &str = "codex_subagent_view_v1";
+pub const CAPABILITY_REMOTE_FOCUS: &str = "remote_tmux_focus_v1";
 pub const SUBAGENT_VIEW_MINIMUM_VERSION: &str = "0.2.0";
 
 pub fn application_capabilities() -> Vec<String> {
-    vec![CAPABILITY_SUBAGENT_VIEW.to_string()]
+    vec![
+        CAPABILITY_SUBAGENT_VIEW.to_string(),
+        CAPABILITY_REMOTE_FOCUS.to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -4,7 +4,7 @@ use crate::model::{
     AgentOrigin, AgentRecord, AgentState, Attention, GoalInfo, GoalState, Snapshot, terminal_safe,
     trim_braille_activity_prefix,
 };
-use crate::tmux::{FocusOutcome, TRANSPORT_ONLY_FOCUS_MESSAGE, Tmux, is_focus_target_missing};
+use crate::tmux::{FocusOutcome, Tmux, is_focus_target_missing};
 use anyhow::{Context, Result};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
@@ -1036,8 +1036,13 @@ async fn activate_record(
     }
     let focus_record = &record;
     if focus_record.is_tmux() || focus_record.remote_alias.is_some() {
-        return match context.tmux.focus_agent(focus_record) {
-            Ok(FocusOutcome::Exact) => {
+        return match crate::focus::activate(context.tmux, context.config, snapshot, focus_record)
+            .await
+        {
+            Ok(crate::focus::FocusReport {
+                outcome: FocusOutcome::Exact,
+                ..
+            }) => {
                 // Usage ordering is optional metadata. A successful focus must
                 // remain successful when an older daemon cannot record it.
                 let _ = ipc::mark_used(&context.paths.socket, &record.id).await;
@@ -1053,15 +1058,15 @@ async fn activate_record(
                 );
                 Ok(Activation::Completed)
             }
-            Ok(FocusOutcome::TransportOnly) => {
+            Ok(crate::focus::FocusReport {
+                outcome: FocusOutcome::TransportOnly,
+                notice,
+            }) => {
                 if activation_requires_acknowledgement(focus_record) {
                     acknowledge_record(context.paths, snapshot, &record.id).await?;
                 }
                 message.set_transient(
-                    format!(
-                        "{TRANSPORT_ONLY_FOCUS_MESSAGE} ({})",
-                        focus_record.location()
-                    ),
+                    format!("{notice} ({})", focus_record.location()),
                     Instant::now(),
                 );
                 Ok(Activation::Completed)

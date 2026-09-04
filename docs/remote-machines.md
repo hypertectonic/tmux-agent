@@ -72,8 +72,8 @@ ssh -T agent@build-host.example.ts.net \
 ```
 
 These are ordinary SSH commands initiated and authorized by the user. Remote
-configuration grants federation read access only; it never grants tmux-agent
-authority to run lifecycle commands on another machine.
+configuration permits federation reads and explicit focus or child-view actions;
+it never grants tmux-agent authority to run lifecycle commands on another machine.
 
 ## What crosses SSH
 
@@ -99,8 +99,9 @@ persistence.
 
 For remote tmux, tmux-agent finds the session currently attached through each
 local SSH or Mosh pane. Selecting an agent in a hidden remote window focuses
-its outer transport even when the active remote window contains only a shell
-or editor. Multiple sessions on one host resolve independently. Two local
+its outer transport and selects the requested inner window and pane, even when
+the active remote window contains only a shell or editor. Multiple sessions on
+one host resolve independently. Two local
 transports attached to the same selected session are ambiguous.
 
 This discovery needs `lsof` on both machines. The remote collector reads the
@@ -121,16 +122,44 @@ one second. Dead panes and tmux-agent UI panes are excluded. Stale host/session
 markers cannot override a known live association, and no arbitrary same-host
 pane is selected when the selected session has no matching transport.
 
-This selects only the outer pane. It does not change or verify the inner tmux
-window or pane. The UI reports partial focus and keeps a popup open; the CLI
-prints the same notice to stderr and exits successfully. Activating a completion
-or pending goal achievement still acknowledges it, but partial focus does not
-change last-used ordering. A missing target still permits the UI's existing
+Inner selection uses a separate non-interactive SSH command from the configured
+`[[machine]]`, including when the visible transport uses Mosh and bootstrap SSH
+has exited. Both peers must advertise `remote_tmux_focus_v1`. The operation sends
+typed JSON on stdin, validates the configured tmux server's PID and start time,
+session ID and creation time, live client endpoint, and requested window and pane
+IDs, then confirms the selection. Names with spaces are supported. No shell text
+is sent to an interactive pane and no extra terminal opens.
+
+The remote binary must use the same configuration for `watch` and `remote-focus`.
+For a named server, set `tmux_args` in that remote configuration or use the same
+configured binary wrapper for both commands. If SSH control reaches a different
+server, the operation rejects the request rather than searching other servers.
+The complete SSH operation has a five-second timeout and bounded input/output.
+
+Tmux shares window selection among clients attached to the same session, and
+pane selection among views of the same window, including linked windows.
+Selecting an agent therefore changes what those clients see. It does not switch
+any client to another session. A second local transport to the same session
+remains ambiguous and prevents selection.
+
+Older peers without the capability, raw `[[remote]]` collectors, and explicit
+bindings without inspectable client evidence retain outer-only focus. The UI
+reports why inner selection is unavailable and keeps a popup open; the CLI prints
+the notice to stderr and exits successfully. Activating a completion or pending
+goal achievement still acknowledges it, but partial focus does not change
+last-used ordering. A missing outer target still permits the UI's existing
 acknowledgement action; ambiguous transports remain errors.
 
+If the target disappears, the association changes, or SSH control fails, the
+operation reports that the outer pane was focused but inner focus was not
+confirmed. These failures keep the popup open and do not acknowledge or update
+last-used ordering. Only a confirmed remote selection followed by a rechecked
+local transport returns exact focus and allows the popup to close.
+
 Completion visibility requires both the remote agent pane and its uniquely
-resolved local transport to be visible. Hidden remote agents remain hidden when
-a transport is selected. A transport label takes precedence over a remote pane
+resolved local transport to be visible. Outer-only focus leaves hidden remote
+agents hidden; successful inner selection becomes visible on the next remote
+snapshot. A transport label takes precedence over a remote pane
 label only for a unique association:
 
 ```tmux
@@ -177,4 +206,6 @@ command = ["ssh", "-T", "build-host", "tmux-agent", "watch", "--jsonl", "--local
 ```
 
 The structured `[[machine]]` form is preferred because it also supports
-diagnostics and remote Codex child viewing.
+diagnostics, inner tmux focus, and remote Codex child viewing. Raw collector
+commands do not define a focus control channel; tmux-agent does not infer one
+from their command text.

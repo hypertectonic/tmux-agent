@@ -1,0 +1,632 @@
+use crate::config::{Config, MachineConfig};
+use crate::model::{
+    AgentRecord, CAPABILITY_REMOTE_FOCUS, ClientConnection, SessionConnections, Snapshot,
+};
+use crate::tmux::{FocusOutcome, TRANSPORT_ONLY_FOCUS_MESSAGE, Tmux, session_transports};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::io::Read;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const CONTROL_VERSION: u32 = 1;
+const CONTROL_LIMIT: u64 = 16 * 1024;
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub struct FocusReport {
+    pub outcome: FocusOutcome,
+    pub notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FocusRequest {
+    version: u32,
+    server_pid: u32,
+    server_started_at: u64,
+    session_created_at: u64,
+    session_id: String,
+    window_id: String,
+    pane_id: String,
+    client: ClientConnection,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+enum FocusResponse {
+    Selected { target: FocusRequest },
+    Rejected { message: String },
+}
+
+pub async fn activate(
+    tmux: &Tmux,
+    config: &Config,
+    snapshot: &Snapshot,
+    record: &AgentRecord,
+) -> Result<FocusReport> {
+    let outcome = tmux.focus_agent(record)?;
+    let partial = |reason: &str| FocusReport {
+        outcome,
+        notice: format!("{TRANSPORT_ONLY_FOCUS_MESSAGE}; {reason}"),
+    };
+    if outcome == FocusOutcome::Exact || !record.is_tmux() {
+        return Ok(FocusReport {
+            outcome,
+            notice: String::new(),
+        });
+    }
+    let Some(alias) = record.remote_alias.as_deref() else {
+        return Ok(partial("remote identity unavailable"));
+    };
+    let Some(machine) = config.machine(alias) else {
+        return Ok(partial(
+            "inner focus requires a structured [[machine]] configuration",
+        ));
+    };
+    if !snapshot.peers.iter().any(|peer| {
+        peer.name == alias
+            && peer
+                .capabilities
+                .iter()
+                .any(|capability| capability == CAPABILITY_REMOTE_FOCUS)
+    }) {
+        return Ok(partial("peer does not advertise remote_tmux_focus_v1"));
+    }
+    let Some(session) = &record.session_connections else {
+        return Ok(partial("peer has no live session attachment identity"));
+    };
+    let Some(transport) = tmux.live_focus_transport(record)? else {
+        if session.complete {
+            bail!("outer transport focused; live client association changed before inner focus");
+        }
+        return Ok(partial(
+            "no inspectable live client association for inner focus",
+        ));
+    };
+    // Resolve the specific remote endpoint that justified this outer pane.
+    // A user-maintained binding alone cannot authorize remote selection.
+    let clients = session
+        .clients
+        .iter()
+        .filter(|client| {
+            let mut candidate = record.clone();
+            candidate.session_connections.as_mut().unwrap().clients = vec![(*client).clone()];
+            !session_transports(&candidate, std::slice::from_ref(&transport)).is_empty()
+        })
+        .collect::<Vec<_>>();
+    let [client] = clients.as_slice() else {
+        return Ok(partial("remote client association is ambiguous"));
+    };
+    let request = FocusRequest {
+        version: CONTROL_VERSION,
+        server_pid: session.server_pid,
+        server_started_at: session.server_started_at,
+        session_created_at: session.session_created_at,
+        session_id: record.session_id.clone(),
+        window_id: record.window_id.clone(),
+        pane_id: record.pane_id.clone(),
+        client: (*client).clone(),
+    };
+    let result = async {
+        request.validate()?;
+        send_control(machine, &request).await?;
+        if !tmux.live_focus_transport(record)?.is_some_and(|current| {
+            current.target == transport.target
+                && current.connection == transport.connection
+                && current.mosh_endpoint == transport.mosh_endpoint
+        }) {
+            bail!("local transport changed during remote selection; refresh and retry");
+        }
+        // Recheck and focus the same outer pane after the remote confirmation.
+        tmux.focus_agent(record)?;
+        Ok(FocusReport {
+            outcome: FocusOutcome::Exact,
+            notice: String::new(),
+        })
+    }
+    .await;
+    // A failed control operation must not enter the UI's missing-outer-target
+    // acknowledgement fallback, even if the final local recheck lost its pane.
+    result.map_err(|error: anyhow::Error| {
+        anyhow::anyhow!("outer transport focused; inner focus was not confirmed: {error:#}")
+    })
+}
+
+async fn send_control(machine: &MachineConfig, request: &FocusRequest) -> Result<()> {
+    let response = control_output(&machine.focus_command(), request, CONTROL_TIMEOUT).await?;
+    confirm_response(&response, request)
+}
+
+fn confirm_response(response: &[u8], request: &FocusRequest) -> Result<()> {
+    match serde_json::from_slice::<FocusResponse>(response)
+        .context("invalid remote focus response")?
+    {
+        FocusResponse::Selected { target } if target == *request => Ok(()),
+        FocusResponse::Selected { .. } => bail!("remote confirmed a different focus target"),
+        FocusResponse::Rejected { message } => bail!(
+            "remote focus rejected: {}",
+            crate::model::terminal_safe(&message)
+        ),
+    }
+}
+
+async fn control_output(
+    command: &[String],
+    request: &FocusRequest,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let payload = serde_json::to_vec(request)?;
+    let mut child = tokio::process::Command::new(&command[0])
+        .args(&command[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // SSH and wrapper output may contain private connection details.
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("start SSH focus control")?;
+    let operation = async {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("SSH control stdin unavailable")?;
+        stdin.write_all(&payload).await?;
+        stdin.shutdown().await?;
+        drop(stdin);
+        let mut response = Vec::new();
+        child
+            .stdout
+            .take()
+            .context("SSH control stdout unavailable")?
+            .take(CONTROL_LIMIT + 1)
+            .read_to_end(&mut response)
+            .await?;
+        if response.len() as u64 > CONTROL_LIMIT {
+            bail!("SSH focus response exceeded size limit");
+        }
+        let status = child.wait().await?;
+        if !status.success() {
+            bail!("SSH focus control failed with {status}");
+        }
+        Ok(response)
+    };
+    tokio::time::timeout(timeout, operation)
+        .await
+        .context("SSH focus control timed out")?
+}
+
+impl FocusRequest {
+    fn validate(&self) -> Result<()> {
+        if self.version != CONTROL_VERSION {
+            bail!("unsupported remote focus operation version");
+        }
+        for (value, prefix) in [
+            (&self.session_id, '$'),
+            (&self.window_id, '@'),
+            (&self.pane_id, '%'),
+        ] {
+            if !value.starts_with(prefix)
+                || value.len() < 2
+                || !value[1..].bytes().all(|byte| byte.is_ascii_digit())
+            {
+                bail!("remote focus requires numeric tmux session, window and pane IDs");
+            }
+        }
+        if self.server_pid == 0 || self.server_started_at == 0 || self.session_created_at == 0 {
+            bail!("remote focus requires tmux server and session lifetime identity");
+        }
+        Ok(())
+    }
+
+    fn validate_session(&self, session: &SessionConnections) -> Result<()> {
+        if session.server_pid != self.server_pid
+            || session.server_started_at != self.server_started_at
+        {
+            bail!(
+                "configured SSH control targets a different or restarted tmux server; configure the same server for watch and remote-focus"
+            );
+        }
+        if session.session_created_at != self.session_created_at {
+            bail!("remote tmux session was replaced");
+        }
+        if session
+            .clients
+            .iter()
+            .filter(|client| *client == &self.client)
+            .count()
+            != 1
+        {
+            bail!("remote tmux client detached, changed sessions, or is ambiguous");
+        }
+        Ok(())
+    }
+}
+
+fn verify_target(tmux: &Tmux, request: &FocusRequest, selected: bool) -> Result<()> {
+    let panes = tmux.list_panes()?;
+    let processes = tmux.fresh_process_snapshot(&panes)?;
+    let sessions = tmux.session_connections(&processes)?;
+    let session = sessions
+        .get(&request.session_id)
+        .context("remote tmux session vanished or configured server is unsupported")?;
+    request.validate_session(session)?;
+    panes
+        .iter()
+        .find(|pane| {
+            pane.session_id == request.session_id
+                && pane.window_id == request.window_id
+                && pane.pane_id == request.pane_id
+                && !pane.dead
+        })
+        .context("requested remote tmux window or pane vanished or changed sessions")?;
+    if selected {
+        let current = tmux.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &format!("{}:", request.session_id),
+            "#{window_id} #{pane_id}",
+        ])?;
+        if current.trim() != format!("{} {}", request.window_id, request.pane_id) {
+            bail!("remote tmux target selection was not confirmed");
+        }
+    }
+    Ok(())
+}
+
+fn select_remote(tmux: &Tmux, request: &FocusRequest) -> Result<()> {
+    request.validate()?;
+    verify_target(tmux, request, false)?;
+    let window = format!("{}:{}", request.session_id, request.window_id);
+    // Window selection is shared by attached clients of this session. Never
+    // switch a client to another session, and never use names or shell text.
+    tmux.run(&[
+        "select-window",
+        "-t",
+        &window,
+        ";",
+        "select-pane",
+        "-t",
+        &request.pane_id,
+    ])?;
+    verify_target(tmux, request, true)
+}
+
+pub fn serve(tmux: &Tmux) -> Result<()> {
+    let result = (|| {
+        let mut input = Vec::new();
+        std::io::stdin()
+            .take(CONTROL_LIMIT + 1)
+            .read_to_end(&mut input)?;
+        if input.len() as u64 > CONTROL_LIMIT {
+            bail!("remote focus request exceeded size limit");
+        }
+        let request: FocusRequest =
+            serde_json::from_slice(&input).context("invalid remote focus request")?;
+        select_remote(tmux, &request)?;
+        Ok(request)
+    })();
+    let response = match result {
+        Ok(target) => FocusResponse::Selected { target },
+        Err(error) => FocusResponse::Rejected {
+            message: format!("{error:#}"),
+        },
+    };
+    println!("{}", serde_json::to_string(&response)?);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::shell_join;
+    use crate::model::MoshEndpoint;
+    use std::process::Command;
+    use std::time::Instant;
+
+    fn request() -> FocusRequest {
+        FocusRequest {
+            version: CONTROL_VERSION,
+            server_pid: 42,
+            server_started_at: 100,
+            session_created_at: 200,
+            session_id: "$1".into(),
+            window_id: "@2".into(),
+            pane_id: "%3".into(),
+            client: ClientConnection::Mosh {
+                endpoint: MoshEndpoint {
+                    address: "127.0.0.1".into(),
+                    port: 60001,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn operation_requires_numeric_ids_and_exact_confirmation() {
+        let request = request();
+        request.validate().unwrap();
+        for invalid in [
+            "session name",
+            "$1; new-window",
+            "$1\n",
+            "$",
+            "$(touch file)",
+            "-t",
+        ] {
+            let mut invalid_request = request.clone();
+            invalid_request.session_id = invalid.into();
+            assert!(invalid_request.validate().is_err());
+        }
+        let selected = serde_json::to_vec(&FocusResponse::Selected {
+            target: request.clone(),
+        })
+        .unwrap();
+        confirm_response(&selected, &request).unwrap();
+        let mut different = request.clone();
+        different.pane_id = "%4".into();
+        assert!(confirm_response(&selected, &different).is_err());
+        assert!(confirm_response(b"{}", &request).is_err());
+        assert!(
+            confirm_response(
+                br#"{"result":"rejected","message":"target vanished"}"#,
+                &request
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("target vanished")
+        );
+        assert!(confirm_response(br#"{"result":"selected","target":{}}"#, &request).is_err());
+    }
+
+    #[tokio::test]
+    async fn control_handles_stdin_bounds_failure_and_full_lifetime_timeout() {
+        let request = request();
+        let command = |script: &str| vec!["sh".into(), "-c".into(), script.into()];
+        let output = control_output(&command("cat"), &request, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<FocusRequest>(&output).unwrap(),
+            request
+        );
+        assert!(
+            control_output(
+                &command("cat >/dev/null; exit 7"),
+                &request,
+                Duration::from_secs(2)
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("failed")
+        );
+        assert!(
+            control_output(
+                &command("cat >/dev/null; head -c 20000 /dev/zero"),
+                &request,
+                Duration::from_secs(2)
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("size limit")
+        );
+        let started = Instant::now();
+        assert!(
+            control_output(
+                &command("cat >/dev/null; exec sleep 10"),
+                &request,
+                Duration::from_millis(100)
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("timed out")
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn real_mosh_inner_selection_validates_lifetime_session_client_and_target() {
+        const FIXTURE: &str = "TMUX_AGENT_INNER_FOCUS_TEST";
+        if std::env::var_os(FIXTURE).is_none() {
+            for program in ["tmux", "mosh-client", "mosh-server", "python3", "lsof"] {
+                if Command::new(program).arg("--version").output().is_err() {
+                    eprintln!("skipping real inner-focus test: {program} unavailable");
+                    return;
+                }
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "focus::tests::real_mosh_inner_selection_validates_lifetime_session_client_and_target", "--nocapture"])
+                .env(FIXTURE, "1").env("TMUX_TMPDIR", directory.path())
+                .env_remove("TMUX").env_remove("TMUX_PANE").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        struct Servers(Vec<String>);
+        impl Drop for Servers {
+            fn drop(&mut self) {
+                for name in &self.0 {
+                    let _ = Command::new("tmux")
+                        .args(["-L", name, "kill-server"])
+                        .output();
+                }
+            }
+        }
+        let outer_name = format!("inner-focus-outer-{}", std::process::id());
+        let inner_name = format!("inner-focus-remote-{}", std::process::id());
+        let _servers = Servers(vec![outer_name.clone(), inner_name.clone()]);
+        let outer = Tmux::new(&Config {
+            tmux_args: vec!["-L".into(), outer_name],
+            ..Config::default()
+        });
+        let inner = Tmux::new(&Config {
+            tmux_args: vec!["-L".into(), inner_name.clone()],
+            ..Config::default()
+        });
+        inner
+            .run(&[
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "session with spaces",
+                "-x",
+                "100",
+                "-y",
+                "40",
+                "sleep 90",
+            ])
+            .unwrap();
+        inner
+            .run(&["set-option", "-g", "set-titles", "on"])
+            .unwrap();
+        let target_window = inner
+            .run(&[
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-t",
+                "session with spaces:",
+                "sleep 90",
+            ])
+            .unwrap()
+            .trim()
+            .to_string();
+        let target_pane = inner
+            .run(&[
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                &target_window,
+                "sleep 90",
+            ])
+            .unwrap()
+            .trim()
+            .to_string();
+        inner
+            .run(&["new-session", "-d", "-s", "unrelated", "sleep 90"])
+            .unwrap();
+        let attach = shell_join(&[
+            "python3".into(),
+            format!(
+                "{}/tests/fixtures/mosh-attachment.py",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            inner_name,
+            "session with spaces".into(),
+        ]);
+        outer
+            .run(&[
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "outer",
+                "-x",
+                "100",
+                "-y",
+                "40",
+                &attach,
+            ])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let session = loop {
+            let panes = inner.list_panes().unwrap();
+            let processes = inner.fresh_process_snapshot(&panes).unwrap();
+            let mut sessions = inner.session_connections(&processes).unwrap();
+            let session = sessions.remove("$0").unwrap();
+            if session.clients.len() == 1 {
+                break session;
+            }
+            assert!(Instant::now() < deadline, "Mosh did not attach");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let request = FocusRequest {
+            server_pid: session.server_pid,
+            server_started_at: session.server_started_at,
+            session_created_at: session.session_created_at,
+            session_id: "$0".into(),
+            window_id: target_window,
+            pane_id: target_pane,
+            client: session.clients[0].clone(),
+            ..request()
+        };
+        let current = || {
+            inner
+                .run(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "$0:",
+                    "#{window_id} #{pane_id}",
+                ])
+                .unwrap()
+        };
+        let original = current();
+        for field in [
+            "server",
+            "lifetime",
+            "session",
+            "window",
+            "pane",
+            "client",
+            "injection",
+        ] {
+            let mut stale = request.clone();
+            match field {
+                "server" => stale.server_pid += 1,
+                "lifetime" => stale.server_started_at += 1,
+                "session" => stale.session_created_at += 1,
+                "window" => stale.window_id = "@9999".into(),
+                "pane" => stale.pane_id = "%9999".into(),
+                "client" => match &mut stale.client {
+                    ClientConnection::Mosh { endpoint } => {
+                        endpoint.port = endpoint.port.wrapping_add(1)
+                    }
+                    ClientConnection::Ssh { connection } => {
+                        connection.client_port = connection.client_port.wrapping_add(1)
+                    }
+                },
+                "injection" => stale.pane_id = "%1; new-window".into(),
+                _ => unreachable!(),
+            }
+            assert!(select_remote(&inner, &stale).is_err(), "accepted {field}");
+            assert_eq!(current(), original, "mutated before rejecting {field}");
+        }
+        select_remote(&inner, &request).unwrap();
+        assert_eq!(
+            current().trim(),
+            format!("{} {}", request.window_id, request.pane_id)
+        );
+        let client = inner
+            .run(&["list-clients", "-t", "$0", "-F", "#{client_name}"])
+            .unwrap();
+        inner
+            .run(&["switch-client", "-c", client.trim(), "-t", "unrelated"])
+            .unwrap();
+        assert!(
+            select_remote(&inner, &request)
+                .unwrap_err()
+                .to_string()
+                .contains("client")
+        );
+        assert_eq!(
+            inner
+                .run(&["list-clients", "-F", "#{session_name}"])
+                .unwrap()
+                .trim(),
+            "unrelated"
+        );
+    }
+}

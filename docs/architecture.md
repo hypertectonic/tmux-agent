@@ -105,6 +105,12 @@ protocol versions on all machines. `mark_used` is local IPC metadata: its
 timestamps are neither serialized nor included in `--local-only` federation
 snapshots, so it does not change the federation protocol.
 
+`remote_tmux_focus_v1` is an additive peer capability on protocol 4. Older
+protocol-4 peers remain compatible and retain outer-only focus. The hidden
+`remote-focus` command accepts one bounded JSON request on stdin and returns a
+typed selected-target confirmation or rejection. Its operation version is `1`;
+unknown versions and malformed IDs are rejected before any tmux mutation.
+
 Peer status contains connection state, a bounded error message, application
 version, protocol, and capabilities. It intentionally has no freshness
 timestamp because snapshots are emitted on state changes, not as connection
@@ -266,10 +272,30 @@ the remote collector targets that server.
 Focus and daemon reconciliation use the same unique association. Focus
 rechecks local panes instead of trusting a precomputed target. Daemon labels
 and visibility use that association too; visibility still requires both the
-remote agent pane and local transport pane to be visible. Outer focus returns
+remote agent pane and local transport pane to be visible.
+
+For a structured machine advertising `remote_tmux_focus_v1`, activation sends
+the server/session lifetime, session/window/pane IDs, and specifically matched
+client endpoint over a separate configured SSH control command. The remote
+operation uses its configured server, refreshes process/socket inspection,
+validates the target and client association, selects the window and pane by ID,
+and verifies the result and association again. It never switches a client to
+another session. Tmux window selection affects all clients attached to that
+session; pane selection also affects linked views of that window. The local
+side rechecks the same transport after remote confirmation before returning
+`Exact`. Display titles and labels do not form part of that identity check.
+
+Control uses bounded JSON input/output and a five-second total SSH deadline.
+The authenticated configured machine establishes the host boundary; remote
+server PID/start time and session creation time reject a different server or
+reused session ID. Named servers must use the same remote configuration for
+collection and control. No server discovery or command inference is attempted.
+
+An older peer, raw collector, or uninspectable explicit binding still returns
 `TransportOnly`, acknowledges an activated completion or goal achievement,
-keeps popups open, and does not record last-used ordering. It never changes the
-inner remote window or pane.
+keeps popups open, and does not record last-used ordering. A rejected or failed
+control operation reports that outer focus happened without confirmed inner
+focus, keeps the popup open, and does not acknowledge or record usage.
 
 Session switches update the attachment on the next scan. Detach removes it;
 reconnect discovers the new client and endpoint. Process/socket changes can
