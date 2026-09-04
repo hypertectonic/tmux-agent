@@ -63,5 +63,83 @@
     "definitive": true,
     "inferred": false,
     "preserve_previous": false
+  },
+  {
+    "name": "left half circle title is active",
+    "basis": "provider terminal observation",
+    "title": "◐ task",
+    "screen": "",
+    "state": "working",
+    "source": "title",
+    "signal": "title_shows_activity",
+    "scope": "terminal_title",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "right half circle title is active",
+    "basis": "provider terminal observation",
+    "title": "◑ task",
+    "screen": "",
+    "state": "working",
+    "source": "title",
+    "signal": "title_shows_activity",
+    "scope": "terminal_title",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "current footer shells override idle title and prompt",
+    "basis": "provider terminal observation",
+    "title": "✳ task",
+    "screen": "response\n────\n❯ \n────\n? shortcuts · 3 shells",
+    "state": "working",
+    "source": "screen",
+    "signal": "background_shell_footer",
+    "scope": "current_footer",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "idle title and prompt without background shells stay idle",
+    "basis": "provider terminal observation",
+    "title": "✳ task",
+    "screen": "response\n────\n❯ \n────\n? shortcuts",
+    "state": "idle",
+    "source": "screen",
+    "signal": "input_prompt",
+    "scope": "prompt_box",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "historical shell count does not override current idle footer",
+    "basis": "synthetic scope regression",
+    "title": "✳ task",
+    "screen": "Earlier output: 3 shells\nresponse\n────\n❯ \n────\n? shortcuts",
+    "state": "idle",
+    "source": "screen",
+    "signal": "input_prompt",
+    "scope": "prompt_box",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "agent count does not imply background work",
+    "basis": "provider terminal observation",
+    "title": "✳ task",
+    "screen": "response\n────\n❯ \n────\n? shortcuts · 1 agent",
+    "state": "idle",
+    "source": "screen",
+    "signal": "input_prompt",
+    "scope": "prompt_box",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
   }
 ]
