@@ -3,7 +3,7 @@ use super::screen::{Lines, VisibleScreen, title_has_braille_activity};
 use crate::model::AgentState;
 
 pub(super) fn detect(title: &str, content: &str) -> ProviderDetection {
-    if title_has_braille_activity(title) {
+    if title_has_braille_activity(title) || title_has_half_circle_activity(title) {
         return ProviderDetection::from_title(AgentState::Working, "title_shows_activity");
     }
 
@@ -31,6 +31,14 @@ pub(super) fn detect(title: &str, content: &str) -> ProviderDetection {
         return ProviderDetection::from_screen(AgentState::Blocked, signal, "current_panel");
     }
 
+    if has_active_background_shells(&screen, current_panel) {
+        return ProviderDetection::from_screen(
+            AgentState::Working,
+            "background_shell_footer",
+            "current_footer",
+        );
+    }
+
     if recent.contains_any(&[
         "esc to interrupt",
         "ctrl+c to stop",
@@ -56,6 +64,10 @@ pub(super) fn detect(title: &str, content: &str) -> ProviderDetection {
     ProviderDetection::inferred_idle("claude_foreground_without_activity")
 }
 
+fn title_has_half_circle_activity(title: &str) -> bool {
+    matches!(title.trim_start().chars().next(), Some('◐' | '◑'))
+}
+
 fn alternate_view(screen: &VisibleScreen<'_>, recent: Lines<'_>) -> Option<&'static str> {
     if recent.contains("showing detailed transcript")
         && recent.contains_any(&["to toggle", "show all", "collapse", "scroll", "shortcuts"])
@@ -73,6 +85,18 @@ fn alternate_view(screen: &VisibleScreen<'_>, recent: Lines<'_>) -> Option<&'sta
 
 fn is_background_task_overlay(recent: Lines<'_>) -> bool {
     recent.any_line(|line| line.trim_start().starts_with("/btw")) && recent.contains("esc to close")
+}
+
+fn has_active_background_shells(screen: &VisibleScreen<'_>, footer: Lines<'_>) -> bool {
+    screen.latest_prompt_box().is_some()
+        && footer.any_line(|line| {
+            line.split_whitespace()
+                .zip(line.split_whitespace().skip(1))
+                .any(|(count, label)| {
+                    count.parse::<u64>().is_ok_and(|count| count > 0)
+                        && matches!(label, "shell" | "shells")
+                })
+        })
 }
 
 fn blocking_signal(panel: Lines<'_>) -> Option<&'static str> {
