@@ -196,6 +196,10 @@ SSH supplies authentication, encryption, host-key policy, streaming, and the
 separate interactive connection used for a remote Codex child view. Tailscale
 can provide private reachability but is not an application dependency.
 
+Selecting a remote tmux agent focuses its uniquely matched SSH or Mosh pane and
+uses a separate SSH control operation to select and verify the inner window and
+pane. Older peers and raw collector commands retain reported outer-only focus.
+
 See [Remote machines](docs/remote-machines.md) for setup order, privacy
 boundaries, focus behavior, and safe multi-machine updates.
 
