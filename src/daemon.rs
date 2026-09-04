@@ -767,7 +767,7 @@ enum TransportResolution<'a> {
 }
 
 #[cfg(test)]
-fn reconcile_transports(agents: &mut [AgentRecord], transports: &[SshTransport]) {
+pub(crate) fn reconcile_transports(agents: &mut [AgentRecord], transports: &[SshTransport]) {
     reconcile_transports_with_observations(agents, transports, None);
 }
 

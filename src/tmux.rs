@@ -577,7 +577,9 @@ impl Tmux {
             {
                 if let Some((host, endpoint)) = mosh_client_endpoint(&process.args) {
                     found_ssh = true;
-                    let mut transport = local_ssh_transport(pane, host, None, &self.host_aliases);
+                    let remote_host = pane.mirror_host.as_deref().unwrap_or(host);
+                    let mut transport =
+                        local_ssh_transport(pane, remote_host, None, &self.host_aliases);
                     transport.mosh_endpoint = Some(endpoint);
                     ssh_transports.push(transport);
                 }
@@ -2369,6 +2371,7 @@ mod tests {
             assert_eq!(mosh_destination_for_command(&command), Some("remote-host"));
         }
         let command = "/opt/bin/mobile-shell -# --client=/opt/bin/mobile-shell --ssh=ssh -o BatchMode=yes remote-host -- tmux attach | 192.0.2.1 60001";
+        assert!(mosh_destination_for_command(command).is_none());
         assert_eq!(
             mosh_client_endpoint(command).unwrap().1.address,
             "192.0.2.1"
@@ -2462,6 +2465,7 @@ mod tests {
                 ];
                 if session == "t" {
                     args.push(custom_client.to_string_lossy().into_owned());
+                    args.push("0.0.0.0".into());
                 }
                 let command = shell_join(&args);
                 test_tmux_value(
@@ -2480,6 +2484,17 @@ mod tests {
             };
             let first = attach("s");
             let second = attach("t");
+            mark_test_remote_pane(&local_socket, &second, "remote-mac", "t", "active shell");
+            test_tmux_output(
+                &local_socket,
+                &[
+                    "set-option",
+                    "-pt",
+                    &second,
+                    "@pane_label",
+                    "explicit transport",
+                ],
+            );
             let record = |session: &str| {
                 let panes = remote.list_panes().unwrap();
                 let pane = panes
@@ -2545,6 +2560,30 @@ mod tests {
                     "0"
                 );
             }
+            // The wildcard-bound remote server needs host attribution. Explicit
+            // markers survive a title whose embedded SSH options hide its host.
+            let processes = local
+                .process_snapshot(&local.list_panes().unwrap())
+                .unwrap();
+            let transport = processes
+                .ssh_transports
+                .iter()
+                .find(|transport| transport.target.pane_id == second)
+                .unwrap();
+            assert_eq!(transport.remote_host, "remote-mac");
+            assert!(transport.remote_host_explicit);
+            assert_eq!(
+                transport.mosh_endpoint.as_ref().unwrap().address,
+                "127.0.0.1"
+            );
+            let mut records = vec![record("t")];
+            assert!(
+                matches!(&records[0].session_connections.as_ref().unwrap().clients[0], ClientConnection::Mosh { endpoint } if matches!(endpoint.address.as_str(), "0.0.0.0" | "*"))
+            );
+            crate::daemon::reconcile_transports(&mut records, &processes.ssh_transports);
+            assert_eq!(records[0].focus_target.as_ref().unwrap().pane_id, second);
+            assert_eq!(records[0].label.as_deref(), Some("explicit transport"));
+            assert!(!records[0].visible);
             // An obsolete explicit binding cannot override a supported live association.
             mark_test_remote_pane(&local_socket, &first, "remote-mac", "s", "unrelated shell");
             let first_client = test_tmux_value(

@@ -7,9 +7,10 @@ import sys
 
 os.environ.pop("TMUX", None)
 os.environ.pop("TMUX_PANE", None)
+bind_address = sys.argv[4] if len(sys.argv) > 4 else "127.0.0.1"
 bootstrap = subprocess.run(
     [
-        "mosh-server", "new", "-s", "-i", "127.0.0.1", "--",
+        "mosh-server", "new", "-s", "-i", bind_address, "--",
         "tmux", "-L", sys.argv[1], "attach-session", "-t", sys.argv[2],
     ],
     capture_output=True,

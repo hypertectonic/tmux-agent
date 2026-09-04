@@ -278,11 +278,14 @@ server/session lifetime and are rebuilt rather than persisted as markers.
 Zero or multiple matching panes fail without a host-only or title fallback.
 
 If a live attached client's ancestry or sockets cannot be inspected, an exact
-explicit host/session binding remains available through `remote bind`. Complete
-live evidence that contradicts a binding takes priority. Address translation,
+explicit host/session binding remains available through `remote bind`, including
+when other known clients have no matching local transport. The user maintains
+that binding after session switches. When every attached client is inspectable,
+no local match rejects old bindings. Address translation,
 SSH proxy or multiplex arrangements that hide the matching endpoint, and tmux
 clients nested beneath another tmux server may prevent automatic discovery.
-Translated endpoints cannot be overridden with stale unscoped bindings.
+With complete inspection, translated endpoints cannot be overridden with stale
+unscoped bindings.
 Install `lsof` on both machines for socket discovery.
 
 Ordinary remote terminals retain their existing SSH endpoint or unique unmarked

@@ -154,10 +154,12 @@ switching sessions when automatic inspection is unavailable.
 
 Automatic association may be unavailable for translated server addresses,
 SSH proxy or multiplex setups that obscure the connection, or remote tmux
-clients running inside another tmux server. A known endpoint with no local
-match fails closed, including when old markers exist; explicit binding cannot
-override contradictory live evidence. Restore direct endpoint visibility for
-these cases.
+clients running inside another tmux server. When every attached client's
+transport is inspectable, no local match fails closed even when old markers
+exist. Restore direct endpoint visibility for these cases. If some attached
+clients cannot be inspected, an exact explicit binding can identify an
+uninspectable client even when other known clients have no local match. You
+must update that binding after switching sessions.
 
 Ordinary remote terminals retain their existing SSH connection matching and
 unique unmarked Mosh destination/title matching. Older compatibility records
