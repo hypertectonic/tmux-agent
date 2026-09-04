@@ -4,7 +4,7 @@ use crate::model::{
     AgentOrigin, AgentRecord, AgentState, Attention, GoalInfo, GoalState, Snapshot, terminal_safe,
     trim_braille_activity_prefix,
 };
-use crate::tmux::{FocusOutcome, Tmux, is_focus_target_missing};
+use crate::tmux::{FocusOutcome, TRANSPORT_ONLY_FOCUS_MESSAGE, Tmux, is_focus_target_missing};
 use anyhow::{Context, Result};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
@@ -1059,7 +1059,7 @@ async fn activate_record(
                 }
                 message.set_transient(
                     format!(
-                        "focused remote transport only; inner session unchanged ({})",
+                        "{TRANSPORT_ONLY_FOCUS_MESSAGE} ({})",
                         focus_record.location()
                     ),
                     Instant::now(),
@@ -3785,18 +3785,28 @@ mod tests {
     }
 
     #[test]
-    fn popup_transport_only_activation_stays_open_to_report_degraded_focus() {
+    fn transport_only_activation_reports_partial_focus_in_persistent_and_popup_ui() {
         const CHILD_ENV: &str = "TMUX_AGENT_TRANSPORT_ONLY_UI_TEST_CHILD";
         if std::env::var_os(CHILD_ENV).is_some() {
             let runtime = tokio::runtime::Runtime::new().unwrap();
-            runtime.block_on(popup_transport_only_activation_child());
+            runtime.block_on(async {
+                for popup in [false, true] {
+                    for (session, precomputed) in [
+                        ("other-session", false),
+                        ("selected-session", false),
+                        ("selected-session", true),
+                    ] {
+                        transport_only_activation_child(popup, session, precomputed).await;
+                    }
+                }
+            });
             return;
         }
 
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "ui::tests::popup_transport_only_activation_stays_open_to_report_degraded_focus",
+                "ui::tests::transport_only_activation_reports_partial_focus_in_persistent_and_popup_ui",
                 "--nocapture",
             ])
             .env(CHILD_ENV, "1")
@@ -3808,7 +3818,7 @@ mod tests {
         assert!(status.success());
     }
 
-    async fn popup_transport_only_activation_child() {
+    async fn transport_only_activation_child(popup: bool, session: &str, precomputed: bool) {
         let directory = tempfile::tempdir().unwrap();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3861,7 +3871,7 @@ mod tests {
         let pane_id = String::from_utf8(pane.stdout).unwrap().trim().to_string();
         for (option, value) in [
             ("@tmux_agent_remote_host", "remote-mac"),
-            ("@tmux_agent_remote_session", "other-session"),
+            ("@tmux_agent_remote_session", session),
         ] {
             let marked = Command::new("tmux")
                 .args([
@@ -3884,6 +3894,23 @@ mod tests {
         remote.remote_alias = Some("remote-mac".into());
         remote.session_name = "selected-session".into();
         remote.title = "selected-project".into();
+        remote.window_id = "@99999".into();
+        remote.pane_id = "%99999".into();
+        remote.goal = Some(GoalInfo {
+            state: GoalState::Achieved,
+            elapsed_seconds: 10,
+            achievement_pending: true,
+            achievement_observed_at_ms: 123_000,
+        });
+        if precomputed {
+            remote.focus_target = Some(crate::model::TmuxTarget {
+                session_name: "local".into(),
+                window_id: "@0".into(),
+                window_index: 0,
+                pane_id,
+                pane_index: 0,
+            });
+        }
         let expected_id = remote.id.clone();
         let mut acknowledged_snapshot = Snapshot {
             agents: vec![remote.clone()],
@@ -3891,6 +3918,11 @@ mod tests {
         };
         acknowledged_snapshot.agents[0].attention = Attention::Idle;
         acknowledged_snapshot.agents[0].seen = true;
+        acknowledged_snapshot.agents[0]
+            .goal
+            .as_mut()
+            .unwrap()
+            .achievement_pending = false;
         let server = tokio::spawn(async move {
             let mut marked = None;
             let mut acknowledged = None;
@@ -3936,7 +3968,7 @@ mod tests {
             tmux: &tmux,
             config: &config,
             config_path: Path::new("/tmp/tmux-agent-config.toml"),
-            exit_after_focus: true,
+            exit_after_focus: popup,
         };
         let mut message = UiMessage::default();
 
@@ -3958,9 +3990,18 @@ mod tests {
         );
         assert_eq!(acknowledged.as_deref(), Some(expected_id.as_str()));
         assert!(message.text().contains("focused remote transport only"));
-        assert!(message.text().contains("inner session unchanged"));
+        assert!(
+            message
+                .text()
+                .contains("inner target not selected or verified")
+        );
         assert_eq!(snapshot.agents[0].attention, Attention::Idle);
         assert!(snapshot.agents[0].seen);
+        assert!(!snapshot.agents[0].goal.unwrap().achievement_pending);
+        assert_eq!(
+            apply_activation_outcome(activation, &mut AgentListState::default(), &snapshot.agents),
+            None
+        );
     }
 
     #[test]

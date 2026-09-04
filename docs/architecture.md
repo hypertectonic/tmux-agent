@@ -263,8 +263,8 @@ explicit fallback for remote tmux:
 ```
 
 `tmux-agent remote bind` and `remote unbind` manage these pane-local markers.
-This gives nested tmux over mosh an exact local focus target without screen or
-unmarked title inference. An exact host and session binding is always used
+This identifies the local transport pane for nested tmux over mosh without
+screen or unmarked title inference. A matching host and session binding is used
 first. If a remote tmux session is recreated under a new name, focus can update
 the session marker when exactly one live, non-UI pane is already marked for
 that host and its normalized title matches the selected agent.
@@ -287,7 +287,16 @@ selected agent title, then writes the binding and selects the pane. Zero or
 multiple shell matches, named remote servers, and an unverified attach all fail
 closed. The daemon protocol and persisted state do not carry the binding.
 
-After those precise remote tmux paths fail, activation can degrade to the outer
+Precomputed remote tmux targets and existing, repaired, or adopted bindings
+return `TransportOnly` after selecting the outer pane. They do not select or
+verify the inner window and pane. Verified detached recovery returns `Exact`,
+as do local tmux focus and ordinary remote terminal focus. The UI acknowledges
+pending completions and goal achievements after either outcome, but records
+usage and closes a popup only for `Exact`. `TransportOnly` displays a notice
+in persistent and popup UIs. The CLI prints the same notice to stderr while
+retaining a successful exit status.
+
+After those remote tmux paths fail, activation can fall back to the outer
 transport. Exactly one live, non-UI local pane must have complete markers for
 the selected host. Its session marker may name a different remote tmux session.
 Focus selects only that local pane and window, leaves both markers unchanged,

@@ -20,7 +20,7 @@ use model::{Snapshot, terminal_safe};
 use scanner::Scanner;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use tmux::Tmux;
+use tmux::{FocusOutcome, TRANSPORT_ONLY_FOCUS_MESSAGE, Tmux};
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -60,6 +60,10 @@ enum Command {
         popup: bool,
     },
     /// Focus an agent by full ID or an unambiguous ID suffix.
+    ///
+    /// Remote tmux focus may select only the outer transport. This prints a
+    /// notice to stderr and still exits successfully; the inner target is not
+    /// selected or verified.
     Focus { target: String },
     /// Explain the current evidence and state for an agent.
     Explain { target: String },
@@ -292,7 +296,10 @@ async fn main() -> Result<()> {
             daemon::ensure_running(&config_path, &paths).await?;
             let snapshot = ipc::snapshot(&paths.socket, false).await?;
             let record = resolve(&snapshot, &target)?;
-            tmux.focus_agent(record).map(|_| ())
+            if tmux.focus_agent(record)? == FocusOutcome::TransportOnly {
+                eprintln!("{TRANSPORT_ONLY_FOCUS_MESSAGE} ({})", record.location());
+            }
+            Ok(())
         }
         Command::Explain { target } => {
             daemon::ensure_running(&config_path, &paths).await?;
