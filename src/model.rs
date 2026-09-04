@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const LAUNCHER_PROTOCOL_VERSION: u32 = 1;
 pub const APPLICATION_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CAPABILITY_SUBAGENT_VIEW: &str = "codex_subagent_view_v1";
@@ -119,6 +119,29 @@ pub struct SshConnection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoshEndpoint {
+    pub address: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "transport", rename_all = "snake_case")]
+pub enum ClientConnection {
+    Ssh { connection: SshConnection },
+    Mosh { endpoint: MoshEndpoint },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionConnections {
+    pub server_pid: u32,
+    pub server_started_at: u64,
+    pub session_created_at: u64,
+    /// False when an attached client's transport cannot be inspected.
+    pub complete: bool,
+    pub clients: Vec<ClientConnection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TmuxTarget {
     pub session_name: String,
     pub window_id: String,
@@ -130,6 +153,8 @@ pub struct TmuxTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshTransport {
     pub connection: Option<SshConnection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mosh_endpoint: Option<MoshEndpoint>,
     pub remote_host: String,
     #[serde(default)]
     pub remote_host_explicit: bool,
@@ -194,6 +219,8 @@ pub struct AgentRecord {
     pub remote_alias: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_connection: Option<SshConnection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_connections: Option<SessionConnections>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus_target: Option<TmuxTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -493,6 +520,7 @@ mod tests {
             terminal: None,
             remote_alias: None,
             ssh_connection: None,
+            session_connections: None,
             focus_target: None,
             goal: None,
             subagent: None,
@@ -677,6 +705,7 @@ mod tests {
     fn local_transport_metadata_is_not_serialized_in_snapshots() {
         let snapshot = Snapshot {
             ssh_transports: vec![SshTransport {
+                mosh_endpoint: None,
                 connection: None,
                 remote_host: "remote-mac".into(),
                 remote_host_explicit: true,

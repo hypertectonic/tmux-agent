@@ -134,7 +134,7 @@ TMUX_AGENT_ROOT="$root" \
     "$binary" --config "$test_root/config/missing.toml" doctor --json \
     >"$test_root/doctor.json"
 grep -F "\"application_version\": \"$version\"" "$test_root/doctor.json" >/dev/null
-grep -F '"protocol": 3' "$test_root/doctor.json" >/dev/null
+grep -F '"protocol": 4' "$test_root/doctor.json" >/dev/null
 
 cat >"$test_root/config/no-server.toml" <<EOF
 tmux_args = ["-L", "tmux-agent-no-server-$$"]
@@ -150,13 +150,13 @@ run_isolated() {
 
 run_isolated scan --json \
     >"$test_root/no-server-scan.json"
-grep -F '"protocol": 3' "$test_root/no-server-scan.json" >/dev/null
+grep -F '"protocol": 4' "$test_root/no-server-scan.json" >/dev/null
 run_isolated paths >"$test_root/paths.txt"
 grep -F 'socket ' "$test_root/paths.txt" >/dev/null
 run_isolated daemon start >"$test_root/start.txt"
-grep -F "running: version $version, protocol 3" "$test_root/start.txt" >/dev/null
+grep -F "running: version $version, protocol 4" "$test_root/start.txt" >/dev/null
 run_isolated daemon status >"$test_root/status.txt"
-grep -F "running: version $version, protocol 3" "$test_root/status.txt" >/dev/null
+grep -F "running: version $version, protocol 4" "$test_root/status.txt" >/dev/null
 run_isolated daemon restart >"$test_root/restart.txt"
 grep -F "restarted: version $version" "$test_root/restart.txt" >/dev/null
 run_isolated list --json --local-only >"$test_root/list.json"

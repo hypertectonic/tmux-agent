@@ -873,6 +873,22 @@ fn resolve_transport<'a>(
     transports: &'a [SshTransport],
     title_counts: &HashMap<(String, String), usize>,
 ) -> TransportResolution<'a> {
+    if agent.is_tmux()
+        && let Some(session) = &agent.session_connections
+    {
+        let matches = crate::tmux::session_transports(agent, transports);
+        match matches.as_slice() {
+            [transport] => {
+                return TransportResolution::One {
+                    transport,
+                    exact_connection: true,
+                };
+            }
+            [] if !session.complete => {}
+            [] => return TransportResolution::None,
+            _ => return TransportResolution::Ambiguous,
+        }
+    }
     match exact_transport(agent, transports) {
         UniqueTransport::One(transport) => {
             return TransportResolution::One {
@@ -1242,6 +1258,7 @@ mod tests {
             terminal: None,
             remote_alias: None,
             ssh_connection: None,
+            session_connections: None,
             focus_target: None,
             goal: None,
             subagent: None,
@@ -1257,6 +1274,7 @@ mod tests {
     ) -> SshTransport {
         SshTransport {
             connection,
+            mosh_endpoint: None,
             remote_host: "remote-mac".into(),
             remote_host_explicit: false,
             remote_session: None,
@@ -2221,6 +2239,71 @@ mod tests {
             panic!("expected one exact transport");
         };
         assert_eq!(resolved.target, target);
+    }
+
+    #[test]
+    fn live_session_associations_share_focus_and_metadata_without_showing_hidden_agents() {
+        use crate::model::{ClientConnection, MoshEndpoint, SessionConnections};
+        let connection = SshConnection {
+            client_address: "192.0.2.1".into(),
+            client_port: 40000,
+            server_address: "192.0.2.2".into(),
+            server_port: 22,
+        };
+        let endpoint = MoshEndpoint {
+            address: "192.0.2.2".into(),
+            port: 60001,
+        };
+        let mut ssh = transport(
+            "ssh",
+            Some(connection.clone()),
+            "active shell",
+            Some("ssh label"),
+        );
+        ssh.visible = true;
+        let mut mosh = transport("mosh", None, "active editor", Some("mosh label"));
+        mosh.mosh_endpoint = Some(endpoint.clone());
+        mosh.visible = true;
+        // Deliberately stale markers must not redirect either session.
+        mosh.remote_host_explicit = true;
+        mosh.remote_session = Some("ssh-session".into());
+        let transports = [ssh, mosh];
+        for (client, expected) in [
+            (ClientConnection::Ssh { connection }, 0),
+            (ClientConnection::Mosh { endpoint }, 1),
+        ] {
+            let mut record = agent(
+                "remote/remote-mac/hidden",
+                AgentState::Idle,
+                Attention::Done,
+            );
+            record.remote_alias = Some("remote-mac".into());
+            record.visible = false;
+            record.seen = false;
+            record.session_name = "ssh-session".into();
+            record.session_connections = Some(SessionConnections {
+                server_pid: 42,
+                server_started_at: 10,
+                session_created_at: 11,
+                complete: true,
+                clients: vec![client],
+            });
+            let mut records = vec![record.clone()];
+            reconcile_transports(&mut records, &transports);
+            assert_eq!(
+                records[0].focus_target,
+                Some(transports[expected].target.clone())
+            );
+            assert_eq!(records[0].label, transports[expected].label);
+            assert!(!records[0].visible);
+            assert!(!records[0].seen);
+            assert_eq!(records[0].attention, Attention::Done);
+            record.session_connections.as_mut().unwrap().clients.clear();
+            let mut records = vec![record];
+            reconcile_transports(&mut records, &transports);
+            assert!(records[0].focus_target.is_none());
+            assert!(records[0].label.is_none());
+        }
     }
 
     #[test]

@@ -580,6 +580,7 @@ mod tests {
                 terminal: Some("ttys001".into()),
                 remote_alias: None,
                 ssh_connection: None,
+                session_connections: None,
                 focus_target: None,
                 goal: None,
                 subagent: Some(subagent.clone()),
