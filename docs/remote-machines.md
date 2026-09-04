@@ -148,6 +148,16 @@ then writes the markers and focuses it. Another binding on the host does not
 block a unique alias and working-directory match. Named tmux servers and zero
 or multiple shell matches fail closed.
 
+If no precise remote tmux path succeeds, tmux-agent can still focus the outer
+transport when exactly one live, non-UI local pane has both markers and its host
+marker names the selected remote. The session marker may name another nested
+tmux session. This degraded focus does not switch the remote session, window,
+or pane, and it does not change either marker. The UI reports that only the
+transport moved. Multiple same-host bindings are ambiguous; dead panes, UI
+panes, and partial marker pairs are ignored. This host-only fallback is used
+only for intentional activation. It does not affect daemon-derived labels,
+visibility, attention, or state.
+
 Other nested remote tmux connections, including SSH connections that cannot be
 matched to the remote agent process or mosh panes without the nested title
 shape, need an initial explicit local-pane binding. Run this on the local
@@ -174,7 +184,9 @@ agent repairs the session marker only when that host has one live, non-UI bound
 pane with a matching normalized title. Reusing a pane for another configured
 mosh destination can repair both markers when the live destination and nested
 title identify one unique pane. Zero or multiple matches leave the binding
-unchanged and report the normal focus error.
+unchanged. If precise recovery finds no match, the host-only fallback above may
+focus one outer transport without changing its binding. Several eligible panes
+remain an error.
 
 A local transport pane can also provide the label shown beside its remote
 agent:
