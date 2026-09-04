@@ -82,7 +82,7 @@ current_ready() {
 
 daemon_ready() {
     "$agent" daemon status 2>/dev/null |
-        grep -F "running: version $version, protocol 3" >/dev/null
+        grep -F "running: version $version, protocol 4" >/dev/null
 }
 
 client_ready() {
@@ -152,7 +152,7 @@ verify_runtime() {
     wait_for 'tmux-agent daemon' daemon_ready
     "$agent" doctor --json >"$doctor_json"
     grep -F "\"application_version\": \"$version\"" "$doctor_json" >/dev/null
-    grep -F '"protocol": 3' "$doctor_json" >/dev/null
+    grep -F '"protocol": 4' "$doctor_json" >/dev/null
     grep -F "$expected_target" "$doctor_json" >/dev/null
     "$agent" list --json --local-only >"$list_json"
     grep -F "\"application_version\": \"$version\"" "$list_json" >/dev/null

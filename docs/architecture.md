@@ -100,7 +100,7 @@ JSON object per line:
 - `mark_used` records a successful top-level focus for local idle ordering
 - `shutdown` stops the daemon cleanly
 
-The current federation protocol version is `3`. Live federation requires equal
+The current federation protocol version is `4`. Live federation requires equal
 protocol versions on all machines. `mark_used` is local IPC metadata: its
 timestamps are neither serialized nor included in `--local-only` federation
 snapshots, so it does not change the federation protocol.
@@ -248,65 +248,50 @@ lines.
 
 ## Focus
 
-Local records focus their stored tmux session, window, and pane. Remote focus
-matches the two endpoints of an established SSH connection to a local tmux
-pane. For an ordinary remote terminal over mosh, focus can instead resolve one
-live, unmarked, non-UI pane whose local `mosh-client` process title names the
-configured remote and whose normalized pane title matches the selected record.
-The resolver rejects zero or multiple candidates, does not persist process
-arguments, and does not write a binding. Public mirror markers provide an
-explicit fallback for remote tmux:
+Local records focus their stored tmux session, window, and pane. Remote tmux
+records carry the current attached clients for their owning server and session.
+The scanner reads tmux server PID/start time, session ID/creation time, and live
+client PIDs each scan. It joins client ancestry against the cached process
+inventory. SSH clients use the established TCP endpoints of their sshd ancestor;
+Mosh clients use the bound UDP endpoint of their mosh-server ancestor.
 
-```text
-@tmux_agent_remote_host
-@tmux_agent_remote_session
-```
+The local resolver matches those endpoints against live, non-UI transport panes.
+Mosh's numeric client endpoint stays available after bootstrap SSH exits and
+while its client address roams. No selected agent title, active provider,
+inherited agent SSH environment, or persisted binding participates in this
+association. A shell or editor in the active remote window therefore does not
+hide the transport carrying agents in other windows. Named servers work when
+the remote collector targets that server.
 
-`tmux-agent remote bind` and `remote unbind` manage these pane-local markers.
-This identifies the local transport pane for nested tmux over mosh without
-screen or unmarked title inference. A matching host and session binding is used
-first. If a remote tmux session is recreated under a new name, focus can update
-the session marker when exactly one live, non-UI pane is already marked for
-that host and its normalized title matches the selected agent.
+Focus and daemon reconciliation use the same unique association. Focus
+rechecks local panes instead of trusting a precomputed target. Daemon labels
+and visibility use that association too; visibility still requires both the
+remote agent pane and local transport pane to be visible. Outer focus returns
+`TransportOnly`, acknowledges an activated completion or goal achievement,
+keeps popups open, and does not record last-used ordering. It never changes the
+inner remote window or pane.
 
-Without an exact or repairable binding, focus can adopt one live, non-UI mosh
-pane whose client destination matches the configured remote and whose title
-uses the established nested tmux shape, `[mosh] · ...`, for the selected agent.
-The pane may be unmarked or carry a complete stale binding for a different
-host; the live client destination must prove the selected remote before both
-markers are replaced. An ordinary `[mosh] title` pane is not adopted as tmux. A
-binding for another session on the same host does not disqualify a unique
-candidate. Zero or multiple candidates leave all markers unchanged.
+Session switches update the attachment on the next scan. Detach removes it;
+reconnect discovers the new client and endpoint. Process/socket changes can
+take up to the one-second inventory refresh. Associations belong to the live
+server/session lifetime and are rebuilt rather than persisted as markers.
+Zero or multiple matching panes fail without a host-only or title fallback.
 
-If the selected default-server session is detached, focus can instead recover
-through one unmarked mosh shell whose client destination and shell
-working-directory title both match the remote record, including when another
-session on that host is already bound. Focus selects the exact remote window
-and pane, attaches the remote tmux client, waits for the local pane to adopt the
-selected agent title, then writes the binding and selects the pane. Zero or
-multiple shell matches, named remote servers, and an unverified attach all fail
-closed. The daemon protocol and persisted state do not carry the binding.
+If a live attached client's ancestry or sockets cannot be inspected, an exact
+explicit host/session binding remains available through `remote bind`, including
+when other known clients have no matching local transport. The user maintains
+that binding after session switches. When every attached client is inspectable,
+no local match rejects old bindings. Address translation,
+SSH proxy or multiplex arrangements that hide the matching endpoint, and tmux
+clients nested beneath another tmux server may prevent automatic discovery.
+With complete inspection, translated endpoints cannot be overridden with stale
+unscoped bindings.
+Install `lsof` on both machines for socket discovery.
 
-Precomputed remote tmux targets and existing, repaired, or adopted bindings
-return `TransportOnly` after selecting the outer pane. They do not select or
-verify the inner window and pane. Verified detached recovery returns `Exact`,
-as do local tmux focus and ordinary remote terminal focus. The UI acknowledges
-pending completions and goal achievements after either outcome, but records
-usage and closes a popup only for `Exact`. `TransportOnly` displays a notice
-in persistent and popup UIs. The CLI prints the same notice to stderr while
-retaining a successful exit status.
-
-After those remote tmux paths fail, activation can fall back to the outer
-transport. Exactly one live, non-UI local pane must have complete markers for
-the selected host. Its session marker may name a different remote tmux session.
-Focus selects only that local pane and window, leaves both markers unchanged,
-and does not send an inner tmux command. Multiple same-host bindings are
-ambiguous. Dead panes, UI panes, and partial marker pairs do not qualify.
-
-This host-only rule belongs only to intentional focus. Daemon reconciliation
-continues to require its existing exact connection, exact host/session, or
-unmarked terminal title evidence for local labels, visibility, attention, and
-focus targets.
+Ordinary remote terminals retain their existing SSH endpoint or unique unmarked
+Mosh destination/title matching. Compatibility records without attachment
+metadata retain the older explicit-binding and title-based recovery paths.
+Federation protocol 4 rejects older peers before those records are merged.
 
 ## Security boundaries
 

@@ -180,6 +180,7 @@ impl Scanner {
             Err(error) => return Err(error),
         };
         let processes = self.tmux.process_snapshot(&panes)?;
+        let session_connections = self.tmux.session_connections(&processes)?;
         let runner_states = runner::load_states(&self.runner_directory, &processes.live_pids);
         let capture_candidates = panes
             .iter()
@@ -337,6 +338,7 @@ impl Scanner {
                 terminal: None,
                 remote_alias: None,
                 ssh_connection: None,
+                session_connections: None,
                 focus_target: None,
                 goal,
                 subagent: None,
@@ -443,6 +445,7 @@ impl Scanner {
                 terminal: Some(terminal.name),
                 remote_alias: None,
                 ssh_connection,
+                session_connections: None,
                 focus_target: None,
                 goal,
                 subagent: None,
@@ -529,6 +532,7 @@ impl Scanner {
                         .get(&wrapped.owner_pid)
                         .or_else(|| processes.ssh_connections.get(&wrapped.child_pid))
                         .cloned(),
+                    session_connections: None,
                     focus_target: None,
                     goal,
                     subagent: None,
@@ -582,6 +586,22 @@ impl Scanner {
                 recovered_root_threads: &recovered_root_threads,
             });
         retain_finished_subagents(&mut next, &self.previous, now);
+        for record in next.values_mut().filter(|record| record.is_tmux()) {
+            // Retained children may outlive their session. Absence is authoritative
+            // and must not reopen legacy marker recovery for a reused session name.
+            record.session_connections = Some(
+                session_connections
+                    .get(&record.session_id)
+                    .cloned()
+                    .unwrap_or(crate::model::SessionConnections {
+                        server_pid: 0,
+                        server_started_at: 0,
+                        session_created_at: 0,
+                        complete: true,
+                        clients: Vec::new(),
+                    }),
+            );
+        }
         self.previous = next;
         self.record_starts
             .retain(|record_id, _| self.previous.contains_key(record_id));
@@ -1317,6 +1337,7 @@ mod tests {
             terminal: None,
             remote_alias: None,
             ssh_connection: None,
+            session_connections: None,
             focus_target: None,
             goal: None,
             subagent: None,
@@ -1374,6 +1395,7 @@ mod tests {
             live_pids: [20, 30, 31].into_iter().collect(),
             parent_pids: HashMap::new(),
             ssh_connections: HashMap::new(),
+            client_connections: HashMap::new(),
             ssh_transports: Vec::new(),
         }
     }
