@@ -105,6 +105,9 @@ pub enum FocusOutcome {
     TransportOnly,
 }
 
+pub const TRANSPORT_ONLY_FOCUS_MESSAGE: &str =
+    "focused remote transport only; inner target not selected or verified";
+
 #[derive(Debug, Clone)]
 struct Process {
     uid: u32,
@@ -580,12 +583,16 @@ impl Tmux {
         if let Some(alias) = &record.remote_alias {
             if let Some(target) = &record.focus_target {
                 self.focus_location(&target.session_name, &target.window_id, &target.pane_id)?;
-                return Ok(FocusOutcome::Exact);
+                return Ok(if record.is_tmux() {
+                    FocusOutcome::TransportOnly
+                } else {
+                    FocusOutcome::Exact
+                });
             }
             if record.is_tmux() {
-                if let Some(mirror) = self.find_or_repair_mirror(alias, record)? {
+                if let Some((mirror, outcome)) = self.find_or_repair_mirror(alias, record)? {
                     self.focus_location(&mirror.session_name, &mirror.window_id, &mirror.pane_id)?;
-                    return Ok(FocusOutcome::Exact);
+                    return Ok(outcome);
                 }
                 if let Some(transport) = self.find_bound_host_transport(alias)? {
                     self.focus_location(
@@ -620,10 +627,10 @@ impl Tmux {
         &self,
         remote_alias: &str,
         record: &AgentRecord,
-    ) -> Result<Option<Pane>> {
+    ) -> Result<Option<(Pane, FocusOutcome)>> {
         let panes = self.list_panes()?;
         if let Some(pane) = find_mirror_pane(&panes, remote_alias, &record.session_name)? {
-            return Ok(Some(pane.clone()));
+            return Ok(Some((pane.clone(), FocusOutcome::TransportOnly)));
         }
         let Some(pane) =
             find_stale_mirror_pane(&panes, remote_alias, &record.session_name, &record.title)
@@ -632,13 +639,16 @@ impl Tmux {
             if let Some(pane) =
                 find_running_mosh_mirror(&panes, &processes.panes, remote_alias, &record.title)?
             {
-                return Ok(Some(self.mark_remote_mirror(
-                    pane,
-                    remote_alias,
-                    &record.session_name,
-                )?));
+                return Ok(Some((
+                    self.mark_remote_mirror(pane, remote_alias, &record.session_name)?,
+                    FocusOutcome::TransportOnly,
+                )));
             }
-            return self.recover_detached_mirror(&panes, &processes.panes, remote_alias, record);
+            // Detached recovery selects the remote target and verifies attachment.
+            // Finding or repairing an existing binding only locates its transport.
+            return Ok(self
+                .recover_detached_mirror(&panes, &processes.panes, remote_alias, record)?
+                .map(|pane| (pane, FocusOutcome::Exact)));
         };
         self.status(&[
             "set-option",
@@ -650,7 +660,7 @@ impl Tmux {
         ])?;
         let mut repaired = pane.clone();
         repaired.mirror_session = Some(record.session_name.clone());
-        Ok(Some(repaired))
+        Ok(Some((repaired, FocusOutcome::TransportOnly)))
     }
 
     fn recover_detached_mirror(
@@ -2265,7 +2275,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_tmux_focus_uses_one_same_host_binding_without_changing_its_session() {
+    fn focus_distinguishes_remote_transport_from_exact_targets() {
         const SOCKET_ENV: &str = "TMUX_AGENT_TRANSPORT_ONLY_FOCUS_TEST_SOCKET";
         if let Some(socket_name) = std::env::var_os(SOCKET_ENV) {
             let socket_name = socket_name.to_string_lossy().into_owned();
@@ -2326,6 +2336,128 @@ mod tests {
                 "other-session"
             );
 
+            // A matching session binding does not prove its background target.
+            new_test_tmux_pane(&socket_name, "other-session", None);
+            let background = test_tmux_value(
+                &socket_name,
+                &[
+                    "new-window",
+                    "-d",
+                    "-t",
+                    "other-session",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "sleep 30",
+                ],
+            );
+            let mut remote = remote_tmux_record("other-session", "background-project");
+            remote.window_id = test_tmux_value(
+                &socket_name,
+                &["display-message", "-p", "-t", &background, "#{window_id}"],
+            );
+            remote.pane_id = background.clone();
+            test_tmux_output(&socket_name, &["select-window", "-t", "local:0"]);
+            assert_eq!(
+                tmux.focus_agent(&remote).unwrap(),
+                FocusOutcome::TransportOnly
+            );
+            assert_eq!(
+                test_tmux_value(
+                    &socket_name,
+                    &[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &transport,
+                        "#{window_active}:#{pane_active}"
+                    ]
+                ),
+                "1:1"
+            );
+            assert_eq!(
+                test_tmux_value(
+                    &socket_name,
+                    &[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &background,
+                        "#{window_active}"
+                    ]
+                ),
+                "0",
+                "the inner background window must remain unchanged"
+            );
+
+            remote.window_id = "@99999".into();
+            remote.pane_id = "%99999".into();
+            assert_eq!(
+                tmux.focus_agent(&remote).unwrap(),
+                FocusOutcome::TransportOnly
+            );
+
+            let window_id = test_tmux_value(
+                &socket_name,
+                &["display-message", "-p", "-t", &transport, "#{window_id}"],
+            );
+            remote.focus_target = Some(crate::model::TmuxTarget {
+                session_name: "local".into(),
+                window_id: window_id.clone(),
+                window_index: 1,
+                pane_id: transport.clone(),
+                pane_index: 0,
+            });
+            test_tmux_output(&socket_name, &["select-window", "-t", "local:0"]);
+            assert_eq!(
+                tmux.focus_agent(&remote).unwrap(),
+                FocusOutcome::TransportOnly
+            );
+            assert_eq!(
+                test_tmux_value(
+                    &socket_name,
+                    &[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &transport,
+                        "#{window_active}:#{pane_active}"
+                    ]
+                ),
+                "1:1"
+            );
+
+            let mut terminal = remote_terminal_record("ordinary-terminal");
+            terminal.focus_target = remote.focus_target.clone();
+            assert_eq!(tmux.focus_agent(&terminal).unwrap(), FocusOutcome::Exact);
+
+            let mut local = remote_tmux_record("local", "local-project");
+            local.remote_alias = None;
+            local.window_id = window_id;
+            local.pane_id = transport.clone();
+            test_tmux_output(&socket_name, &["select-window", "-t", "local:0"]);
+            assert_eq!(tmux.focus_agent(&local).unwrap(), FocusOutcome::Exact);
+            assert_eq!(
+                test_tmux_value(
+                    &socket_name,
+                    &[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &transport,
+                        "#{window_active}:#{pane_active}"
+                    ]
+                ),
+                "1:1"
+            );
+            local.origin = AgentOrigin::Terminal;
+            assert!(
+                tmux.focus_agent(&local)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ordinary terminal")
+            );
+
             let second = new_test_tmux_pane(&socket_name, "local", Some(&transport));
             mark_test_remote_pane(
                 &socket_name,
@@ -2358,7 +2490,7 @@ mod tests {
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "tmux::tests::remote_tmux_focus_uses_one_same_host_binding_without_changing_its_session",
+                "tmux::tests::focus_distinguishes_remote_transport_from_exact_targets",
                 "--nocapture",
             ])
             .env(SOCKET_ENV, &socket_name)
@@ -2396,8 +2528,11 @@ mod tests {
                 ..Config::default()
             };
             let tmux = Tmux::new(&config);
-            tmux.focus_agent(&remote_tmux_record("0", "recovered-project"))
-                .unwrap();
+            assert_eq!(
+                tmux.focus_agent(&remote_tmux_record("0", "recovered-project"))
+                    .unwrap(),
+                FocusOutcome::TransportOnly
+            );
             assert_eq!(
                 test_pane_option(&socket_name, &pane_id, REMOTE_SESSION_OPTION),
                 "0"
@@ -2427,7 +2562,7 @@ mod tests {
             assert_eq!(
                 tmux.focus_agent(&remote_tmux_record("fresh-exact", "exact-title"))
                     .unwrap(),
-                FocusOutcome::Exact
+                FocusOutcome::TransportOnly
             );
             assert_eq!(
                 test_tmux_value(
@@ -2657,7 +2792,7 @@ exit 1
                 ""
             );
 
-            tmux.focus_agent(&record).unwrap();
+            assert_eq!(tmux.focus_agent(&record).unwrap(), FocusOutcome::Exact);
 
             assert_eq!(
                 std::fs::read_to_string(&log_path).unwrap(),
@@ -2852,8 +2987,11 @@ exit 1
                 ""
             );
 
-            tmux.focus_agent(&remote_tmux_record("new-session", "renamed-project"))
-                .unwrap();
+            assert_eq!(
+                tmux.focus_agent(&remote_tmux_record("new-session", "renamed-project"))
+                    .unwrap(),
+                FocusOutcome::TransportOnly
+            );
             assert_eq!(
                 test_tmux_value(
                     &socket_name,
@@ -2876,11 +3014,14 @@ exit 1
                 "new-session"
             );
 
-            tmux.focus_agent(&remote_tmux_record(
-                "simulation - development",
-                "sample-robot-project",
-            ))
-            .unwrap();
+            assert_eq!(
+                tmux.focus_agent(&remote_tmux_record(
+                    "simulation - development",
+                    "sample-robot-project",
+                ))
+                .unwrap(),
+                FocusOutcome::TransportOnly
+            );
 
             assert_eq!(
                 test_tmux_value(

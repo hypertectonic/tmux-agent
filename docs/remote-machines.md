@@ -130,7 +130,7 @@ hidden local transport is shown as `done`. Opening that transport marks the
 completion seen. Ambiguous and unresolved transports keep the peer's reported
 visibility and attention state.
 
-An exact host and session binding takes priority. Without one, focus can adopt
+A matching host and session binding takes priority. Without one, focus can adopt
 exactly one live mosh pane that names the configured remote and is already
 displaying the selected agent with the nested tmux title shape `[mosh] · ...`.
 The pane may be unmarked or carry a complete stale binding for a different
@@ -148,7 +148,19 @@ then writes the markers and focuses it. Another binding on the host does not
 block a unique alias and working-directory match. Named tmux servers and zero
 or multiple shell matches fail closed.
 
-If no precise remote tmux path succeeds, tmux-agent can still focus the outer
+Selecting a precomputed SSH transport or an existing, repaired, or adopted
+mirror binding only selects the local outer pane. It does not select or verify
+the remote tmux window or pane, even when the session binding matches. The UI
+reports this partial focus and keeps a popup open. Activating a completion or
+pending goal achievement still acknowledges it, but partial focus does not
+record last-used ordering. Ordinary remote terminal focus keeps its exact-focus
+behavior, as does the verified detached-session recovery above.
+
+`tmux-agent focus <id-or-pane>` prints the same partial-focus notice to stderr
+and retains a successful exit status when it selects the outer pane. Exact
+focus remains silent. A failed focus returns a nonzero status.
+
+If no matching remote tmux path succeeds, tmux-agent can still focus the outer
 transport when exactly one live, non-UI local pane has both markers and its host
 marker names the selected remote. The session marker may name another nested
 tmux session. This degraded focus does not switch the remote session, window,
