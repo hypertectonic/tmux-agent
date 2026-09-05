@@ -1111,6 +1111,13 @@ mod tests {
     }
 
     fn check_client_replacement(outer: &Tmux, target_pane: &str) {
+        struct ReleaseHandshake(Tmux);
+        impl Drop for ReleaseHandshake {
+            fn drop(&mut self) {
+                let _ = self.0.run(&["wait-for", "-S", "focus-replacement-ready"]);
+            }
+        }
+
         let socket = outer.server_key().unwrap().unwrap();
         let command = || {
             let mut command = CommandBuilder::new("tmux");
@@ -1175,7 +1182,11 @@ mod tests {
         let replacement_command = command();
         let replacement_tmux = outer.clone();
         let replacement_task = std::thread::spawn(move || {
-            original.wait().unwrap();
+            // Release the blocked query even if either readiness check panics.
+            let _release = ReleaseHandshake(replacement_tmux.clone());
+            wait_until_ready("original client exit", || {
+                original.try_wait().unwrap().is_some()
+            });
             let replacement = pair.slave.spawn_command(replacement_command).unwrap();
             let pid = replacement.process_id().unwrap().to_string();
             wait_until_ready("same-PTY replacement attachment", || {
@@ -1185,9 +1196,6 @@ mod tests {
                     .trim()
                     == pid
             });
-            replacement_tmux
-                .run(&["wait-for", "-S", "focus-replacement-ready"])
-                .unwrap();
             replacement
         });
         let result = context.select(&target);
@@ -1205,7 +1213,9 @@ mod tests {
             ])
             .unwrap();
         replacement.kill().unwrap();
-        replacement.wait().unwrap();
+        wait_until_ready("replacement client exit", || {
+            replacement.try_wait().unwrap().is_some()
+        });
         drop(pair.master);
         assert!(result.is_err(), "replaced initiating client was accepted");
         assert_eq!(
