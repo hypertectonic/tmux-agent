@@ -91,14 +91,27 @@
     "preserve_previous": false
   },
   {
-    "name": "current footer shells override idle title and prompt",
-    "basis": "provider terminal observation",
+    "name": "completed prompt stays ready with background shells",
+    "basis": "foreground turn contract regression, issue 131",
     "title": "✳ task",
     "screen": "response\n────\n❯ \n────\n? shortcuts · 3 shells",
-    "state": "working",
+    "state": "idle",
     "source": "screen",
-    "signal": "background_shell_footer",
-    "scope": "current_footer",
+    "signal": "input_prompt",
+    "scope": "prompt_box",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "completed modern prompt with persistent shell is ready",
+    "basis": "sanitized provider terminal observation, issue 131",
+    "title": "✳ task",
+    "screen": "Done.\n✻ Worked for 46m · done · 1 shell still running\n────\n❯ editable unsent text\n────\nmodel · project · main · Context 23% left\n⏵⏵ auto mode on · 1 shell · ← 1 agent",
+    "state": "idle",
+    "source": "screen",
+    "signal": "input_prompt",
+    "scope": "prompt_box",
     "definitive": true,
     "inferred": false,
     "preserve_previous": false
