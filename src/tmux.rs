@@ -108,6 +108,190 @@ pub enum FocusOutcome {
     TransportOnly,
 }
 
+pub struct FocusPlan {
+    pub target: TmuxTarget,
+    pub outcome: FocusOutcome,
+    pub transport: Option<SshTransport>,
+}
+
+/// One activation's tmux server and invoking client, captured before selection.
+pub struct FocusContext {
+    pub tmux: Tmux,
+    server_identity: String,
+    client: FocusClient,
+}
+
+enum FocusClient {
+    OutsideTmux,
+    Attached(LocalClient),
+    Unavailable,
+}
+
+#[derive(PartialEq, Eq)]
+struct LocalClient {
+    name: String,
+    pid: u32,
+    created: u64,
+}
+
+impl LocalClient {
+    fn parse(fields: &[&str]) -> Option<Self> {
+        let [name, pid, created] = fields else {
+            return None;
+        };
+        if name.is_empty() {
+            return None;
+        }
+        Some(Self {
+            name: (*name).into(),
+            pid: pid.parse().ok()?,
+            created: created.parse().ok()?,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct FocusLocation {
+    session_id: String,
+    window_id: String,
+    pane_id: String,
+}
+
+impl FocusLocation {
+    fn parse(fields: &[&str]) -> Option<Self> {
+        let [session_id, window_id, pane_id] = fields else {
+            return None;
+        };
+        Some(Self {
+            session_id: (*session_id).into(),
+            window_id: (*window_id).into(),
+            pane_id: (*pane_id).into(),
+        })
+    }
+}
+
+impl FocusContext {
+    pub fn select(&self, target: &TmuxTarget) -> Result<FocusLocation> {
+        self.verify_server()?;
+        let pane = self
+            .tmux
+            .list_panes()?
+            .into_iter()
+            .find(|pane| {
+                pane.session_name == target.session_name
+                    && pane.window_id == target.window_id
+                    && pane.pane_id == target.pane_id
+                    && !pane.dead
+            })
+            .context("local focus target vanished or changed sessions")?;
+        let location = FocusLocation {
+            session_id: pane.session_id,
+            window_id: pane.window_id,
+            pane_id: pane.pane_id,
+        };
+        if matches!(self.client, FocusClient::Unavailable) {
+            bail!("no initiating tmux client is attached");
+        }
+        if let FocusClient::Attached(client) = &self.client {
+            self.current_client()?;
+            let server = format!("#{{==:#{{pid}} #{{start_time}},{}}}", self.server_identity);
+            let pid = format!("#{{==:#{{client_pid}},{}}}", client.pid);
+            let created = format!("#{{==:#{{client_created}},{}}}", client.created);
+            let shared_pane = "#{==:#{m:*active-pane*,#{client_flags}},0}";
+            let guard = format!("#{{&&:{server},#{{&&:{pid},#{{&&:{created},{shared_pane}}}}}}}");
+            let target = format!(
+                "{}:{}.{}",
+                location.session_id, location.window_id, location.pane_id
+            );
+            let selection = shell_join(&[
+                "switch-client".into(),
+                "-c".into(),
+                client.name.clone(),
+                "-t".into(),
+                target,
+            ]);
+            // if-shell -F inserts its branch synchronously, without a shell or
+            // event-loop yield before switch-client. The latter selects the
+            // full numeric target in one command on tmux 3.2 and newer.
+            let output = self.tmux.run(&[
+                "if-shell",
+                "-F",
+                &guard,
+                &format!("{selection} ; display-message -p tmux-agent-focus-selected"),
+                "display-message -p tmux-agent-focus-client-changed",
+            ])?;
+            if output.trim() != "tmux-agent-focus-selected" {
+                bail!(
+                    "initiating tmux client or server changed before selection; refresh and retry"
+                );
+            }
+        } else {
+            self.tmux.status(&[
+                "select-window",
+                "-t",
+                &format!("{}:{}", location.session_id, location.window_id),
+            ])?;
+            self.tmux
+                .status(&["select-pane", "-t", &location.pane_id])?;
+        }
+        self.verify(&location)?;
+        Ok(location)
+    }
+
+    pub fn verify(&self, target: &FocusLocation) -> Result<()> {
+        self.verify_server()?;
+        let selected = if !matches!(self.client, FocusClient::OutsideTmux) {
+            self.current_client()?
+        } else {
+            // CLI calls outside tmux select a session's active window and pane.
+            let value = self.tmux.run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{}:", target.session_id),
+                "#{session_id}\t#{window_id}\t#{pane_id}",
+            ])?;
+            FocusLocation::parse(&value.trim().split('\t').collect::<Vec<_>>())
+                .context("local tmux selection unavailable")?
+        };
+        if selected != *target {
+            bail!("initiating tmux client changed selection during focus; refresh and retry");
+        }
+        Ok(())
+    }
+
+    fn verify_server(&self) -> Result<()> {
+        if self
+            .tmux
+            .run(&["display-message", "-p", "#{pid} #{start_time}"])?
+            .trim()
+            != self.server_identity
+        {
+            bail!("local tmux server changed during focus; refresh and retry");
+        }
+        Ok(())
+    }
+
+    fn current_client(&self) -> Result<FocusLocation> {
+        let FocusClient::Attached(client) = &self.client else {
+            bail!("no initiating tmux client is attached");
+        };
+        let output = self.tmux.run(&["list-clients", "-F", "#{client_name}\t#{client_pid}\t#{client_created}\t#{session_id}\t#{window_id}\t#{pane_id}\t#{client_flags}"])?;
+        let (location, flags) = output
+            .lines()
+            .find_map(|line| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                if fields.len() != 7 || LocalClient::parse(&fields[..3]).as_ref() != Some(client) {
+                    return None;
+                }
+                Some((FocusLocation::parse(&fields[3..6])?, fields[6]))
+            })
+            .context("initiating tmux client detached or was replaced during focus")?;
+        validate_focus_client_flags(flags)?;
+        Ok(location)
+    }
+}
+
 pub const TRANSPORT_ONLY_FOCUS_MESSAGE: &str =
     "focused remote transport only; inner target not selected or verified";
 
@@ -737,7 +921,52 @@ impl Tmux {
             .unwrap_or_default()
     }
 
+    pub fn focus_context(&self) -> Result<FocusContext> {
+        let output = self.run_optional(&["display-message", "-p", "#{socket_path}"])?;
+        let socket = required_focus_socket(output.as_deref())?;
+        let mut tmux = self.clone();
+        tmux.args = vec!["-S".into(), socket.into()];
+        let server_identity = tmux
+            .run(&["display-message", "-p", "#{pid} #{start_time}"])?
+            .trim()
+            .to_string();
+        let client = if has_current_tmux_client(env::var_os("TMUX").as_deref()) {
+            // tmux chooses the current/most recently active client once here.
+            // Repeating that lookup after switch-client can select a spectator.
+            let value = tmux.run(&[
+                "display-message",
+                "-p",
+                "#{client_name}\t#{client_pid}\t#{client_created}",
+            ])?;
+            // Preserve missing-target acknowledgement when no client is attached.
+            // Selection still refuses this captured absence instead of guessing later.
+            LocalClient::parse(&value.trim().split('\t').collect::<Vec<_>>())
+                .map(FocusClient::Attached)
+                .unwrap_or(FocusClient::Unavailable)
+        } else {
+            FocusClient::OutsideTmux
+        };
+        Ok(FocusContext {
+            tmux,
+            server_identity,
+            client,
+        })
+    }
+
+    #[cfg(test)]
     pub fn focus_agent(&self, record: &AgentRecord) -> Result<FocusOutcome> {
+        let context = self.focus_context()?;
+        let plan = context.tmux.resolve_agent_focus(record)?;
+        context.select(&plan.target)?;
+        Ok(plan.outcome)
+    }
+
+    pub fn resolve_agent_focus(&self, record: &AgentRecord) -> Result<FocusPlan> {
+        let resolved = |target, outcome| FocusPlan {
+            target,
+            outcome,
+            transport: None,
+        };
         if let Some(alias) = &record.remote_alias {
             if record.is_tmux()
                 && let Some(connections) = &record.session_connections
@@ -771,33 +1000,34 @@ impl Tmux {
                         record.session_name
                     ),
                 };
-                self.focus_location(&target.session_name, &target.window_id, &target.pane_id)?;
-                return Ok(FocusOutcome::TransportOnly);
+                return Ok(FocusPlan {
+                    target,
+                    outcome: FocusOutcome::TransportOnly,
+                    transport: transports.first().map(|transport| (*transport).clone()),
+                });
             }
             if let Some(target) = &record.focus_target {
-                self.focus_location(&target.session_name, &target.window_id, &target.pane_id)?;
-                return Ok(if record.is_tmux() {
-                    FocusOutcome::TransportOnly
-                } else {
-                    FocusOutcome::Exact
-                });
+                return Ok(resolved(
+                    target.clone(),
+                    if record.is_tmux() {
+                        FocusOutcome::TransportOnly
+                    } else {
+                        FocusOutcome::Exact
+                    },
+                ));
             }
             if record.is_tmux() {
                 if let Some((mirror, outcome)) = self.find_or_repair_mirror(alias, record)? {
-                    self.focus_location(&mirror.session_name, &mirror.window_id, &mirror.pane_id)?;
-                    return Ok(outcome);
+                    return Ok(resolved(pane_target(&mirror), outcome));
                 }
                 if let Some(transport) = self.find_bound_host_transport(alias)? {
-                    self.focus_location(
-                        &transport.session_name,
-                        &transport.window_id,
-                        &transport.pane_id,
-                    )?;
-                    return Ok(FocusOutcome::TransportOnly);
+                    return Ok(resolved(
+                        pane_target(&transport),
+                        FocusOutcome::TransportOnly,
+                    ));
                 }
             } else if let Some(pane) = self.find_transport_pane(alias, &record.title)? {
-                self.focus_location(&pane.session_name, &pane.window_id, &pane.pane_id)?;
-                return Ok(FocusOutcome::Exact);
+                return Ok(resolved(pane_target(&pane), FocusOutcome::Exact));
             }
             return Err(FocusTargetMissing {
                 alias: alias.clone(),
@@ -813,8 +1043,16 @@ impl Tmux {
                 record.location()
             );
         }
-        self.focus_location(&record.session_name, &record.window_id, &record.pane_id)?;
-        Ok(FocusOutcome::Exact)
+        Ok(resolved(
+            TmuxTarget {
+                session_name: record.session_name.clone(),
+                window_id: record.window_id.clone(),
+                window_index: record.window_index,
+                pane_id: record.pane_id.clone(),
+                pane_index: record.pane_index,
+            },
+            FocusOutcome::Exact,
+        ))
     }
 
     fn find_or_repair_mirror(
@@ -1089,15 +1327,6 @@ impl Tmux {
         self.status(&["display-popup", "-E", "-w", "85%", "-h", "80%", command])
     }
 
-    pub fn focus_location(&self, session: &str, window: &str, pane: &str) -> Result<()> {
-        if has_current_tmux_client(std::env::var_os("TMUX").as_deref()) {
-            self.status(&["switch-client", "-t", session])?;
-        }
-        self.status(&["select-window", "-t", window])?;
-        self.status(&["select-pane", "-t", pane])?;
-        Ok(())
-    }
-
     pub(crate) fn run(&self, command_args: &[&str]) -> Result<String> {
         let mut command = Command::new("tmux");
         command.args(&self.args).args(command_args);
@@ -1129,6 +1358,34 @@ impl Tmux {
 
     fn status(&self, command_args: &[&str]) -> Result<()> {
         self.run(command_args).map(|_| ())
+    }
+}
+
+pub(crate) fn validate_focus_client_flags(flags: &str) -> Result<()> {
+    if flags.split(',').any(|flag| flag == "active-pane") {
+        // list-clients reports the window's active pane, not this mode's
+        // independent input pane. Do not claim that selection was verified.
+        bail!(
+            "focus cannot verify tmux active-pane clients; use shared-pane mode or focus manually"
+        );
+    }
+    Ok(())
+}
+
+fn required_focus_socket(output: Option<&str>) -> Result<&str> {
+    output
+        .map(str::trim)
+        .filter(|socket| !socket.is_empty())
+        .context("local tmux socket path is unavailable; cannot pin focus server")
+}
+
+fn pane_target(pane: &Pane) -> TmuxTarget {
+    TmuxTarget {
+        session_name: pane.session_name.clone(),
+        window_id: pane.window_id.clone(),
+        window_index: pane.window_index,
+        pane_id: pane.pane_id.clone(),
+        pane_index: pane.pane_index,
     }
 }
 
@@ -1211,13 +1468,7 @@ fn local_ssh_transport(
         title: normalize_transport_title(&pane.title),
         label: pane.label.clone(),
         visible: pane.visible,
-        target: TmuxTarget {
-            session_name: pane.session_name.clone(),
-            window_id: pane.window_id.clone(),
-            window_index: pane.window_index,
-            pane_id: pane.pane_id.clone(),
-            pane_index: pane.pane_index,
-        },
+        target: pane_target(pane),
     }
 }
 
@@ -2380,6 +2631,16 @@ mod tests {
     use crate::model::{AgentOrigin, AgentState, Attention, EvidenceSource};
     use tempfile::tempdir;
 
+    #[test]
+    fn focus_requires_a_reported_socket_path_without_a_runtime_key_fallback() {
+        for missing in [None, Some(""), Some(" \n")] {
+            assert!(required_focus_socket(missing).is_err());
+        }
+        assert_eq!(
+            required_focus_socket(Some("/tmp/tmux-test/default\n")).unwrap(),
+            "/tmp/tmux-test/default"
+        );
+    }
     #[test]
     fn mosh_endpoint_parsing_handles_linux_and_macos_socket_records() {
         let sockets = parse_lsof_udp_endpoints(b"p10\nf4\nn[2001:db8::1]:60001\np20\nn192.0.2.1:60002\np30\nf4\nn*:60003\np40\nn127.0.0.1:60004\nn127.0.0.1:60005\n");

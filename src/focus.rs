@@ -45,7 +45,32 @@ pub async fn activate(
     snapshot: &Snapshot,
     record: &AgentRecord,
 ) -> Result<FocusReport> {
-    let outcome = tmux.focus_agent(record)?;
+    activate_with_control(
+        tmux,
+        config,
+        snapshot,
+        record,
+        |machine, request| async move { send_control(&machine, &request).await },
+    )
+    .await
+}
+
+async fn activate_with_control<F, Fut>(
+    tmux: &Tmux,
+    config: &Config,
+    snapshot: &Snapshot,
+    record: &AgentRecord,
+    control: F,
+) -> Result<FocusReport>
+where
+    F: FnOnce(MachineConfig, FocusRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let context = tmux.focus_context()?;
+    let tmux = &context.tmux;
+    let plan = tmux.resolve_agent_focus(record)?;
+    let selected = context.select(&plan.target)?;
+    let outcome = plan.outcome;
     let partial = |reason: &str| FocusReport {
         outcome,
         notice: format!("{TRANSPORT_ONLY_FOCUS_MESSAGE}; {reason}"),
@@ -76,7 +101,7 @@ pub async fn activate(
     let Some(session) = &record.session_connections else {
         return Ok(partial("peer has no live session attachment identity"));
     };
-    let Some(transport) = tmux.live_focus_transport(record)? else {
+    let Some(transport) = plan.transport else {
         if session.complete {
             bail!("outer transport focused; live client association changed before inner focus");
         }
@@ -110,7 +135,7 @@ pub async fn activate(
     };
     let result = async {
         request.validate()?;
-        send_control(machine, &request).await?;
+        control(machine.clone(), request.clone()).await?;
         if !tmux.live_focus_transport(record)?.is_some_and(|current| {
             current.target == transport.target
                 && current.connection == transport.connection
@@ -118,8 +143,9 @@ pub async fn activate(
         }) {
             bail!("local transport changed during remote selection; refresh and retry");
         }
-        // Recheck and focus the same outer pane after the remote confirmation.
-        tmux.focus_agent(record)?;
+        // Confirm the original client still shows this target. Never switch
+        // again after SSH: the user may have navigated or detached meanwhile.
+        context.verify(&selected)?;
         Ok(FocusReport {
             outcome: FocusOutcome::Exact,
             notice: String::new(),
@@ -251,6 +277,25 @@ fn verify_target(tmux: &Tmux, request: &FocusRequest, selected: bool) -> Result<
         .get(&request.session_id)
         .context("remote tmux session vanished or configured server is unsupported")?;
     request.validate_session(session)?;
+    let clients = tmux.run(&[
+        "list-clients",
+        "-t",
+        &request.session_id,
+        "-F",
+        "#{client_pid}\t#{client_flags}",
+    ])?;
+    let matched_flags = clients
+        .lines()
+        .filter_map(|line| {
+            let (pid, flags) = line.split_once('\t')?;
+            let pid = pid.parse().ok()?;
+            (processes.client_connections.get(&pid) == Some(&request.client)).then_some(flags)
+        })
+        .collect::<Vec<_>>();
+    let [flags] = matched_flags.as_slice() else {
+        bail!("remote tmux client detached, changed sessions, or is ambiguous");
+    };
+    crate::tmux::validate_focus_client_flags(flags)?;
     panes
         .iter()
         .find(|pane| {
@@ -322,6 +367,8 @@ mod tests {
     use super::*;
     use crate::config::shell_join;
     use crate::model::MoshEndpoint;
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::io::Write;
     use std::process::Command;
     use std::time::Instant;
 
@@ -442,7 +489,7 @@ mod tests {
             let status = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "focus::tests::real_mosh_inner_selection_validates_lifetime_session_client_and_target", "--nocapture"])
                 .env(FIXTURE, "1").env("TMUX_TMPDIR", directory.path())
-                .env_remove("TMUX").env_remove("TMUX_PANE").status().unwrap();
+                .env("TMUX", "isolated-focus-test,0,0").env("TMUX_PANE", "%0").status().unwrap();
             assert!(status.success());
             return;
         }
@@ -532,6 +579,17 @@ mod tests {
                 "new-session",
                 "-d",
                 "-s",
+                "ui",
+                "sleep 90",
+            ])
+            .unwrap();
+        outer
+            .run(&[
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
                 "outer",
                 "-x",
                 "100",
@@ -562,6 +620,7 @@ mod tests {
             client: session.clients[0].clone(),
             ..request()
         };
+        check_activation_clients(&outer, &inner, &request, session);
         let current = || {
             inner
                 .run(&[
@@ -612,6 +671,94 @@ mod tests {
         let client = inner
             .run(&["list-clients", "-t", "$0", "-F", "#{client_name}"])
             .unwrap();
+        let other_pane = inner
+            .run(&["list-panes", "-t", &request.window_id, "-F", "#{pane_id}"])
+            .unwrap()
+            .lines()
+            .find(|pane| *pane != request.pane_id)
+            .unwrap()
+            .to_string();
+        inner
+            .run(&["refresh-client", "-t", client.trim(), "-f", "active-pane"])
+            .unwrap();
+        inner
+            .run(&["bind-key", "-n", "F11", "select-pane", "-t", &other_pane])
+            .unwrap();
+        inner
+            .run(&[
+                "bind-key",
+                "-n",
+                "F12",
+                "set-option",
+                "-gF",
+                "@focus_test_client_pane",
+                "#{pane_id}",
+            ])
+            .unwrap();
+        outer
+            .run(&["send-keys", "-t", "outer:0", "F11", "F12"])
+            .unwrap();
+        wait_until_ready("independent remote pane selection", || {
+            inner
+                .run(&["show-option", "-gqv", "@focus_test_client_pane"])
+                .unwrap()
+                .trim()
+                == other_pane
+        });
+        inner.run(&["select-window", "-t", "$0:0"]).unwrap();
+        let before_rejection = current();
+        let selected = select_remote(&inner, &request);
+        inner
+            .run(&["set-option", "-gu", "@focus_test_client_pane"])
+            .unwrap();
+        outer.run(&["send-keys", "-t", "outer:0", "F12"]).unwrap();
+        wait_until_ready("remote client pane observation", || {
+            !inner
+                .run(&["show-option", "-gqv", "@focus_test_client_pane"])
+                .unwrap()
+                .trim()
+                .is_empty()
+        });
+        let actual = inner
+            .run(&["show-option", "-gqv", "@focus_test_client_pane"])
+            .unwrap();
+        assert!(
+            selected
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("active-pane")),
+            "independent client pane was not selected, yet remote focus confirmed success: {}",
+            actual.trim()
+        );
+        assert_eq!(
+            current(),
+            before_rejection,
+            "unsupported client mutated before rejection"
+        );
+        inner
+            .run(&["refresh-client", "-t", client.trim(), "-f", "!active-pane"])
+            .unwrap();
+        inner.run(&["select-pane", "-t", &other_pane]).unwrap();
+        let change_mode = shell_join(&[
+            "refresh-client".into(),
+            "-t".into(),
+            client.trim().into(),
+            "-f".into(),
+            "active-pane".into(),
+        ]);
+        inner
+            .run(&["set-hook", "-g", "after-select-pane", &change_mode])
+            .unwrap();
+        let changed_mode = select_remote(&inner, &request).unwrap_err();
+        assert!(
+            changed_mode.to_string().contains("active-pane"),
+            "{changed_mode:#}"
+        );
+        inner
+            .run(&["set-hook", "-gu", "after-select-pane"])
+            .unwrap();
+        inner
+            .run(&["refresh-client", "-t", client.trim(), "-f", "!active-pane"])
+            .unwrap();
         inner
             .run(&["switch-client", "-c", client.trim(), "-t", "unrelated"])
             .unwrap();
@@ -627,6 +774,458 @@ mod tests {
                 .unwrap()
                 .trim(),
             "unrelated"
+        );
+    }
+
+    fn wait_until_ready(description: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn check_activation_clients(
+        outer: &Tmux,
+        inner: &Tmux,
+        request: &FocusRequest,
+        session: SessionConnections,
+    ) {
+        let socket = outer.server_key().unwrap().unwrap();
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let pair = native_pty_system()
+                .openpty(PtySize {
+                    rows: 40,
+                    cols: 100,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            let mut command = CommandBuilder::new("tmux");
+            command.args(["-S", &socket, "attach-session", "-t", "ui"]);
+            command.env_remove("TMUX");
+            command.env_remove("TMUX_PANE");
+            command.env("TERM", "xterm-256color");
+            let child = pair.slave.spawn_command(command).unwrap();
+            drop(pair.slave);
+            let pid = child.process_id().unwrap().to_string();
+            clients.push((child, pair.master));
+            wait_until_ready("tmux client attachment", || {
+                outer
+                    .run(&["list-clients", "-F", "#{client_pid}"])
+                    .unwrap()
+                    .lines()
+                    .any(|line| line == pid)
+            });
+        }
+        let initiating = clients[0].0.process_id().unwrap();
+        let spectator = clients[1].0.process_id().unwrap();
+        // The first client supplies input after the spectator attaches second.
+        let mut input = clients[0].1.take_writer().unwrap();
+        let mut initiating_input = || {
+            input.write_all(b"x").unwrap();
+            wait_until_ready("initiating client input", || {
+                outer
+                    .run(&["display-message", "-p", "#{client_pid}"])
+                    .unwrap()
+                    .trim()
+                    == initiating.to_string()
+            });
+        };
+        initiating_input();
+        let record = AgentRecord {
+            id: "remote/test/target".into(),
+            host: "test".into(),
+            server: "default".into(),
+            pane_id: request.pane_id.clone(),
+            pane_pid: 1,
+            session_id: request.session_id.clone(),
+            session_name: "session with spaces".into(),
+            window_id: request.window_id.clone(),
+            window_index: 1,
+            window_name: "hidden".into(),
+            pane_index: 1,
+            agent: "Claude".into(),
+            state: Default::default(),
+            attention: Default::default(),
+            source: Default::default(),
+            title: "synthetic target".into(),
+            label: None,
+            cwd: "/".into(),
+            visible: false,
+            seen: true,
+            changed_at_ms: 1,
+            origin: Default::default(),
+            terminal: None,
+            remote_alias: Some("test".into()),
+            ssh_connection: None,
+            session_connections: Some(session),
+            focus_target: None,
+            goal: None,
+            subagent: None,
+            detection: None,
+        };
+        let config = Config {
+            machines: vec![MachineConfig {
+                name: "test".into(),
+                host: "localhost".into(),
+                ssh_user: "test".into(),
+                binary: "/test/tmux-agent".into(),
+                auto_connect: false,
+            }],
+            ..Config::default()
+        };
+        let snapshot = Snapshot {
+            peers: vec![crate::model::PeerStatus {
+                name: "test".into(),
+                capabilities: vec![CAPABILITY_REMOTE_FOCUS.into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = runtime
+            .block_on(activate_with_control(
+                outer,
+                &config,
+                &snapshot,
+                &record,
+                |_, target| async move { select_remote(inner, &target) },
+            ))
+            .unwrap();
+        assert_eq!(report.outcome, FocusOutcome::Exact);
+        let selected = outer
+            .run(&["list-clients", "-F", "#{client_pid}:#{session_name}"])
+            .unwrap();
+        assert!(
+            selected
+                .lines()
+                .any(|line| line == format!("{initiating}:outer")),
+            "initiator did not move: {selected}"
+        );
+        assert!(
+            selected
+                .lines()
+                .any(|line| line == format!("{spectator}:ui")),
+            "spectator moved: {selected}"
+        );
+        let client_name = |pid: u32| {
+            outer
+                .run(&["list-clients", "-F", "#{client_pid}\t#{client_name}"])
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    let (current, name) = line.split_once('\t')?;
+                    (current == pid.to_string()).then(|| name.to_string())
+                })
+                .unwrap()
+        };
+        let initiating_name = client_name(initiating);
+        let spectator_name = client_name(spectator);
+        let alternate = outer
+            .run(&[
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                "outer:0",
+                "sleep 90",
+            ])
+            .unwrap()
+            .trim()
+            .to_string();
+        for case in [
+            "failed-control",
+            "changed-session",
+            "changed-pane",
+            "old-peer",
+            "independent-local",
+            "changed-client-mode",
+            "local",
+            "single-client",
+            "detach",
+        ] {
+            outer
+                .run(&["switch-client", "-c", &initiating_name, "-t", "ui"])
+                .unwrap();
+            initiating_input();
+            inner.run(&["select-window", "-t", "$0:0"]).unwrap();
+            let mut selected_record = record.clone();
+            let mut selected_snapshot = snapshot.clone();
+            if case == "old-peer" {
+                selected_snapshot.peers.clear();
+            }
+            if case == "independent-local" {
+                outer
+                    .run(&[
+                        "refresh-client",
+                        "-t",
+                        &initiating_name,
+                        "-f",
+                        "active-pane",
+                    ])
+                    .unwrap();
+            }
+            if case == "local" {
+                let target = outer
+                    .list_panes()
+                    .unwrap()
+                    .into_iter()
+                    .find(|pane| pane.pane_id == alternate)
+                    .unwrap();
+                selected_record.remote_alias = None;
+                selected_record.session_connections = None;
+                selected_record.session_name = target.session_name;
+                selected_record.session_id = target.session_id;
+                selected_record.window_id = target.window_id;
+                selected_record.pane_id = target.pane_id;
+            }
+            if case == "single-client" {
+                outer
+                    .run(&["detach-client", "-t", &spectator_name])
+                    .unwrap();
+            }
+            let result = runtime.block_on(activate_with_control(
+                outer,
+                &config,
+                &selected_snapshot,
+                &selected_record,
+                |_, target| {
+                    let initiating_name = &initiating_name;
+                    let alternate = &alternate;
+                    async move {
+                        assert!(!matches!(case, "old-peer" | "local" | "independent-local"));
+                        if case == "failed-control" {
+                            bail!("synthetic control rejection")
+                        }
+                        select_remote(inner, &target)?;
+                        match case {
+                            "changed-session" => {
+                                outer.run(&["switch-client", "-c", initiating_name, "-t", "ui"])?;
+                            }
+                            "changed-pane" => {
+                                outer.run(&["select-pane", "-t", alternate])?;
+                            }
+                            "detach" => {
+                                outer.run(&["detach-client", "-t", initiating_name])?;
+                            }
+                            "changed-client-mode" => {
+                                outer.run(&[
+                                    "refresh-client",
+                                    "-t",
+                                    initiating_name,
+                                    "-f",
+                                    "active-pane",
+                                ])?;
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    }
+                },
+            ));
+            if matches!(case, "old-peer" | "local" | "single-client") {
+                assert_eq!(
+                    result.unwrap().outcome,
+                    if case == "old-peer" {
+                        FocusOutcome::TransportOnly
+                    } else {
+                        FocusOutcome::Exact
+                    },
+                    "{case}"
+                );
+            } else if case == "independent-local" {
+                assert!(result.err().unwrap().to_string().contains("active-pane"));
+            } else {
+                let error = result.err().unwrap();
+                assert!(!crate::tmux::is_focus_target_missing(&error));
+                let error = error.to_string();
+                assert!(
+                    error.contains("inner focus was not confirmed"),
+                    "{case}: {error}"
+                );
+            }
+            let selected = outer
+                .run(&["list-clients", "-F", "#{client_pid}:#{session_name}"])
+                .unwrap();
+            if !matches!(case, "single-client" | "detach") {
+                assert!(
+                    selected
+                        .lines()
+                        .any(|line| line == format!("{spectator}:ui")),
+                    "{case} moved spectator: {selected}"
+                );
+            }
+            if matches!(case, "changed-session" | "independent-local") {
+                assert!(
+                    selected
+                        .lines()
+                        .any(|line| line == format!("{initiating}:ui")),
+                    "focus undid user navigation"
+                );
+            }
+            if case == "changed-pane" {
+                assert_eq!(
+                    outer
+                        .run(&["display-message", "-p", "-t", "outer:", "#{pane_id}"])
+                        .unwrap()
+                        .trim(),
+                    alternate,
+                    "focus undid user pane selection"
+                );
+            }
+            if case == "detach" {
+                assert!(
+                    !selected
+                        .lines()
+                        .any(|line| line.starts_with(&format!("{initiating}:")))
+                );
+            }
+            if matches!(case, "independent-local" | "changed-client-mode") {
+                outer
+                    .run(&[
+                        "refresh-client",
+                        "-t",
+                        &initiating_name,
+                        "-f",
+                        "!active-pane",
+                    ])
+                    .unwrap();
+            }
+        }
+        for (mut child, _) in clients {
+            let _ = child.kill();
+            child.wait().unwrap();
+        }
+        check_client_replacement(outer, &alternate);
+        inner.run(&["select-window", "-t", "$0:0"]).unwrap();
+    }
+
+    fn check_client_replacement(outer: &Tmux, target_pane: &str) {
+        struct ReleaseHandshake(Tmux);
+        impl Drop for ReleaseHandshake {
+            fn drop(&mut self) {
+                let _ = self.0.run(&["wait-for", "-S", "focus-replacement-ready"]);
+            }
+        }
+
+        let socket = outer.server_key().unwrap().unwrap();
+        let command = || {
+            let mut command = CommandBuilder::new("tmux");
+            command.args(["-S", &socket, "attach-session", "-t", "ui"]);
+            command.env_remove("TMUX");
+            command.env_remove("TMUX_PANE");
+            command.env("TERM", "xterm-256color");
+            command
+        };
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 40,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut original = pair.slave.spawn_command(command()).unwrap();
+        let original_pid = original.process_id().unwrap().to_string();
+        wait_until_ready("original client attachment", || {
+            outer
+                .run(&["list-clients", "-F", "#{client_pid}"])
+                .unwrap()
+                .trim()
+                == original_pid
+        });
+        let name = outer
+            .run(&["list-clients", "-F", "#{client_name}"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let context = outer.focus_context().unwrap();
+        let pane = outer
+            .list_panes()
+            .unwrap()
+            .into_iter()
+            .find(|pane| pane.pane_id == target_pane)
+            .unwrap();
+        let target = crate::model::TmuxTarget {
+            session_name: pane.session_name,
+            window_id: pane.window_id,
+            window_index: pane.window_index,
+            pane_id: pane.pane_id,
+            pane_index: pane.pane_index,
+        };
+        let target_before = outer
+            .run(&[
+                "display-message",
+                "-p",
+                "-t",
+                "outer:",
+                "#{window_id} #{pane_id}",
+            ])
+            .unwrap();
+        let hook = format!(
+            "set-hook -gu after-list-clients ; {} ; wait-for focus-replacement-ready",
+            shell_join(&["detach-client".into(), "-t".into(), name.clone()])
+        );
+        outer
+            .run(&["set-hook", "-g", "after-list-clients", &hook])
+            .unwrap();
+        let replacement_command = command();
+        let replacement_tmux = outer.clone();
+        let replacement_task = std::thread::spawn(move || {
+            // Release the blocked query even if either readiness check panics.
+            let _release = ReleaseHandshake(replacement_tmux.clone());
+            wait_until_ready("original client exit", || {
+                original.try_wait().unwrap().is_some()
+            });
+            let replacement = pair.slave.spawn_command(replacement_command).unwrap();
+            let pid = replacement.process_id().unwrap().to_string();
+            wait_until_ready("same-PTY replacement attachment", || {
+                replacement_tmux
+                    .run(&["list-clients", "-F", "#{client_pid}"])
+                    .unwrap()
+                    .trim()
+                    == pid
+            });
+            replacement
+        });
+        let result = context.select(&target);
+        let mut replacement = replacement_task.join().unwrap();
+        let after = outer
+            .run(&["list-clients", "-F", "#{client_name}\t#{session_name}"])
+            .unwrap();
+        let target_after = outer
+            .run(&[
+                "display-message",
+                "-p",
+                "-t",
+                "outer:",
+                "#{window_id} #{pane_id}",
+            ])
+            .unwrap();
+        replacement.kill().unwrap();
+        wait_until_ready("replacement client exit", || {
+            replacement.try_wait().unwrap().is_some()
+        });
+        drop(pair.master);
+        assert!(result.is_err(), "replaced initiating client was accepted");
+        assert_eq!(
+            after.trim(),
+            format!("{name}\tui"),
+            "same-PTY replacement client was moved"
+        );
+        assert_eq!(
+            target_after, target_before,
+            "target pane changed after client replacement"
         );
     }
 }

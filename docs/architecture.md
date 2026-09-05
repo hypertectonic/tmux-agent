@@ -286,6 +286,26 @@ rechecks local panes instead of trusting a precomputed target. Daemon labels
 and visibility use that association too; visibility still requires both the
 remote agent pane and local transport pane to be visible.
 
+Each activation captures the local tmux socket, server lifetime, and current
+client's name, PID, and creation time before selecting anything. A persistent
+UI uses tmux's current/most recently active client at that moment, not a client
+cached when the UI started. Selection uses that explicit client and numeric
+session, window, and pane IDs. A synchronous tmux format guard rechecks the
+captured server/client lifetime and shared-pane mode before one full-target
+switch. This prevents a same-terminal detach/reattach from redirecting the
+activation to a replacement client. If another client became current before
+the guard, activation safely refuses instead of switching it. After asynchronous
+remote control, verification checks the same client's selected location without
+switching again. When the transport is in another local session, only that
+client switches sessions;
+spectators remain in the original UI session. Within a shared session, native
+tmux window selection still changes every attached client's view. Pane selection
+is shared by default; clients using tmux's `active-pane` flag retain independent
+pane selection. Exact focus still requires the captured client's actual pane
+to match the target. Detach or user navigation during control fails verification
+and is not undone. A CLI outside tmux continues to select and verify the target
+session's active window and pane without switching an attached client.
+
 For a structured machine advertising `remote_tmux_focus_v1`, activation sends
 the server/session lifetime, session/window/pane IDs, and specifically matched
 client endpoint over a separate configured SSH control command. The remote
@@ -293,9 +313,17 @@ operation uses its configured server, refreshes process/socket inspection,
 validates the target and client association, selects the window and pane by ID,
 and verifies the result and association again. It never switches a client to
 another session. Tmux window selection affects all clients attached to that
-session; pane selection also affects linked views of that window. The local
-side rechecks the same transport after remote confirmation before returning
-`Exact`. Display titles and labels do not form part of that identity check.
+session; shared-pane clients also share pane selection across linked views of
+that window. Clients using `active-pane` retain independent pane selection. The
+local side rechecks the same transport and initiating client's location after remote
+confirmation before returning `Exact`. Display titles and labels do not form
+part of that identity check.
+
+The initiating local client and matched remote client must use shared-pane
+mode. Tmux's `list-clients` pane format reports the window's active pane rather
+than an `active-pane` client's independent input pane. Focus rejects that flag
+before selection and checks it again during verification, rather than reporting
+an unverified exact result. Other clients' flags are not changed.
 
 Control uses bounded JSON input/output and a five-second total SSH deadline.
 The authenticated configured machine establishes the host boundary; remote
