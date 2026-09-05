@@ -51,8 +51,8 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Check shell scripts
         run: |
-          shellcheck tmux-agent.tmux bin/tmux-agent scripts/* tests/*.sh tests/run-shell-tests
-          shfmt -d -i 4 -ci tmux-agent.tmux bin/tmux-agent scripts/* tests/*.sh tests/run-shell-tests
+          shellcheck tmux-agent.tmux bin/tmux-agent scripts/* tests/*.sh tests/run-shell-tests tests/transport-ui/run
+          shfmt -d -i 4 -ci tmux-agent.tmux bin/tmux-agent scripts/* tests/*.sh tests/run-shell-tests tests/transport-ui/run
       - name: Check GitHub Actions workflows
         if: runner.os == 'Linux'
         run: |
@@ -60,6 +60,20 @@ jobs:
           "$(go env GOPATH)/bin/actionlint"
       - name: Run shell and tmux integration tests
         run: tests/run-shell-tests
+
+  transport-ui:
+    name: SSH and Mosh persistent UI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install mandatory transport prerequisites
+        run: sudo apt-get update && sudo apt-get install -y lsof mosh openssh-client openssh-server procps python3 tmux
+      - name: Exercise production scanner and persistent UI
+        run: tests/transport-ui/run
 
   release-target:
     name: Build ${{ matrix.target }}
