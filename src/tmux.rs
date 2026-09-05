@@ -895,9 +895,10 @@ impl Tmux {
     }
 
     pub fn focus_context(&self) -> Result<FocusContext> {
-        let socket = self.server_key()?.context("local tmux server is missing")?;
+        let output = self.run_optional(&["display-message", "-p", "#{socket_path}"])?;
+        let socket = required_focus_socket(output.as_deref())?;
         let mut tmux = self.clone();
-        tmux.args = vec!["-S".into(), socket];
+        tmux.args = vec!["-S".into(), socket.into()];
         let server_identity = tmux
             .run(&["display-message", "-p", "#{pid} #{start_time}"])?
             .trim()
@@ -1331,6 +1332,13 @@ impl Tmux {
     fn status(&self, command_args: &[&str]) -> Result<()> {
         self.run(command_args).map(|_| ())
     }
+}
+
+fn required_focus_socket(output: Option<&str>) -> Result<&str> {
+    output
+        .map(str::trim)
+        .filter(|socket| !socket.is_empty())
+        .context("local tmux socket path is unavailable; cannot pin focus server")
 }
 
 fn pane_target(pane: &Pane) -> TmuxTarget {
@@ -2585,6 +2593,16 @@ mod tests {
     use crate::model::{AgentOrigin, AgentState, Attention, EvidenceSource};
     use tempfile::tempdir;
 
+    #[test]
+    fn focus_requires_a_reported_socket_path_without_a_runtime_key_fallback() {
+        for missing in [None, Some(""), Some(" \n")] {
+            assert!(required_focus_socket(missing).is_err());
+        }
+        assert_eq!(
+            required_focus_socket(Some("/tmp/tmux-test/default\n")).unwrap(),
+            "/tmp/tmux-test/default"
+        );
+    }
     #[test]
     fn mosh_endpoint_parsing_handles_linux_and_macos_socket_records() {
         let sockets = parse_lsof_udp_endpoints(b"p10\nf4\nn[2001:db8::1]:60001\np20\nn192.0.2.1:60002\np30\nf4\nn*:60003\np40\nn127.0.0.1:60004\nn127.0.0.1:60005\n");

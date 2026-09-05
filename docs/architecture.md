@@ -294,11 +294,12 @@ session, window, and pane IDs. After asynchronous remote control, verification
 checks the same client's selected location without switching again. When the
 transport is in another local session, only that client switches sessions;
 spectators remain in the original UI session. Within a shared session, native
-tmux window selection still changes every attached client's view, and pane
-selection affects all views of that window. Detach or user navigation during
-control fails verification and is not undone. A CLI outside tmux continues to
-select and verify the target session's active window and pane without switching
-an attached client.
+tmux window selection still changes every attached client's view. Pane selection
+is shared by default; clients using tmux's `active-pane` flag retain independent
+pane selection. Exact focus still requires the captured client's actual pane
+to match the target. Detach or user navigation during control fails verification
+and is not undone. A CLI outside tmux continues to select and verify the target
+session's active window and pane without switching an attached client.
 
 For a structured machine advertising `remote_tmux_focus_v1`, activation sends
 the server/session lifetime, session/window/pane IDs, and specifically matched
@@ -307,8 +308,9 @@ operation uses its configured server, refreshes process/socket inspection,
 validates the target and client association, selects the window and pane by ID,
 and verifies the result and association again. It never switches a client to
 another session. Tmux window selection affects all clients attached to that
-session; pane selection also affects linked views of that window. The local
-side rechecks the same transport and initiating client's location after remote
+session; shared-pane clients also share pane selection across linked views of
+that window. Clients using `active-pane` retain independent pane selection. The
+local side rechecks the same transport and initiating client's location after remote
 confirmation before returning `Exact`. Display titles and labels do not form
 part of that identity check.
 

@@ -143,18 +143,20 @@ configured binary wrapper for both commands. If SSH control reaches a different
 server, the operation rejects the request rather than searching other servers.
 The complete SSH operation has a five-second timeout and bounded input/output.
 
-Tmux shares window selection among clients attached to the same session, and
-pane selection among views of the same window, including linked windows.
-Selecting an agent therefore changes what those clients see. It does not switch
+Tmux shares window selection among clients attached to the same session. Pane
+selection is shared by default across views of the same window, including linked
+windows; clients using tmux's `active-pane` flag retain independent pane
+selection. Selecting an agent therefore changes what those clients see. It does not switch
 any client to another session. A second local transport to the same session
 remains ambiguous and prevents selection.
 
 On the local machine, activation selects the current tmux client once before
 contacting SSH control. If the transport is in another local session, only
 that client switches sessions; spectators remain in the original UI session.
-A target in the same session retains tmux's shared window selection, and pane
-selection affects every view of that window, so those views may change together.
-Remote confirmation verifies the initiating client's selected session, window,
+A target in the same session retains tmux's shared window selection. Views using
+the default shared-pane mode also change their selected pane together; clients
+using `active-pane` retain independent pane selection. Remote confirmation
+verifies the initiating client's selected session, window,
 and pane; it does not switch a second client or undo navigation while control
 was running. Detaching or changing selection during control reports unconfirmed
 focus.

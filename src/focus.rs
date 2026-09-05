@@ -670,6 +670,17 @@ mod tests {
         );
     }
 
+    fn wait_until_ready(description: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn check_activation_clients(
         outer: &Tmux,
         inner: &Tmux,
@@ -694,13 +705,31 @@ mod tests {
             command.env("TERM", "xterm-256color");
             let child = pair.slave.spawn_command(command).unwrap();
             drop(pair.slave);
+            let pid = child.process_id().unwrap().to_string();
             clients.push((child, pair.master));
-            std::thread::sleep(Duration::from_millis(150));
+            wait_until_ready("tmux client attachment", || {
+                outer
+                    .run(&["list-clients", "-F", "#{client_pid}"])
+                    .unwrap()
+                    .lines()
+                    .any(|line| line == pid)
+            });
         }
+        let initiating = clients[0].0.process_id().unwrap();
+        let spectator = clients[1].0.process_id().unwrap();
         // The first client supplies input after the spectator attaches second.
         let mut input = clients[0].1.take_writer().unwrap();
-        input.write_all(b"x").unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        let mut initiating_input = || {
+            input.write_all(b"x").unwrap();
+            wait_until_ready("initiating client input", || {
+                outer
+                    .run(&["display-message", "-p", "#{client_pid}"])
+                    .unwrap()
+                    .trim()
+                    == initiating.to_string()
+            });
+        };
+        initiating_input();
         let record = AgentRecord {
             id: "remote/test/target".into(),
             host: "test".into(),
@@ -768,8 +797,6 @@ mod tests {
         let selected = outer
             .run(&["list-clients", "-F", "#{client_pid}:#{session_name}"])
             .unwrap();
-        let initiating = clients[0].0.process_id().unwrap();
-        let spectator = clients[1].0.process_id().unwrap();
         assert!(
             selected
                 .lines()
@@ -821,8 +848,7 @@ mod tests {
             outer
                 .run(&["switch-client", "-c", &initiating_name, "-t", "ui"])
                 .unwrap();
-            input.write_all(b"x").unwrap();
-            std::thread::sleep(Duration::from_millis(50));
+            initiating_input();
             inner.run(&["select-window", "-t", "$0:0"]).unwrap();
             let mut selected_record = record.clone();
             let mut selected_snapshot = snapshot.clone();
