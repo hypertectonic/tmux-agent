@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "linux")]
+mod linux_ssh;
+
 const SEPARATOR: char = '\u{1f}';
 const ESCAPED_SEPARATOR: &str = r"\037";
 const UI_SELECTION_OPTION: &str = "@tmux_agent_selection";
@@ -485,6 +488,25 @@ impl Tmux {
                     .map(|connection| (*pid, ssh_connection(&connection.right, &connection.left)))
             })
             .collect::<HashMap<_, _>>();
+        #[cfg(target_os = "linux")]
+        let sshd_connections = {
+            let mut connections = sshd_connections;
+            if connections.len() < sshd_pids.len() {
+                let clients = self
+                    .run_optional(&["list-clients", "-F", "#{client_pid}"])?
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|pid| pid.parse().ok())
+                    .collect::<Vec<_>>();
+                linux_ssh::recover_connections(
+                    Path::new("/proc"),
+                    &processes,
+                    &clients,
+                    &mut connections,
+                );
+            }
+            connections
+        };
         let ssh_connections =
             unambiguous_ssh_connections(&processes, &parent_pids, &sshd_pids, &sshd_connections);
         let mosh_pids = processes

@@ -112,6 +112,13 @@ Named tmux servers are supported when the configured remote collector targets
 that server. No launch wrapper, registry, extra service, or dotfile edit is
 needed.
 
+Linux SSH login processes can hide their sockets from the logged-in user. In
+that case tmux-agent reads only `SSH_CONNECTION` from the attached tmux client's
+current login ancestry and checks it against an established inbound connection.
+It does not need root, changed process permissions, or session-global tmux
+environment. Missing or conflicting evidence leaves discovery incomplete;
+multiple terminal channels sharing one SSH connection remain ambiguous.
+
 Custom Mosh clients are recognized when the original `--client` option names
 the exact running executable and its process title carries a numeric server
 endpoint. Custom executable paths containing whitespace are not supported.

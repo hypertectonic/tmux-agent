@@ -261,6 +261,15 @@ client PIDs each scan. It joins client ancestry against the cached process
 inventory. SSH clients use the established TCP endpoints of their sshd ancestor;
 Mosh clients use the bound UDP endpoint of their mosh-server ancestor.
 
+On Linux, OpenSSH can make its login process's file-descriptor table unreadable
+to the logged-in user. When socket enumeration is unavailable, the scanner
+extracts only `SSH_CONNECTION` from the current attached tmux client's login
+ancestry. It requires a live sshd ancestor, consistent numeric endpoints, and
+the exact established inbound connection in procfs. Mosh ancestry takes
+precedence. Multiple outer terminals sharing that connection remain ambiguous.
+Missing or conflicting evidence leaves the attachment incomplete. This fallback
+does not read session-global tmux environment or export process environments.
+
 The local resolver matches those endpoints against live, non-UI transport panes.
 Mosh's numeric client endpoint stays available after bootstrap SSH exits and
 while its client address roams. No selected agent title, active provider,
