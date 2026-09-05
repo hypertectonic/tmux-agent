@@ -1292,6 +1292,45 @@ mod tests {
     }
 
     #[test]
+    fn claude_completed_turn_stays_idle_while_background_shell_persists() {
+        let screen = "Done.\n✻ Worked for 46m · done · 1 shell still running\n────\n❯ editable unsent text\n────\nmodel · project · main · Context 23% left\n⏵⏵ auto mode on · 1 shell · ← 1 agent";
+        let mut tracker = StateTracker::default();
+        let mut previous = old(AgentState::Idle, true);
+        previous.agent = "Claude".into();
+
+        for (now, title, freshness, expected) in [
+            (
+                1_000,
+                "◐ task",
+                ObservationFreshness::Fresh,
+                AgentState::Working,
+            ),
+            (2_000, "", ObservationFreshness::Fresh, AgentState::Idle),
+            (2_300, "", ObservationFreshness::Replayed, AgentState::Idle),
+            (3_000, "", ObservationFreshness::Fresh, AgentState::Idle),
+        ] {
+            let result = tracker.stabilize_observation(
+                &previous.id,
+                "Claude:20",
+                detect::detect("claude", title, screen).unwrap(),
+                Some(&previous),
+                now,
+                freshness,
+            );
+            assert_eq!(result.state, expected, "observation at {now}");
+            if expected == AgentState::Idle {
+                let details = result.details.as_ref().unwrap();
+                assert_eq!(details.signal.as_deref(), Some("input_prompt"));
+                assert!(details.definitive);
+                assert!(!details.inferred);
+            }
+            previous.state = result.state;
+            previous.source = result.source;
+            previous.detection = result.details;
+        }
+    }
+
+    #[test]
     fn cached_screen_still_applies_current_title_evidence() {
         let previous = old(AgentState::Working, true);
         let mut tracker = StateTracker::default();

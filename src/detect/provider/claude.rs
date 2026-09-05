@@ -31,14 +31,6 @@ pub(super) fn detect(title: &str, content: &str) -> ProviderDetection {
         return ProviderDetection::from_screen(AgentState::Blocked, signal, "current_panel");
     }
 
-    if has_active_background_shells(&screen, current_panel) {
-        return ProviderDetection::from_screen(
-            AgentState::Working,
-            "background_shell_footer",
-            "current_footer",
-        );
-    }
-
     if recent.contains_any(&[
         "esc to interrupt",
         "ctrl+c to stop",
@@ -87,18 +79,6 @@ fn is_background_task_overlay(recent: Lines<'_>) -> bool {
     recent.any_line(|line| line.trim_start().starts_with("/btw")) && recent.contains("esc to close")
 }
 
-fn has_active_background_shells(screen: &VisibleScreen<'_>, footer: Lines<'_>) -> bool {
-    screen.latest_prompt_box().is_some()
-        && footer.any_line(|line| {
-            line.split_whitespace()
-                .zip(line.split_whitespace().skip(1))
-                .any(|(count, label)| {
-                    count.parse::<u64>().is_ok_and(|count| count > 0)
-                        && matches!(label, "shell" | "shells")
-                })
-        })
-}
-
 fn blocking_signal(panel: Lines<'_>) -> Option<&'static str> {
     if panel.contains_all(&["enter to select", "esc to cancel"])
         && panel.contains_any(&[
@@ -128,17 +108,52 @@ fn blocking_signal(panel: Lines<'_>) -> Option<&'static str> {
 }
 
 fn has_ready_prompt(screen: &VisibleScreen<'_>) -> bool {
-    let footer_is_passive = !screen.after_last_divider().any_line(|line| {
+    let footer = screen.after_last_divider();
+    let footer_is_passive = !footer.any_line(|line| {
         let text = line.trim().to_lowercase();
         !text.is_empty()
             && !text.contains("shortcuts")
             && !text.contains("bypass permissions")
             && !text.contains("shift+tab")
     });
-    footer_is_passive
+    (footer_is_passive || is_modern_ready_footer(footer))
         && screen
             .latest_prompt_box()
             .is_some_and(|body| body.any_line(|line| line.trim_start().starts_with('❯')))
+}
+
+fn is_modern_ready_footer(footer: Lines<'_>) -> bool {
+    // The observed footer has exactly a model/project/branch/context row and
+    // an auto-mode row. Background shell counts describe jobs, not the turn.
+    let mut rows = footer.iter().map(str::trim).filter(|line| !line.is_empty());
+    let (Some(status), Some(mode), None) = (rows.next(), rows.next(), rows.next()) else {
+        return false;
+    };
+    let status: Vec<_> = status.split('·').map(str::trim).collect();
+    let [model, project, branch, context] = status.as_slice() else {
+        return false;
+    };
+    if [model, project, branch]
+        .iter()
+        .any(|field| field.is_empty())
+        || !context
+            .strip_prefix("Context ")
+            .and_then(|text| text.strip_suffix("% left"))
+            .and_then(|percent| percent.parse::<u8>().ok())
+            .is_some_and(|percent| percent <= 100)
+    {
+        return false;
+    }
+
+    let mut fields = mode.split('·').map(str::trim);
+    fields.next() == Some("⏵⏵ auto mode on")
+        && fields.all(|field| {
+            let field = field.strip_prefix("← ").unwrap_or(field);
+            let Some((count, label)) = field.split_once(' ') else {
+                return false;
+            };
+            count.parse::<u64>().is_ok() && matches!(label, "shell" | "shells" | "agent" | "agents")
+        })
 }
 
 #[cfg(test)]
@@ -159,6 +174,64 @@ mod tests {
         assert_eq!(result.state, AgentState::Idle);
         assert!(result.definitive);
         assert_eq!(result.signal, "input_prompt");
+    }
+
+    const MODERN_READY_SCREEN: &str = "Done.\n✻ Worked for 46m · done · 1 shell still running\n────\n❯ editable unsent text\n────\nmodel · project · main · Context 23% left\n⏵⏵ auto mode on · 1 shell · ← 1 agent";
+
+    #[test]
+    fn modern_prompt_without_title_is_direct_idle_evidence() {
+        for screen in [
+            MODERN_READY_SCREEN.to_string(),
+            MODERN_READY_SCREEN.replace(" · 1 shell", ""),
+        ] {
+            let result = detect("", &screen);
+            assert_eq!(result.state, AgentState::Idle);
+            assert_eq!(result.source, EvidenceSource::Screen);
+            assert_eq!(result.signal, "input_prompt");
+            assert!(result.definitive);
+            assert!(!result.inferred);
+        }
+    }
+
+    #[test]
+    fn foreground_activity_and_permissions_still_override_ready_shell_footer() {
+        for title in ["◐ task", "◑ task", "⠂ task"] {
+            let result = detect(title, MODERN_READY_SCREEN);
+            assert_eq!(result.state, AgentState::Working, "{title}");
+            assert_eq!(result.signal, "title_shows_activity");
+        }
+        let active = detect(
+            "✳ task",
+            &format!("{MODERN_READY_SCREEN}\nesc to interrupt"),
+        );
+        assert_eq!(active.state, AgentState::Working);
+        assert_eq!(active.signal, "recent_activity_marker");
+
+        let permission = detect(
+            "✳ task",
+            &format!("{MODERN_READY_SCREEN}\nAllow this command?"),
+        );
+        assert_eq!(permission.state, AgentState::Blocked);
+        assert_eq!(permission.signal, "permission_question");
+    }
+
+    #[test]
+    fn historical_prompts_and_output_do_not_supply_modern_ready_evidence() {
+        for screen in [
+            "────\n❯ previous\n────\nordinary output",
+            "────\n❯ previous\n────\nordinary output\nmodel · project · main · Context 23% left\n⏵⏵ auto mode on · 1 shell",
+            "────\n❯ previous\n────\nmodel · project · main · Context 23% left\n⏵⏵ auto mode on · 1 shell\nnew output",
+            "────\n❯ previous\n────\noutput mentioning Context 23% left\n⏵⏵ auto mode on · 1 shell",
+            "────\n❯ previous\n────\nmodel · project · main · Context 23% left\n⏵⏵ auto mode on · arbitrary output",
+            "────\n❯ previous\n────\nmodel · project · main · Context 23% left",
+            "────\n❯ previous\n────\n⏵⏵ auto mode on · 1 shell",
+            "❯ previous\nmodel · project · main · Context 23% left\n⏵⏵ auto mode on · 1 shell",
+        ] {
+            let result = detect("", screen);
+            assert!(!result.definitive, "{screen}");
+            assert!(result.inferred, "{screen}");
+            assert_ne!(result.signal, "input_prompt", "{screen}");
+        }
     }
 
     #[test]

@@ -39,6 +39,12 @@ minimal synthetic fixtures. Detectors emit semantic state and derived evidence
 details, not the source terminal content. State stabilization prevents one
 quiet frame from immediately erasing stronger working or blocked evidence.
 
+Claude state follows the foreground turn. A ready bordered prompt can be idle
+while background shells remain running. The modern ready footer requires its
+model/project/branch/context row followed by the auto-mode row; shell and agent
+counts in that footer do not signal foreground activity. Activity titles,
+current interrupt hints, and permission prompts retain their existing precedence.
+
 OMP v17.3.4 enables state titles by default. Its exact `π <separator>
 <label>` title is the primary state signal. The scanner stores only `<label>`,
 so the 80 ms working spinner does not change the record title or publish a new
