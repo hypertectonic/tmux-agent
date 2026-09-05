@@ -286,6 +286,17 @@ rechecks local panes instead of trusting a precomputed target. Daemon labels
 and visibility use that association too; visibility still requires both the
 remote agent pane and local transport pane to be visible.
 
+Each activation captures the local tmux socket, server lifetime, and current
+client's name, PID, and creation time before selecting anything. A persistent
+UI uses tmux's current/most recently active client at that moment, not a client
+cached when the UI started. Selection uses that explicit client and numeric
+session, window, and pane IDs. After asynchronous remote control, verification
+checks the same client's selected location without switching again. Other
+clients still in the UI session are not moved. Detach or user navigation during
+control fails verification and is not undone. A CLI outside tmux continues to
+select and verify the target session's active window and pane without switching
+an attached client.
+
 For a structured machine advertising `remote_tmux_focus_v1`, activation sends
 the server/session lifetime, session/window/pane IDs, and specifically matched
 client endpoint over a separate configured SSH control command. The remote
@@ -294,8 +305,9 @@ validates the target and client association, selects the window and pane by ID,
 and verifies the result and association again. It never switches a client to
 another session. Tmux window selection affects all clients attached to that
 session; pane selection also affects linked views of that window. The local
-side rechecks the same transport after remote confirmation before returning
-`Exact`. Display titles and labels do not form part of that identity check.
+side rechecks the same transport and initiating client's location after remote
+confirmation before returning `Exact`. Display titles and labels do not form
+part of that identity check.
 
 Control uses bounded JSON input/output and a five-second total SSH deadline.
 The authenticated configured machine establishes the host boundary; remote

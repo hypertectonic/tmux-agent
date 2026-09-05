@@ -149,6 +149,13 @@ Selecting an agent therefore changes what those clients see. It does not switch
 any client to another session. A second local transport to the same session
 remains ambiguous and prevents selection.
 
+On the local machine, activation selects the current tmux client once before
+contacting SSH control. Other clients sharing the persistent UI session stay
+there. Remote confirmation verifies that same client's selected session,
+window, and pane; it does not switch a second client or undo navigation while
+control was running. Detaching or changing selection during control reports
+unconfirmed focus.
+
 Older peers without the capability, raw `[[remote]]` collectors, and explicit
 bindings without inspectable client evidence retain outer-only focus. The UI
 reports why inner selection is unavailable and keeps a popup open; the CLI prints
@@ -161,7 +168,8 @@ If the target disappears, the association changes, or SSH control fails, the
 operation reports that the outer pane was focused but inner focus was not
 confirmed. These failures keep the popup open and do not acknowledge or update
 last-used ordering. Only a confirmed remote selection followed by a rechecked
-local transport returns exact focus and allows the popup to close.
+local transport and initiating client returns exact focus and allows the popup
+to close.
 
 Completion visibility requires both the remote agent pane and its uniquely
 resolved local transport to be visible. Outer-only focus leaves hidden remote
