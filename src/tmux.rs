@@ -444,6 +444,8 @@ impl Tmux {
     }
 
     fn refresh_process_inventory(&self) -> Result<ProcessInventory> {
+        #[cfg(target_os = "linux")]
+        let snapshot_before = linux_ssh::snapshot_cutoff();
         let output = Command::new("ps")
             .args(["-axww", "-o", PROCESS_COLUMNS])
             .output()
@@ -502,6 +504,7 @@ impl Tmux {
                     Path::new("/proc"),
                     &processes,
                     &clients,
+                    snapshot_before,
                     &mut connections,
                 );
             }

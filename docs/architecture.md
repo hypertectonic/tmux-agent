@@ -267,6 +267,9 @@ extracts only `SSH_CONNECTION` from the current attached tmux client's login
 ancestry. It requires a live sshd ancestor, consistent numeric endpoints, and
 the exact established inbound connection in procfs. Mosh ancestry takes
 precedence. Multiple outer terminals sharing that connection remain ambiguous.
+Each ancestry member must predate the process-table scan and retain its parent
+and start time through metadata extraction, preventing reused PIDs from joining
+new connection metadata to old ancestry.
 Missing or conflicting evidence leaves the attachment incomplete. This fallback
 does not read session-global tmux environment or export process environments.
 

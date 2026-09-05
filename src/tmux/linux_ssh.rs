@@ -10,12 +10,34 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
+pub(super) fn snapshot_cutoff() -> Option<u64> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut now) } != 0 {
+        return None;
+    }
+    let ticks = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()?;
+    if ticks == 0 {
+        return None;
+    }
+    u64::try_from(now.tv_sec)
+        .ok()?
+        .checked_mul(ticks)?
+        .checked_add(u64::try_from(now.tv_nsec).ok()?.checked_mul(ticks)? / 1_000_000_000)
+}
+
 pub(super) fn recover_connections(
     proc_root: &Path,
     processes: &[Process],
     clients: &[u32],
+    snapshot_before: Option<u64>,
     connections: &mut HashMap<u32, SshConnection>,
 ) {
+    let Some(snapshot_before) = snapshot_before else {
+        return;
+    };
     let by_pid = processes
         .iter()
         .map(|p| (p.pid, p))
@@ -36,7 +58,22 @@ pub(super) fn recover_connections(
     let mut recovered = HashMap::new();
     let mut rejected = HashSet::new();
     for (sshd, ancestry) in candidates {
-        let metadata = ancestry.into_iter().try_fold(None, |found, pid| {
+        let identities = ancestry
+            .iter()
+            .chain(std::iter::once(&sshd))
+            .map(|pid| {
+                let identity = process_identity(&proc_root.join(format!("{pid}/stat")))?;
+                // A process born after the pre-ps cutoff cannot own the ps row,
+                // even when before/after reads of its current stat would agree.
+                (identity.1 < snapshot_before && identity.0 == by_pid.get(pid)?.parent_pid)
+                    .then_some((*pid, identity))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(identities) = identities else {
+            rejected.insert(sshd);
+            continue;
+        };
+        let metadata = ancestry.iter().try_fold(None, |found, pid| {
             let next = read_connection(&proc_root.join(format!("{pid}/environ")))?;
             match (found, next) {
                 (Some(left), Some(right)) if left != right => Err(()),
@@ -47,7 +84,9 @@ pub(super) fn recover_connections(
             rejected.insert(sshd);
             continue;
         };
-        if !established.iter().any(|socket| {
+        if identities.iter().any(|(pid, identity)| {
+            process_identity(&proc_root.join(format!("{pid}/stat"))) != Some(*identity)
+        }) || !established.iter().any(|socket| {
             socket.left.port == connection.server_port
                 && socket.right.port == connection.client_port
                 && same_address(&socket.left.address, &connection.server_address)
@@ -64,6 +103,17 @@ pub(super) fn recover_connections(
             .into_iter()
             .filter(|(pid, _)| !rejected.contains(pid)),
     );
+}
+
+fn process_identity(path: &Path) -> Option<(u32, u64)> {
+    let stat = fs::read_to_string(path).ok()?;
+    // comm is parenthesized and can itself contain spaces or parentheses.
+    let (_, fields) = stat.rsplit_once(')')?;
+    let mut fields = fields.split_whitespace();
+    fields.next()?;
+    let parent = fields.next()?.parse().ok()?;
+    let started = fields.nth(17)?.parse().ok()?;
+    Some((parent, started))
 }
 
 fn login_ancestry(start: u32, processes: &HashMap<u32, &Process>) -> Option<(u32, Vec<u32>)> {
@@ -216,6 +266,24 @@ mod tests {
         fs::write(root.join("net/tcp"), records).unwrap();
     }
 
+    fn process_stats(root: &Path, processes: &[Process]) {
+        for process in processes {
+            fs::create_dir_all(root.join(process.pid.to_string())).unwrap();
+            write_stat(root, process.pid, process.parent_pid, 10);
+        }
+    }
+
+    fn write_stat(root: &Path, pid: u32, parent: u32, started: u64) {
+        fs::write(
+            root.join(format!("{pid}/stat")),
+            format!(
+                "{pid} (process) S {parent} {} {started}\n",
+                ["0"; 17].join(" ")
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn unreadable_sshd_sockets_recover_two_attached_clients_and_reconnect() {
         let root = tempfile::tempdir().unwrap();
@@ -235,8 +303,9 @@ mod tests {
             "0: 020200C0:0016 010200C0:C350 01\n1: 020200C0:0016 010200C0:C351 01\n",
         );
         let resolve = |processes: &[Process], clients: &[u32]| {
+            process_stats(root.path(), processes);
             let mut inbound = HashMap::new();
-            recover_connections(root.path(), processes, clients, &mut inbound);
+            recover_connections(root.path(), processes, clients, Some(100), &mut inbound);
             let parents = processes.iter().map(|p| (p.pid, p.parent_pid)).collect();
             unambiguous_ssh_connections(processes, &parents, &HashSet::from([50, 51, 52]), &inbound)
         };
@@ -276,7 +345,8 @@ mod tests {
         metadata(root.path(), 200, "192.0.2.1 50000 192.0.2.2 22");
         established(root.path(), "0: 020200C0:0016 010200C0:C350 01\n");
         let mut inbound = HashMap::new();
-        recover_connections(root.path(), &processes, &[200], &mut inbound);
+        process_stats(root.path(), &processes);
+        recover_connections(root.path(), &processes, &[200], Some(100), &mut inbound);
         assert!(inbound.contains_key(&50));
         let parents = processes.iter().map(|p| (p.pid, p.parent_pid)).collect();
         assert!(
@@ -302,7 +372,8 @@ mod tests {
                 process(200, 100, Some("pts/1"), "tmux attach-session"),
             ];
             let mut inbound = HashMap::new();
-            recover_connections(root.path(), &processes, &[200], &mut inbound);
+            process_stats(root.path(), &processes);
+            recover_connections(root.path(), &processes, &[200], Some(100), &mut inbound);
             assert!(
                 inbound.is_empty(),
                 "inherited environment accepted beneath {ancestor}"
@@ -320,7 +391,8 @@ mod tests {
         ];
         let resolve = || {
             let mut inbound = HashMap::new();
-            recover_connections(root.path(), &processes, &[200], &mut inbound);
+            process_stats(root.path(), &processes);
+            recover_connections(root.path(), &processes, &[200], Some(100), &mut inbound);
             inbound
         };
         established(root.path(), "0: 020200C0:0016 010200C0:C350 01\n");
@@ -368,7 +440,8 @@ mod tests {
         )
         .unwrap();
         let mut inbound = HashMap::new();
-        recover_connections(root.path(), &processes, &[200], &mut inbound);
+        process_stats(root.path(), &processes);
+        recover_connections(root.path(), &processes, &[200], Some(100), &mut inbound);
         assert_eq!(inbound[&50].server_address, "2001:db8::2");
         let known = inbound.clone();
         metadata(
@@ -376,7 +449,38 @@ mod tests {
             200,
             "malformed environment must not override known socket",
         );
-        recover_connections(root.path(), &processes, &[200], &mut inbound);
+        recover_connections(root.path(), &processes, &[200], Some(100), &mut inbound);
         assert_eq!(inbound, known);
+    }
+
+    #[test]
+    fn reused_client_pid_cannot_apply_new_metadata_to_old_ps_ancestry() {
+        let root = tempfile::tempdir().unwrap();
+        let processes = vec![
+            process(50, 1, None, "sshd: user"),
+            process(200, 50, Some("pts/1"), "tmux attach-session"),
+        ];
+        metadata(root.path(), 200, "192.0.2.1 50000 192.0.2.2 22");
+        established(root.path(), "0: 020200C0:0016 010200C0:C350 01\n");
+        // ps was collected at tick 100. The PID now belongs to a new login,
+        // whose valid environment and live TCP connection are unrelated to 50.
+        process_stats(root.path(), &processes);
+        for (parent, started) in [(51, 101), (50, 101), (50, 100), (51, 10)] {
+            write_stat(root.path(), 200, parent, started);
+            let mut inbound = HashMap::new();
+            recover_connections(root.path(), &processes, &[200], Some(100), &mut inbound);
+            assert!(
+                inbound.is_empty(),
+                "new PID metadata was attributed to the old sshd"
+            );
+        }
+    }
+
+    #[test]
+    fn current_process_start_uses_the_snapshot_clock() {
+        let cutoff = snapshot_cutoff().unwrap();
+        let (parent, started) = process_identity(Path::new("/proc/self/stat")).unwrap();
+        assert_eq!(parent, unsafe { libc::getppid() } as u32);
+        assert!(started <= cutoff);
     }
 }
