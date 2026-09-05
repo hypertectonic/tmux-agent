@@ -291,8 +291,11 @@ client's name, PID, and creation time before selecting anything. A persistent
 UI uses tmux's current/most recently active client at that moment, not a client
 cached when the UI started. Selection uses that explicit client and numeric
 session, window, and pane IDs. After asynchronous remote control, verification
-checks the same client's selected location without switching again. Other
-clients still in the UI session are not moved. Detach or user navigation during
+checks the same client's selected location without switching again. When the
+transport is in another local session, only that client switches sessions;
+spectators remain in the original UI session. Within a shared session, native
+tmux window selection still changes every attached client's view, and pane
+selection affects all views of that window. Detach or user navigation during
 control fails verification and is not undone. A CLI outside tmux continues to
 select and verify the target session's active window and pane without switching
 an attached client.

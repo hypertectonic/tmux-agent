@@ -150,11 +150,14 @@ any client to another session. A second local transport to the same session
 remains ambiguous and prevents selection.
 
 On the local machine, activation selects the current tmux client once before
-contacting SSH control. Other clients sharing the persistent UI session stay
-there. Remote confirmation verifies that same client's selected session,
-window, and pane; it does not switch a second client or undo navigation while
-control was running. Detaching or changing selection during control reports
-unconfirmed focus.
+contacting SSH control. If the transport is in another local session, only
+that client switches sessions; spectators remain in the original UI session.
+A target in the same session retains tmux's shared window selection, and pane
+selection affects every view of that window, so those views may change together.
+Remote confirmation verifies the initiating client's selected session, window,
+and pane; it does not switch a second client or undo navigation while control
+was running. Detaching or changing selection during control reports unconfirmed
+focus.
 
 Older peers without the capability, raw `[[remote]]` collectors, and explicit
 bindings without inspectable client evidence retain outer-only focus. The UI
