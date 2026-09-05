@@ -91,14 +91,14 @@
     "preserve_previous": false
   },
   {
-    "name": "current footer shells override idle title and prompt",
-    "basis": "provider terminal observation",
+    "name": "completed ready prompt stays idle with a persistent shell",
+    "basis": "issue 131 regression",
     "title": "✳ task",
-    "screen": "response\n────\n❯ \n────\n? shortcuts · 3 shells",
-    "state": "working",
+    "screen": "response\n────\n❯ \n────\n? shortcuts · 1 shell",
+    "state": "idle",
     "source": "screen",
-    "signal": "background_shell_footer",
-    "scope": "current_footer",
+    "signal": "input_prompt",
+    "scope": "prompt_box",
     "definitive": true,
     "inferred": false,
     "preserve_previous": false
@@ -140,6 +140,58 @@
     "scope": "prompt_box",
     "definitive": true,
     "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "modern ready footer without a title is idle",
+    "basis": "issue 131 regression",
+    "title": "",
+    "screen": "response\n────\n❯ \n────\nClaude Sonnet 4.5 · Context 42% left · auto mode",
+    "state": "idle",
+    "source": "screen",
+    "signal": "input_prompt",
+    "scope": "prompt_box",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "active turn with a background shell remains working",
+    "basis": "issue 131 regression",
+    "title": "",
+    "screen": "────\n❯ previous\n────\nRunning command\nesc to interrupt\n? shortcuts · 1 shell",
+    "state": "working",
+    "source": "screen",
+    "signal": "recent_activity_marker",
+    "scope": "recent_lines",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "permission with a background shell remains blocked",
+    "basis": "issue 131 regression",
+    "title": "",
+    "screen": "────\n❯ previous\n────\nDo you want to proceed?\n1. Yes\n2. No\n? shortcuts · 1 shell",
+    "state": "blocked",
+    "source": "screen",
+    "signal": "permission_question",
+    "scope": "current_panel",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
+    "name": "historical prompt with arbitrary footer is not current input",
+    "basis": "issue 131 regression",
+    "title": "",
+    "screen": "❯ old request\nold response\n────\nold output\n────\ncustom footer",
+    "state": "idle",
+    "source": "process",
+    "signal": "claude_foreground_without_activity",
+    "scope": "foreground_process",
+    "definitive": false,
+    "inferred": true,
     "preserve_previous": false
   }
 ]

@@ -113,6 +113,13 @@ impl Lines<'_> {
     {
         self.lines.iter().any(|line| predicate(line))
     }
+
+    pub(super) fn non_empty(&self) -> impl Iterator<Item = &str> {
+        self.lines
+            .iter()
+            .copied()
+            .filter(|line| !line.trim().is_empty())
+    }
 }
 
 pub(super) fn codex_prompt(line: &str) -> bool {

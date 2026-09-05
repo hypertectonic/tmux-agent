@@ -31,14 +31,6 @@ pub(super) fn detect(title: &str, content: &str) -> ProviderDetection {
         return ProviderDetection::from_screen(AgentState::Blocked, signal, "current_panel");
     }
 
-    if has_active_background_shells(&screen, current_panel) {
-        return ProviderDetection::from_screen(
-            AgentState::Working,
-            "background_shell_footer",
-            "current_footer",
-        );
-    }
-
     if recent.contains_any(&[
         "esc to interrupt",
         "ctrl+c to stop",
@@ -87,18 +79,6 @@ fn is_background_task_overlay(recent: Lines<'_>) -> bool {
     recent.any_line(|line| line.trim_start().starts_with("/btw")) && recent.contains("esc to close")
 }
 
-fn has_active_background_shells(screen: &VisibleScreen<'_>, footer: Lines<'_>) -> bool {
-    screen.latest_prompt_box().is_some()
-        && footer.any_line(|line| {
-            line.split_whitespace()
-                .zip(line.split_whitespace().skip(1))
-                .any(|(count, label)| {
-                    count.parse::<u64>().is_ok_and(|count| count > 0)
-                        && matches!(label, "shell" | "shells")
-                })
-        })
-}
-
 fn blocking_signal(panel: Lines<'_>) -> Option<&'static str> {
     if panel.contains_all(&["enter to select", "esc to cancel"])
         && panel.contains_any(&[
@@ -128,17 +108,61 @@ fn blocking_signal(panel: Lines<'_>) -> Option<&'static str> {
 }
 
 fn has_ready_prompt(screen: &VisibleScreen<'_>) -> bool {
-    let footer_is_passive = !screen.after_last_divider().any_line(|line| {
-        let text = line.trim().to_lowercase();
-        !text.is_empty()
-            && !text.contains("shortcuts")
-            && !text.contains("bypass permissions")
-            && !text.contains("shift+tab")
-    });
-    footer_is_passive
+    let footer = screen.after_last_divider();
+    ready_footer(footer)
         && screen
             .latest_prompt_box()
             .is_some_and(|body| body.any_line(|line| line.trim_start().starts_with('❯')))
+}
+
+fn ready_footer(footer: Lines<'_>) -> bool {
+    let lines = footer.non_empty().map(str::trim).collect::<Vec<_>>();
+    if lines.len() == 1 && legacy_ready_footer(lines[0]) {
+        return true;
+    }
+
+    if !(1..=2).contains(&lines.len()) {
+        return false;
+    }
+
+    let joined = lines.join(" ").to_lowercase();
+    has_model_marker(&joined) && has_context_marker(&joined) && has_auto_mode_marker(&joined)
+}
+
+fn legacy_ready_footer(line: &str) -> bool {
+    let normalized = line.trim().to_lowercase();
+    let mut segments = normalized.split(" · ");
+    let Some(prefix) = segments.next() else {
+        return false;
+    };
+    if !matches!(prefix, "? shortcuts" | "? for shortcuts") {
+        return false;
+    }
+    segments.all(|segment| {
+        let mut words = segment.split_whitespace();
+        words
+            .next()
+            .is_some_and(|count| count.parse::<u64>().is_ok())
+            && words
+                .next()
+                .is_some_and(|label| matches!(label, "shell" | "shells" | "agent" | "agents"))
+            && words.next().is_none()
+    })
+}
+
+fn has_model_marker(footer: &str) -> bool {
+    footer
+        .split(|character: char| !character.is_ascii_alphabetic())
+        .any(|word| matches!(word, "opus" | "sonnet" | "haiku"))
+}
+
+fn has_context_marker(footer: &str) -> bool {
+    footer.contains("context")
+        && (footer.contains('%') || footer.contains("left") || footer.contains("remaining"))
+}
+
+fn has_auto_mode_marker(footer: &str) -> bool {
+    footer.contains("auto")
 }
 
 #[cfg(test)]
@@ -159,6 +183,57 @@ mod tests {
         assert_eq!(result.state, AgentState::Idle);
         assert!(result.definitive);
         assert_eq!(result.signal, "input_prompt");
+    }
+
+    #[test]
+    fn persistent_background_shell_does_not_override_a_completed_turn() {
+        let result = detect(
+            "✳ task",
+            "response\n────────\n❯ \n────────\n? shortcuts · 1 shell",
+        );
+        assert_eq!(result.state, AgentState::Idle);
+        assert_eq!(result.signal, "input_prompt");
+    }
+
+    #[test]
+    fn modern_ready_footer_without_a_title_is_idle() {
+        let result = detect(
+            "",
+            "response\n────────\n❯ \n────────\nClaude Sonnet 4.5 · Context 42% left · auto mode",
+        );
+        assert_eq!(result.state, AgentState::Idle);
+        assert_eq!(result.signal, "input_prompt");
+    }
+
+    #[test]
+    fn active_turn_with_background_shell_is_working() {
+        let result = detect(
+            "",
+            "────────\n❯ previous\n────────\nRunning command\nesc to interrupt\n? shortcuts · 1 shell",
+        );
+        assert_eq!(result.state, AgentState::Working);
+        assert_eq!(result.signal, "recent_activity_marker");
+    }
+
+    #[test]
+    fn permission_prompt_with_background_shell_is_blocked() {
+        let result = detect(
+            "",
+            "────────\n❯ previous\n────────\nDo you want to proceed?\n1. Yes\n2. No\n? shortcuts · 1 shell",
+        );
+        assert_eq!(result.state, AgentState::Blocked);
+        assert_eq!(result.signal, "permission_question");
+    }
+
+    #[test]
+    fn historical_prompt_and_arbitrary_footer_are_not_ready_input() {
+        let result = detect(
+            "",
+            "❯ old request\nold response\n────────\nold output\n────────\ncustom footer",
+        );
+        assert_eq!(result.state, AgentState::Idle);
+        assert!(result.inferred);
+        assert_eq!(result.signal, "claude_foreground_without_activity");
     }
 
     #[test]
