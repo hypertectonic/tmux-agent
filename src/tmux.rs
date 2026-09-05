@@ -251,17 +251,19 @@ impl FocusContext {
         let FocusClient::Attached(client) = &self.client else {
             bail!("no initiating tmux client is attached");
         };
-        let output = self.tmux.run(&["list-clients", "-F", "#{client_name}\t#{client_pid}\t#{client_created}\t#{session_id}\t#{window_id}\t#{pane_id}"])?;
-        output
+        let output = self.tmux.run(&["list-clients", "-F", "#{client_name}\t#{client_pid}\t#{client_created}\t#{session_id}\t#{window_id}\t#{pane_id}\t#{client_flags}"])?;
+        let (location, flags) = output
             .lines()
             .find_map(|line| {
                 let fields = line.split('\t').collect::<Vec<_>>();
-                if fields.len() != 6 || LocalClient::parse(&fields[..3]).as_ref() != Some(client) {
+                if fields.len() != 7 || LocalClient::parse(&fields[..3]).as_ref() != Some(client) {
                     return None;
                 }
-                FocusLocation::parse(&fields[3..])
+                Some((FocusLocation::parse(&fields[3..6])?, fields[6]))
             })
-            .context("initiating tmux client detached or was replaced during focus")
+            .context("initiating tmux client detached or was replaced during focus")?;
+        validate_focus_client_flags(flags)?;
+        Ok(location)
     }
 }
 
@@ -1332,6 +1334,17 @@ impl Tmux {
     fn status(&self, command_args: &[&str]) -> Result<()> {
         self.run(command_args).map(|_| ())
     }
+}
+
+pub(crate) fn validate_focus_client_flags(flags: &str) -> Result<()> {
+    if flags.split(',').any(|flag| flag == "active-pane") {
+        // list-clients reports the window's active pane, not this mode's
+        // independent input pane. Do not claim that selection was verified.
+        bail!(
+            "focus cannot verify tmux active-pane clients; use shared-pane mode or focus manually"
+        );
+    }
+    Ok(())
 }
 
 fn required_focus_socket(output: Option<&str>) -> Result<&str> {

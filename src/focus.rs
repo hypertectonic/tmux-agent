@@ -277,6 +277,25 @@ fn verify_target(tmux: &Tmux, request: &FocusRequest, selected: bool) -> Result<
         .get(&request.session_id)
         .context("remote tmux session vanished or configured server is unsupported")?;
     request.validate_session(session)?;
+    let clients = tmux.run(&[
+        "list-clients",
+        "-t",
+        &request.session_id,
+        "-F",
+        "#{client_pid}\t#{client_flags}",
+    ])?;
+    let matched_flags = clients
+        .lines()
+        .filter_map(|line| {
+            let (pid, flags) = line.split_once('\t')?;
+            let pid = pid.parse().ok()?;
+            (processes.client_connections.get(&pid) == Some(&request.client)).then_some(flags)
+        })
+        .collect::<Vec<_>>();
+    let [flags] = matched_flags.as_slice() else {
+        bail!("remote tmux client detached, changed sessions, or is ambiguous");
+    };
+    crate::tmux::validate_focus_client_flags(flags)?;
     panes
         .iter()
         .find(|pane| {
@@ -652,6 +671,94 @@ mod tests {
         let client = inner
             .run(&["list-clients", "-t", "$0", "-F", "#{client_name}"])
             .unwrap();
+        let other_pane = inner
+            .run(&["list-panes", "-t", &request.window_id, "-F", "#{pane_id}"])
+            .unwrap()
+            .lines()
+            .find(|pane| *pane != request.pane_id)
+            .unwrap()
+            .to_string();
+        inner
+            .run(&["refresh-client", "-t", client.trim(), "-f", "active-pane"])
+            .unwrap();
+        inner
+            .run(&["bind-key", "-n", "F11", "select-pane", "-t", &other_pane])
+            .unwrap();
+        inner
+            .run(&[
+                "bind-key",
+                "-n",
+                "F12",
+                "set-option",
+                "-gF",
+                "@focus_test_client_pane",
+                "#{pane_id}",
+            ])
+            .unwrap();
+        outer
+            .run(&["send-keys", "-t", "outer:0", "F11", "F12"])
+            .unwrap();
+        wait_until_ready("independent remote pane selection", || {
+            inner
+                .run(&["show-option", "-gqv", "@focus_test_client_pane"])
+                .unwrap()
+                .trim()
+                == other_pane
+        });
+        inner.run(&["select-window", "-t", "$0:0"]).unwrap();
+        let before_rejection = current();
+        let selected = select_remote(&inner, &request);
+        inner
+            .run(&["set-option", "-gu", "@focus_test_client_pane"])
+            .unwrap();
+        outer.run(&["send-keys", "-t", "outer:0", "F12"]).unwrap();
+        wait_until_ready("remote client pane observation", || {
+            !inner
+                .run(&["show-option", "-gqv", "@focus_test_client_pane"])
+                .unwrap()
+                .trim()
+                .is_empty()
+        });
+        let actual = inner
+            .run(&["show-option", "-gqv", "@focus_test_client_pane"])
+            .unwrap();
+        assert!(
+            selected
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("active-pane")),
+            "independent client pane was not selected, yet remote focus confirmed success: {}",
+            actual.trim()
+        );
+        assert_eq!(
+            current(),
+            before_rejection,
+            "unsupported client mutated before rejection"
+        );
+        inner
+            .run(&["refresh-client", "-t", client.trim(), "-f", "!active-pane"])
+            .unwrap();
+        inner.run(&["select-pane", "-t", &other_pane]).unwrap();
+        let change_mode = shell_join(&[
+            "refresh-client".into(),
+            "-t".into(),
+            client.trim().into(),
+            "-f".into(),
+            "active-pane".into(),
+        ]);
+        inner
+            .run(&["set-hook", "-g", "after-select-pane", &change_mode])
+            .unwrap();
+        let changed_mode = select_remote(&inner, &request).unwrap_err();
+        assert!(
+            changed_mode.to_string().contains("active-pane"),
+            "{changed_mode:#}"
+        );
+        inner
+            .run(&["set-hook", "-gu", "after-select-pane"])
+            .unwrap();
+        inner
+            .run(&["refresh-client", "-t", client.trim(), "-f", "!active-pane"])
+            .unwrap();
         inner
             .run(&["switch-client", "-c", client.trim(), "-t", "unrelated"])
             .unwrap();
@@ -841,6 +948,8 @@ mod tests {
             "changed-session",
             "changed-pane",
             "old-peer",
+            "independent-local",
+            "changed-client-mode",
             "local",
             "single-client",
             "detach",
@@ -854,6 +963,17 @@ mod tests {
             let mut selected_snapshot = snapshot.clone();
             if case == "old-peer" {
                 selected_snapshot.peers.clear();
+            }
+            if case == "independent-local" {
+                outer
+                    .run(&[
+                        "refresh-client",
+                        "-t",
+                        &initiating_name,
+                        "-f",
+                        "active-pane",
+                    ])
+                    .unwrap();
             }
             if case == "local" {
                 let target = outer
@@ -883,7 +1003,7 @@ mod tests {
                     let initiating_name = &initiating_name;
                     let alternate = &alternate;
                     async move {
-                        assert!(!matches!(case, "old-peer" | "local"));
+                        assert!(!matches!(case, "old-peer" | "local" | "independent-local"));
                         if case == "failed-control" {
                             bail!("synthetic control rejection")
                         }
@@ -897,6 +1017,15 @@ mod tests {
                             }
                             "detach" => {
                                 outer.run(&["detach-client", "-t", initiating_name])?;
+                            }
+                            "changed-client-mode" => {
+                                outer.run(&[
+                                    "refresh-client",
+                                    "-t",
+                                    initiating_name,
+                                    "-f",
+                                    "active-pane",
+                                ])?;
                             }
                             _ => {}
                         }
@@ -914,6 +1043,8 @@ mod tests {
                     },
                     "{case}"
                 );
+            } else if case == "independent-local" {
+                assert!(result.err().unwrap().to_string().contains("active-pane"));
             } else {
                 let error = result.err().unwrap();
                 assert!(!crate::tmux::is_focus_target_missing(&error));
@@ -934,7 +1065,7 @@ mod tests {
                     "{case} moved spectator: {selected}"
                 );
             }
-            if case == "changed-session" {
+            if matches!(case, "changed-session" | "independent-local") {
                 assert!(
                     selected
                         .lines()
@@ -958,6 +1089,17 @@ mod tests {
                         .lines()
                         .any(|line| line.starts_with(&format!("{initiating}:")))
                 );
+            }
+            if matches!(case, "independent-local" | "changed-client-mode") {
+                outer
+                    .run(&[
+                        "refresh-client",
+                        "-t",
+                        &initiating_name,
+                        "-f",
+                        "!active-pane",
+                    ])
+                    .unwrap();
             }
         }
         for (mut child, _) in clients {

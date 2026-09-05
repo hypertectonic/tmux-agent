@@ -314,6 +314,12 @@ local side rechecks the same transport and initiating client's location after re
 confirmation before returning `Exact`. Display titles and labels do not form
 part of that identity check.
 
+The initiating local client and matched remote client must use shared-pane
+mode. Tmux's `list-clients` pane format reports the window's active pane rather
+than an `active-pane` client's independent input pane. Focus rejects that flag
+before selection and checks it again during verification, rather than reporting
+an unverified exact result. Other clients' flags are not changed.
+
 Control uses bounded JSON input/output and a five-second total SSH deadline.
 The authenticated configured machine establishes the host boundary; remote
 server PID/start time and session creation time reject a different server or

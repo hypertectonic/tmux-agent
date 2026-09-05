@@ -161,6 +161,12 @@ and pane; it does not switch a second client or undo navigation while control
 was running. Detaching or changing selection during control reports unconfirmed
 focus.
 
+Focus does not support an initiating local client or matched remote client
+using tmux's `active-pane` flag. Tmux's pane-reporting format cannot verify that
+client's independent input pane, so tmux-agent reports an error instead of exact
+focus. Use shared-pane mode or focus manually. Tmux-agent never changes client
+flags; enabling the flag during an operation also fails its final verification.
+
 Older peers without the capability, raw `[[remote]]` collectors, and explicit
 bindings without inspectable client evidence retain outer-only focus. The UI
 reports why inner selection is unavailable and keeps a popup open; the CLI prints
