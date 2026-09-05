@@ -1310,6 +1310,57 @@ mod tests {
         assert_eq!(result.source, EvidenceSource::Title);
     }
 
+    #[test]
+    fn completed_claude_turn_with_shell_reaches_the_idle_ui_row() {
+        let mut tracker = StateTracker::default();
+        let mut row = old(AgentState::Working, true);
+        row.agent = "Claude".into();
+        row.title = "◐ task".into();
+        let active_screen = "response\n────\n❯ previous\n────\nRunning command\nesc to interrupt\n? shortcuts · 1 shell";
+        let active = detect::detect("claude", &row.title, active_screen).unwrap();
+        let active = tracker.stabilize_observation(
+            &row.id,
+            "Claude:20",
+            active,
+            Some(&row),
+            1_000,
+            ObservationFreshness::Fresh,
+        );
+        row.state = active.state;
+        row.source = active.source;
+        row.attention = attention(row.state, row.seen);
+        row.detection = active.details;
+        assert_eq!(row.state, AgentState::Working);
+
+        row.title = "✳ task".into();
+        let screen = "response\n────\n❯ \n────\n? shortcuts · 1 shell";
+
+        for _ in 0..2 {
+            let detection = detect::detect("claude", &row.title, screen).unwrap();
+            let stabilized = tracker.stabilize_observation(
+                &row.id,
+                "Claude:20",
+                detection,
+                Some(&row),
+                1_000,
+                ObservationFreshness::Fresh,
+            );
+            row.state = stabilized.state;
+            row.source = stabilized.source;
+            row.attention = attention(row.state, row.seen);
+            row.detection = stabilized.details;
+        }
+
+        assert_eq!(row.state, AgentState::Idle);
+        assert_eq!(row.attention, Attention::Idle);
+        assert_eq!(
+            row.detection
+                .as_ref()
+                .and_then(|details| details.signal.as_deref()),
+            Some("input_prompt")
+        );
+    }
+
     fn old(state: AgentState, seen: bool) -> AgentRecord {
         AgentRecord {
             id: "host/default/%1".into(),
