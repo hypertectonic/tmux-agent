@@ -1106,6 +1106,116 @@ mod tests {
             let _ = child.kill();
             child.wait().unwrap();
         }
+        check_client_replacement(outer, &alternate);
         inner.run(&["select-window", "-t", "$0:0"]).unwrap();
+    }
+
+    fn check_client_replacement(outer: &Tmux, target_pane: &str) {
+        let socket = outer.server_key().unwrap().unwrap();
+        let command = || {
+            let mut command = CommandBuilder::new("tmux");
+            command.args(["-S", &socket, "attach-session", "-t", "ui"]);
+            command.env_remove("TMUX");
+            command.env_remove("TMUX_PANE");
+            command.env("TERM", "xterm-256color");
+            command
+        };
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 40,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut original = pair.slave.spawn_command(command()).unwrap();
+        let original_pid = original.process_id().unwrap().to_string();
+        wait_until_ready("original client attachment", || {
+            outer
+                .run(&["list-clients", "-F", "#{client_pid}"])
+                .unwrap()
+                .trim()
+                == original_pid
+        });
+        let name = outer
+            .run(&["list-clients", "-F", "#{client_name}"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let context = outer.focus_context().unwrap();
+        let pane = outer
+            .list_panes()
+            .unwrap()
+            .into_iter()
+            .find(|pane| pane.pane_id == target_pane)
+            .unwrap();
+        let target = crate::model::TmuxTarget {
+            session_name: pane.session_name,
+            window_id: pane.window_id,
+            window_index: pane.window_index,
+            pane_id: pane.pane_id,
+            pane_index: pane.pane_index,
+        };
+        let target_before = outer
+            .run(&[
+                "display-message",
+                "-p",
+                "-t",
+                "outer:",
+                "#{window_id} #{pane_id}",
+            ])
+            .unwrap();
+        let hook = format!(
+            "set-hook -gu after-list-clients ; {} ; wait-for focus-replacement-ready",
+            shell_join(&["detach-client".into(), "-t".into(), name.clone()])
+        );
+        outer
+            .run(&["set-hook", "-g", "after-list-clients", &hook])
+            .unwrap();
+        let replacement_command = command();
+        let replacement_tmux = outer.clone();
+        let replacement_task = std::thread::spawn(move || {
+            original.wait().unwrap();
+            let replacement = pair.slave.spawn_command(replacement_command).unwrap();
+            let pid = replacement.process_id().unwrap().to_string();
+            wait_until_ready("same-PTY replacement attachment", || {
+                replacement_tmux
+                    .run(&["list-clients", "-F", "#{client_pid}"])
+                    .unwrap()
+                    .trim()
+                    == pid
+            });
+            replacement_tmux
+                .run(&["wait-for", "-S", "focus-replacement-ready"])
+                .unwrap();
+            replacement
+        });
+        let result = context.select(&target);
+        let mut replacement = replacement_task.join().unwrap();
+        let after = outer
+            .run(&["list-clients", "-F", "#{client_name}\t#{session_name}"])
+            .unwrap();
+        let target_after = outer
+            .run(&[
+                "display-message",
+                "-p",
+                "-t",
+                "outer:",
+                "#{window_id} #{pane_id}",
+            ])
+            .unwrap();
+        replacement.kill().unwrap();
+        replacement.wait().unwrap();
+        drop(pair.master);
+        assert!(result.is_err(), "replaced initiating client was accepted");
+        assert_eq!(
+            after.trim(),
+            format!("{name}\tui"),
+            "same-PTY replacement client was moved"
+        );
+        assert_eq!(
+            target_after, target_before,
+            "target pane changed after client replacement"
+        );
     }
 }

@@ -153,6 +153,9 @@ remains ambiguous and prevents selection.
 On the local machine, activation selects the current tmux client once before
 contacting SSH control. If the transport is in another local session, only
 that client switches sessions; spectators remain in the original UI session.
+Client lifetime is checked within the same synchronous tmux command queue as
+selection. A replacement on the same terminal or a newly current client causes
+activation to refuse before changing the selected session, window, or pane.
 A target in the same session retains tmux's shared window selection. Views using
 the default shared-pane mode also change their selected pane together; clients
 using `active-pane` retain independent pane selection. Remote confirmation

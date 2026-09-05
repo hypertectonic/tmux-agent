@@ -290,9 +290,14 @@ Each activation captures the local tmux socket, server lifetime, and current
 client's name, PID, and creation time before selecting anything. A persistent
 UI uses tmux's current/most recently active client at that moment, not a client
 cached when the UI started. Selection uses that explicit client and numeric
-session, window, and pane IDs. After asynchronous remote control, verification
-checks the same client's selected location without switching again. When the
-transport is in another local session, only that client switches sessions;
+session, window, and pane IDs. A synchronous tmux format guard rechecks the
+captured server/client lifetime and shared-pane mode before one full-target
+switch. This prevents a same-terminal detach/reattach from redirecting the
+activation to a replacement client. If another client became current before
+the guard, activation safely refuses instead of switching it. After asynchronous
+remote control, verification checks the same client's selected location without
+switching again. When the transport is in another local session, only that
+client switches sessions;
 spectators remain in the original UI session. Within a shared session, native
 tmux window selection still changes every attached client's view. Pane selection
 is shared by default; clients using tmux's `active-pane` flag retain independent

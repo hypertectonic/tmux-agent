@@ -194,21 +194,46 @@ impl FocusContext {
         }
         if let FocusClient::Attached(client) = &self.client {
             self.current_client()?;
-            self.tmux.status(&[
-                "switch-client",
-                "-c",
-                &client.name,
-                "-t",
-                &location.session_id,
+            let server = format!("#{{==:#{{pid}} #{{start_time}},{}}}", self.server_identity);
+            let pid = format!("#{{==:#{{client_pid}},{}}}", client.pid);
+            let created = format!("#{{==:#{{client_created}},{}}}", client.created);
+            let shared_pane = "#{==:#{m:*active-pane*,#{client_flags}},0}";
+            let guard = format!("#{{&&:{server},#{{&&:{pid},#{{&&:{created},{shared_pane}}}}}}}");
+            let target = format!(
+                "{}:{}.{}",
+                location.session_id, location.window_id, location.pane_id
+            );
+            let selection = shell_join(&[
+                "switch-client".into(),
+                "-c".into(),
+                client.name.clone(),
+                "-t".into(),
+                target,
+            ]);
+            // if-shell -F inserts its branch synchronously, without a shell or
+            // event-loop yield before switch-client. The latter selects the
+            // full numeric target in one command on tmux 3.2 and newer.
+            let output = self.tmux.run(&[
+                "if-shell",
+                "-F",
+                &guard,
+                &format!("{selection} ; display-message -p tmux-agent-focus-selected"),
+                "display-message -p tmux-agent-focus-client-changed",
             ])?;
+            if output.trim() != "tmux-agent-focus-selected" {
+                bail!(
+                    "initiating tmux client or server changed before selection; refresh and retry"
+                );
+            }
+        } else {
+            self.tmux.status(&[
+                "select-window",
+                "-t",
+                &format!("{}:{}", location.session_id, location.window_id),
+            ])?;
+            self.tmux
+                .status(&["select-pane", "-t", &location.pane_id])?;
         }
-        self.tmux.status(&[
-            "select-window",
-            "-t",
-            &format!("{}:{}", location.session_id, location.window_id),
-        ])?;
-        self.tmux
-            .status(&["select-pane", "-t", &location.pane_id])?;
         self.verify(&location)?;
         Ok(location)
     }
