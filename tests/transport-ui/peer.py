@@ -21,6 +21,7 @@ try:
                 if capability != "remote_tmux_focus_v1"
             ]
         print(json.dumps(snapshot), flush=True)
+    raise SystemExit(child.wait(timeout=5))
 finally:
     child.terminate()
     try:

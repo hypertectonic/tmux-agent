@@ -57,8 +57,21 @@ def prepare_login():
     for path in ssh.iterdir():
         path.chmod(0o600)
     server = subprocess.Popen(["/usr/sbin/sshd", "-D", "-e", "-f", str(ROOT / "sshd.conf")],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                              stdout=subprocess.DEVNULL)
     try:
+        deadline = time.monotonic() + 5
+        while True:
+            if server.poll() is not None:
+                raise RuntimeError(f"sshd exited before listening: status {server.returncode}")
+            listener = subprocess.run(
+                ["lsof", "-nP", "-a", "-p", str(server.pid), "-iTCP:2222", "-sTCP:LISTEN", "-Fn"],
+                capture_output=True, text=True, timeout=1, check=False)
+            fields = listener.stdout.splitlines()
+            if listener.returncode == 0 and f"p{server.pid}" in fields and "n127.0.0.1:2222" in fields:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("sshd did not listen on 127.0.0.1:2222 within 5 seconds")
+            time.sleep(0.05)
         subprocess.run(["runuser", "-u", "agent", "--", "python3", __file__, "--user"],
                        check=True, timeout=210)
     finally:
