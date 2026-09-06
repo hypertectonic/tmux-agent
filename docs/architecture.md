@@ -39,6 +39,10 @@ minimal synthetic fixtures. Detectors emit semantic state and derived evidence
 details, not the source terminal content. State stabilization prevents one
 quiet frame from immediately erasing stronger working or blocked evidence.
 
+Claude discovery recognizes `claude`, `claude-code`, and absolute native
+entrypoints ending in `claude/versions/<major>.<minor>.<patch>`. A version
+basename or a Claude title alone is not enough to identify a process.
+
 Claude state follows the foreground turn. A ready bordered prompt can be idle
 while background shells remain running. The modern ready footer requires its
 model/project/branch/context row followed by the auto-mode row; shell and agent
