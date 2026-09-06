@@ -69,6 +69,10 @@ misclassified as a direct binary.
 
 ## Build from source
 
+The following installs at the normal command path. For temporary testing, use
+the separate-artifact and activation requirements below instead of overwriting
+an existing official launcher.
+
 ```sh
 cargo build --locked --release
 install -m 0755 target/release/tmux-agent ~/.local/bin/tmux-agent
@@ -79,6 +83,106 @@ Restart a running daemon after replacing the binary:
 ```sh
 tmux-agent daemon restart
 ```
+
+### Experimental activation and return
+
+These are required outcomes for temporary builds and their activation, not a
+built-in deployment command. Preparation alone must not install, select, or
+restart anything. Obtain approval for the exact hosts, runtimes, and live
+process changes before activation; publication and releases are separate acts.
+
+#### Prepare traceable artifacts
+
+- Record the full source commit and build inputs. Prefer a clean source snapshot;
+  if testing uncommitted work, preserve and identify its exact patch too. A
+  commit SHA alone must not stand for different source bytes.
+- Give the experiment a distinguishable version tied to that source. Keep
+  temporary version stamping in a disposable build copy and record it; do not
+  create empty commits or rewrite source history just to obtain a build ID.
+- Build natively for each target or use an artifact with verified OS,
+  architecture, and runtime-library compatibility. Record its checksum and
+  embedded version. A successful build on one platform proves nothing about
+  another platform's artifact.
+- Keep experimental artifacts separate from official launchers and managed
+  versions. Preserve the previous binaries, configuration, selector values
+  including unset values, and launch commands needed to undo activation.
+
+#### Select the whole runtime
+
+Identify the user, configuration, environment, exact tmux socket, server
+lifetime, and corresponding daemon IPC socket on each target. Verify the
+resolved sockets, not just a session name or the invoking shell's `TMUX` value;
+`tmux_args` and runtime-directory settings can change the destination.
+
+Current selection paths are independent:
+
+- `@tmux-agent-binary` selects plugin startup/popup behavior. It does not
+  redirect an arbitrary shell command or replace an already-running UI.
+- The checkout and standalone launchers select managed binaries. Runtime
+  `current` and lifecycle `manager` have distinct purposes; the checkout
+  launcher's `TMUX_AGENT_BINARY` override is not a universal selector.
+- `[[machine]].binary` constructs remote `watch --jsonl --local-only`,
+  `remote-focus`, `subagent-view --local-only`, and diagnostic commands.
+  Raw `[[remote]].command` collectors have their own command vectors.
+- Commands that ensure a daemon exists can start their own executable when
+  its socket is absent. Local child viewers also launch from the UI's own
+  executable. Existing owned PTY runners retain their loaded code.
+
+Before replacing the daemon, reconcile these entry points for the intended
+experiment, including collectors launched by other participating hosts. Replace
+or stop/reconnect only verified app-owned stale clients that could restart the
+wrong daemon. Restart the selected daemon and affected UI/watch processes with
+the agreed configuration. Include marked `@tmux_agent_ui=1` panes, hidden UIs,
+popups, and any active child viewer or owned PTY runner relevant to the feature.
+Do not respawn provider sessions just to refresh runner code; schedule such
+changes with the user or mark that part unverified.
+
+Scope cleanup by user, PID/start time, loaded executable, and runtime ownership.
+Do not use name-wide kills, kill a tmux server, or terminate unrelated agent,
+SSH, or Mosh sessions. Preserve layouts and user work.
+
+#### Verify before reporting success
+
+- After a settle period and collector reconnection, identify each relevant
+  process's PID/start time and loaded executable using platform process
+  inspection. Correlate the loaded image with the recorded artifact/version;
+  checking only `--version` on a replaced pathname or `pane_current_command`
+  does not identify code already running. Check daemon IPC ownership and every
+  affected UI pane, recording expected, restarted, and verified counts.
+- Verify each command through its actual launch route and environment,
+  including remote non-interactive SSH. Observe the executable/version used
+  by short-lived `remote-focus`, diagnostics, and child-view commands during
+  an isolated exercise, not merely a different shell's `command -v`. Account
+  for the tmux/SSH/Mosh helpers and sockets those commands actually use.
+- Check the local-only daemon snapshot and the consuming host's merged
+  snapshot. For remote tmux focus, verify required `session_connections`
+  identity survives the actual watcher. A connected peer, matching protocol,
+  capability, or advertised daemon version does not prove relay compatibility:
+  `watch` decodes and reserializes a typed snapshot, so an older executable can
+  drop newer fields while forwarding those labels.
+- Exercise the feature end to end. Remote focus must confirm the requested
+  inner session/window/pane IDs and the initiating local client's destination.
+  CLI success or outer-only focus is not evidence of inner selection. Use
+  isolated fixtures such as `tests/transport-ui/run` by default; moving a real
+  user's focus requires explicit approval. Do not open private transcripts to
+  test child viewers when a synthetic fixture suffices.
+
+Record source/version, per-target artifact paths and hashes, sockets, verified
+processes and commands, UI counts, feature results, and rollback selection.
+If tooling reports success but any required check fails or cannot be completed,
+report activation incomplete and investigate. Do not substitute daemon-only
+health for feature verification.
+
+#### Return to official builds
+
+Restore the recorded official launch routes and configuration, removing only
+the experiment's overrides. Reconcile remote collector/control/viewer commands
+as well as local daemon and UI selection. Stop/reconnect verified experimental
+watchers before they can restart an experimental daemon. Restart affected
+app-owned processes and repeat the same loaded-image, socket, snapshot, UI, and
+feature checks against the intended official version. A changed symlink or
+`rollback` exit code alone is not proof. Retain recovery artifacts until the
+return is verified; deletion requires separate authorization.
 
 ## Verify
 
