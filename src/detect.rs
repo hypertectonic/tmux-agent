@@ -4,6 +4,7 @@ pub(crate) mod stabilize;
 use crate::model::{AgentState, DetectionDetails, EvidenceSource, GoalInfo, GoalState};
 use regex::Regex;
 use std::ffi::{OsStr, OsString};
+use std::path::Path;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +184,7 @@ fn agent_for_command(command: &str) -> Option<String> {
 fn agent_for_program(program: &str) -> Option<&'static str> {
     let name = program_name(program);
     agent_for_name(&name)
+        .or_else(|| is_claude_native_entrypoint(Path::new(program)).then_some("Claude"))
         .or_else(|| is_pi_package_entrypoint(program).then_some("Pi"))
         .or_else(|| is_omp_package_entrypoint(program).then_some("OMP"))
 }
@@ -190,6 +192,7 @@ fn agent_for_program(program: &str) -> Option<&'static str> {
 fn agent_for_os_program(program: &OsStr) -> Option<&'static str> {
     let name = program_name_os(program);
     agent_for_name(&name)
+        .or_else(|| is_claude_native_entrypoint(Path::new(program)).then_some("Claude"))
         .or_else(|| is_pi_package_entrypoint(&program.to_string_lossy()).then_some("Pi"))
         .or_else(|| is_omp_package_entrypoint(&program.to_string_lossy()).then_some("OMP"))
 }
@@ -210,6 +213,27 @@ fn agent_for_name(name: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn is_claude_native_entrypoint(program: &Path) -> bool {
+    // Native installs can expose the versioned entrypoint as argv0 instead of
+    // "claude". Require the install layout, not just a version-shaped basename.
+    if !program.is_absolute()
+        || !program
+            .parent()
+            .is_some_and(|parent| parent.ends_with("claude/versions"))
+    {
+        return false;
+    }
+    let Some(version) = program.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let mut parts = version.split('.');
+    (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) && parts.next().is_none()
 }
 
 fn is_pi_package_entrypoint(program: &str) -> bool {
@@ -261,6 +285,69 @@ mod tests {
     fn unsupported_provider_process_is_not_detected() {
         assert!(detect("unsupported-agent", "project", "").is_none());
         assert!(agent_for_argv(&[OsString::from("unsupported-agent")]).is_none());
+    }
+
+    #[test]
+    fn claude_native_versioned_process_is_detected() {
+        for program in [
+            "/home/user/.local/share/claude/versions/2.1.261",
+            "/Users/user/.local/share/claude/versions/2.1.260",
+            "/opt/data/claude/versions/3.0.0",
+        ] {
+            let process = format!("{program} --resume");
+            assert!(looks_like_agent(&process), "{program}");
+            assert_eq!(detect(&process, "", "").unwrap().agent, "Claude");
+        }
+    }
+
+    #[test]
+    fn claude_native_versioned_argv_is_detected() {
+        for program in [
+            "/home/user/.local/share/claude/versions/2.1.261",
+            "/opt/test data/claude/versions/2.1.260",
+            "/opt/data/claude/versions/3.0.0",
+        ] {
+            let command = [OsString::from(program), OsString::from("--resume")];
+            assert_eq!(agent_for_argv(&command).as_deref(), Some("Claude"));
+        }
+    }
+
+    #[test]
+    fn claude_native_detection_rejects_unrelated_paths_and_arguments() {
+        for program in [
+            "2.1.261",
+            "/opt/tools/2.1.261",
+            "/home/user/.local/share/other/versions/2.1.261",
+            "/home/user/.local/share/not-claude/versions/2.1.261",
+            "/home/user/.local/share/claude/2.1.261",
+            "claude/versions/2.1.261",
+            "/home/user/.local/share/claude/versions/latest",
+            "/home/user/.local/share/claude/versions/2.1",
+            "/home/user/.local/share/claude/versions/2..261",
+            "/home/user/.local/share/claude/versions/2.1.261.js",
+            "/home/user/.local/share/claude/versions/2.1.261/helper",
+        ] {
+            assert!(!looks_like_agent(program), "{program}");
+            assert!(detect(program, "Claude Code", "").is_none(), "{program}");
+            assert!(
+                agent_for_argv(&[OsString::from(program)]).is_none(),
+                "{program}"
+            );
+        }
+        let program = "/home/user/.local/share/claude/versions/2.1.261";
+        assert!(!looks_like_agent(&format!("cat {program}")));
+        assert!(agent_for_argv(&[OsString::from("cat"), OsString::from(program)]).is_none());
+    }
+
+    #[test]
+    fn claude_named_entrypoints_remain_detected() {
+        for program in ["claude", "claude-code", "/opt/bin/claude"] {
+            assert_eq!(detect(program, "", "").unwrap().agent, "Claude");
+            assert_eq!(
+                agent_for_argv(&[OsString::from(program)]).as_deref(),
+                Some("Claude")
+            );
+        }
     }
 
     #[test]
