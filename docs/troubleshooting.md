@@ -148,8 +148,12 @@ remote unbind --pane <local-pane-id>` to remove one. A stale remote session name
 self-heals during focus when exactly one live pane is already bound to that host
 and its normalized title matches the selected agent. A stale host and session
 pair can also self-heal when one live mosh destination and nested title match.
-If no pane or several panes match, tmux-agent leaves every binding unchanged
-and reports the focus failure.
+If precise recovery still fails, one live, non-UI pane with a complete binding
+for that host can be focused as the outer transport. Its session marker may
+refer to another nested tmux session. tmux-agent does not switch the inner
+session or change either marker, and the UI reports the degraded result.
+Several same-host bindings remain ambiguous. Dead panes, UI panes, and partial
+bindings do not qualify.
 
 ## A completion remains visible
 

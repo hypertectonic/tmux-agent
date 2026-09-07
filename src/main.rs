@@ -3,6 +3,7 @@ mod config;
 mod daemon;
 mod detect;
 mod doctor;
+mod focus;
 mod ipc;
 mod model;
 mod runner;
@@ -20,7 +21,7 @@ use model::{Snapshot, terminal_safe};
 use scanner::Scanner;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use tmux::Tmux;
+use tmux::{FocusOutcome, Tmux};
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -54,12 +55,20 @@ enum Command {
     },
     /// Open the interactive agent view in the current terminal.
     Ui {
-        /// Adapt lifecycle for a tmux popup: do not mark a pane and exit after focus.
+        /// Adapt lifecycle for a tmux popup: do not mark a pane, exit after exact
+        /// focus, and remain open to report transport-only focus.
         #[arg(long)]
         popup: bool,
     },
     /// Focus an agent by full ID or an unambiguous ID suffix.
+    ///
+    /// Remote tmux focus may select only the outer transport. This prints a
+    /// notice to stderr and still exits successfully. Supported peers select
+    /// and verify the inner target through SSH; failed control exits with error.
     Focus { target: String },
+    /// Internal typed SSH operation, with request and response on standard I/O.
+    #[command(name = "remote-focus", hide = true)]
+    RemoteFocus,
     /// Explain the current evidence and state for an agent.
     Explain { target: String },
     /// Mark an agent's completion as seen.
@@ -291,8 +300,13 @@ async fn main() -> Result<()> {
             daemon::ensure_running(&config_path, &paths).await?;
             let snapshot = ipc::snapshot(&paths.socket, false).await?;
             let record = resolve(&snapshot, &target)?;
-            tmux.focus_agent(record)
+            let report = focus::activate(&tmux, &config, &snapshot, record).await?;
+            if report.outcome == FocusOutcome::TransportOnly {
+                eprintln!("{} ({})", report.notice, record.location());
+            }
+            Ok(())
         }
+        Command::RemoteFocus => focus::serve(&tmux),
         Command::Explain { target } => {
             daemon::ensure_running(&config_path, &paths).await?;
             let snapshot = ipc::snapshot(&paths.socket, false).await?;
@@ -509,6 +523,15 @@ mod tests {
         assert!(help.contains("tmux-agent run -- opencode"));
         assert!(help.contains("tmux-agent run -- omp"));
         assert!(help.contains("tmux-agent run -- pi"));
+
+        let command = Cli::command();
+        let ui = command
+            .find_subcommand("ui")
+            .expect("ui subcommand should exist");
+        let help = ui.clone().render_long_help().to_string();
+        assert!(
+            help.contains("exit after exact focus, and remain open to report transport-only focus")
+        );
     }
 
     #[test]

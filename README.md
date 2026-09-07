@@ -123,9 +123,11 @@ tmux-agent ui
 | `Backspace` | Edit the active search |
 | `Enter` | Focus, acknowledge, or open a Codex child |
 | Left click | Activate a row |
+| `a` | Mark all currently unread completions as read in normal mode |
 | `r` | Refresh |
-| `q` | Close in normal mode; type `q` during search |
-| `Esc` | Clear the active search, otherwise close |
+| `q` | Ask to close in normal mode; type `q` during search |
+| `y`, `Y` | Confirm closing when the quit prompt is visible |
+| `Esc` | Cancel the quit prompt, clear the active search, or close |
 
 Search is case-insensitive and matches the displayed title, provider, label,
 state, location, and working directory. It remains local to the UI process.
@@ -193,6 +195,10 @@ tmux-agent list
 SSH supplies authentication, encryption, host-key policy, streaming, and the
 separate interactive connection used for a remote Codex child view. Tailscale
 can provide private reachability but is not an application dependency.
+
+Selecting a remote tmux agent focuses its uniquely matched SSH or Mosh pane and
+uses a separate SSH control operation to select and verify the inner window and
+pane. Older peers and raw collector commands retain reported outer-only focus.
 
 See [Remote machines](docs/remote-machines.md) for setup order, privacy
 boundaries, focus behavior, and safe multi-machine updates.

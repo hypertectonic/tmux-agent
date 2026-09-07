@@ -86,6 +86,7 @@ pub async fn shutdown(socket: &Path) -> Result<()> {
     reader.read_line(&mut line).await?;
     match serde_json::from_str(&line).context("parse shutdown response")? {
         IpcResponse::Ack => {}
+        IpcResponse::Acknowledged { .. } => bail!("unexpected count response to shutdown"),
         IpcResponse::Error { message } => bail!("daemon error: {message}"),
         IpcResponse::Snapshot { .. } => bail!("unexpected snapshot response to shutdown"),
     }
@@ -107,6 +108,23 @@ pub async fn acknowledge(socket: &Path, target: &str) -> Result<()> {
         "acknowledge",
     )
     .await
+}
+
+pub async fn mark_all_read(socket: &Path) -> Result<usize> {
+    let stream = UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connect to daemon {}", socket.display()))?;
+    let (reader, mut writer) = stream.into_split();
+    write_request(&mut writer, &IpcRequest::MarkAllRead).await?;
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    match serde_json::from_str(&line).context("parse mark all read response")? {
+        IpcResponse::Acknowledged { count } => Ok(count),
+        IpcResponse::Error { message } => bail!("daemon error: {message}"),
+        IpcResponse::Ack => bail!("unexpected daemon acknowledgement to mark all read"),
+        IpcResponse::Snapshot { .. } => bail!("unexpected snapshot response to mark all read"),
+    }
 }
 
 pub async fn mark_used(socket: &Path, target: &str) -> Result<()> {
@@ -131,6 +149,7 @@ async fn request_ack(socket: &Path, request: IpcRequest, operation: &str) -> Res
     reader.read_line(&mut line).await?;
     match serde_json::from_str(&line).with_context(|| format!("parse {operation} response"))? {
         IpcResponse::Ack => Ok(()),
+        IpcResponse::Acknowledged { .. } => bail!("unexpected count response to {operation}"),
         IpcResponse::Error { message } => bail!("daemon error: {message}"),
         IpcResponse::Snapshot { .. } => bail!("unexpected snapshot response to {operation}"),
     }
@@ -152,6 +171,7 @@ fn parse_response(line: &str) -> Result<Snapshot> {
     match serde_json::from_str(line).context("parse daemon response")? {
         IpcResponse::Snapshot { snapshot } => Ok(snapshot),
         IpcResponse::Ack => bail!("unexpected daemon acknowledgement"),
+        IpcResponse::Acknowledged { .. } => bail!("unexpected daemon count response"),
         IpcResponse::Error { message } => bail!("daemon error: {message}"),
     }
 }

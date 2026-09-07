@@ -4,7 +4,7 @@ use crate::model::{
     AgentOrigin, AgentRecord, AgentState, Attention, GoalInfo, GoalState, Snapshot, terminal_safe,
     trim_braille_activity_prefix,
 };
-use crate::tmux::{Tmux, is_focus_target_missing};
+use crate::tmux::{FocusOutcome, Tmux, is_focus_target_missing};
 use anyhow::{Context, Result};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
@@ -304,6 +304,7 @@ impl UiMessage {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct AgentListState {
     searching: bool,
+    confirming_quit: bool,
     query: String,
     selected_id: Option<String>,
     selected_position: usize,
@@ -478,6 +479,7 @@ enum ListAction {
     Close,
     Activate,
     ActivateShortcut(usize),
+    MarkAllRead,
     SyncSharedSelection,
     Refresh,
 }
@@ -495,6 +497,19 @@ fn shortcut_slot(character: char) -> Option<usize> {
 fn handle_list_key(key: KeyEvent, list: &mut AgentListState, agents: &[AgentRecord]) -> ListAction {
     if key.code == KeyCode::F(UI_SELECTION_WAKE_KEY) {
         return ListAction::SyncSharedSelection;
+    }
+    if list.confirming_quit {
+        list.confirming_quit = false;
+        return match key.code {
+            KeyCode::Char('y' | 'Y')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                ListAction::Close
+            }
+            _ => ListAction::None,
+        };
     }
     let action = if list.searching {
         match key.code {
@@ -517,7 +532,8 @@ fn handle_list_key(key: KeyEvent, list: &mut AgentListState, agents: &[AgentReco
         ListAction::None
     } else {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return ListAction::Close,
+            KeyCode::Char('q') => list.confirming_quit = true,
+            KeyCode::Esc => return ListAction::Close,
             KeyCode::Char('j') | KeyCode::Down => list.move_selection(agents, 1),
             KeyCode::Char('k') | KeyCode::Up => list.move_selection(agents, -1),
             KeyCode::Char('g') | KeyCode::Home => list.select_visible(agents, 0),
@@ -525,6 +541,7 @@ fn handle_list_key(key: KeyEvent, list: &mut AgentListState, agents: &[AgentReco
                 list.select_visible(agents, list.visible_indices(agents).len().saturating_sub(1));
             }
             KeyCode::Enter => return ListAction::Activate,
+            KeyCode::Char('a') => return ListAction::MarkAllRead,
             KeyCode::Char('r') => return ListAction::Refresh,
             KeyCode::Char('/') => list.enter_search(),
             KeyCode::Char(character)
@@ -722,6 +739,10 @@ async fn run_loop(
                                 }
                             };
                             pending_shared_selection = Some(agent_id);
+                        }
+                        ListAction::MarkAllRead => {
+                            mark_all_read(paths, &mut message).await;
+                            schedule.view_changed();
                         }
                         ListAction::Refresh => {
                             let (next_watch, next_snapshot) =
@@ -1015,8 +1036,13 @@ async fn activate_record(
     }
     let focus_record = &record;
     if focus_record.is_tmux() || focus_record.remote_alias.is_some() {
-        return match context.tmux.focus_agent(focus_record) {
-            Ok(()) => {
+        return match crate::focus::activate(context.tmux, context.config, snapshot, focus_record)
+            .await
+        {
+            Ok(crate::focus::FocusReport {
+                outcome: FocusOutcome::Exact,
+                ..
+            }) => {
                 // Usage ordering is optional metadata. A successful focus must
                 // remain successful when an older daemon cannot record it.
                 let _ = ipc::mark_used(&context.paths.socket, &record.id).await;
@@ -1028,6 +1054,19 @@ async fn activate_record(
                 }
                 message.set_transient(
                     format!("focused {}", focus_record.location()),
+                    Instant::now(),
+                );
+                Ok(Activation::Completed)
+            }
+            Ok(crate::focus::FocusReport {
+                outcome: FocusOutcome::TransportOnly,
+                notice,
+            }) => {
+                if activation_requires_acknowledgement(focus_record) {
+                    acknowledge_record(context.paths, snapshot, &record.id).await?;
+                }
+                message.set_transient(
+                    format!("{notice} ({})", focus_record.location()),
                     Instant::now(),
                 );
                 Ok(Activation::Completed)
@@ -1149,6 +1188,15 @@ async fn acknowledge_record(
     ipc::acknowledge(&paths.socket, record_id).await?;
     *snapshot = ipc::snapshot(&paths.socket, false).await?;
     Ok(())
+}
+
+async fn mark_all_read(paths: &RuntimePaths, message: &mut UiMessage) {
+    let text = match ipc::mark_all_read(&paths.socket).await {
+        Ok(0) => "no unread completions".to_string(),
+        Ok(count) => format!("marked {count} read"),
+        Err(error) => format!("{error:#}"),
+    };
+    message.set_transient(text, Instant::now());
 }
 
 #[cfg(test)]
@@ -1514,12 +1562,14 @@ fn render_agent_list(
         }
         frame.render_widget(Paragraph::new(Line::from(peers)), chunks[2]);
     }
-    let footer = if !message.is_empty() {
+    let footer = if list.confirming_quit {
+        "Quit tmux-agent? [y/N]".to_string()
+    } else if !message.is_empty() {
         terminal_safe(message)
     } else if list.searching {
         "↑/↓ move  enter focus/view  backspace edit  esc clear".to_string()
     } else {
-        "j/k move  / search  enter focus/view  r refresh  q close".to_string()
+        "j/k move  / search  enter focus/view  a mark all read  r refresh  q close".to_string()
     };
     frame.render_widget(
         Paragraph::new(truncate(
@@ -1781,9 +1831,10 @@ fn display_title(agent: &AgentRecord) -> String {
     } else {
         None
     };
-    let title = stable_grok_title.unwrap_or_else(|| trim_braille_activity_prefix(&agent.title));
+    let title =
+        stable_grok_title.unwrap_or_else(|| trim_provider_title(&agent.agent, &agent.title));
     let title = if title.is_empty() {
-        trim_braille_activity_prefix(&agent.window_name)
+        trim_provider_title(&agent.agent, &agent.window_name)
     } else {
         title
     };
@@ -1797,6 +1848,21 @@ fn display_title(agent: &AgentRecord) -> String {
         (false, _) => title.to_string(),
         (true, Some(label)) => label.to_string(),
         (true, None) => String::new(),
+    }
+}
+
+fn trim_provider_title<'a>(agent: &str, value: &'a str) -> &'a str {
+    let title = trim_braille_activity_prefix(value);
+    if !agent.eq_ignore_ascii_case("claude") {
+        return title;
+    }
+    let Some(remainder) = title.strip_prefix('✳') else {
+        return title;
+    };
+    match remainder.chars().next() {
+        None => "",
+        Some(character) if character.is_whitespace() => remainder.trim(),
+        Some(_) => title,
     }
 }
 
@@ -1861,6 +1927,7 @@ mod tests {
             terminal: (origin == AgentOrigin::Terminal).then(|| "ttys005".into()),
             remote_alias: None,
             ssh_connection: None,
+            session_connections: None,
             focus_target: None,
             goal: None,
             subagent: None,
@@ -1995,8 +2062,35 @@ mod tests {
             .unwrap();
         assert_eq!(
             row_text(&terminal, footer_row),
-            "j/k move  / search  enter focus/view  r refresh  q close"
+            "j/k move  / search  enter focus/view  a mark all read  r refresh  q close"
         );
+    }
+
+    #[test]
+    fn quit_confirmation_replaces_the_footer_message() {
+        let snapshot = Snapshot::default();
+        let list = AgentListState {
+            confirming_quit: true,
+            ..AgentListState::default()
+        };
+        let area = Rect::new(0, 0, 80, 10);
+        let footer_row = ui_layout(area, false)[3].y;
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_agent_list(
+                    frame,
+                    &snapshot,
+                    &list,
+                    "refreshed",
+                    0,
+                    snapshot.generated_at_ms,
+                )
+            })
+            .unwrap();
+
+        assert_eq!(row_text(&terminal, footer_row), "Quit tmux-agent? [y/N]");
     }
 
     #[test]
@@ -2461,6 +2555,20 @@ mod tests {
     }
 
     #[test]
+    fn display_title_removes_claude_status_glyphs() {
+        let mut agent = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        agent.title = "✳ Startup website section animations".into();
+        assert_eq!(display_title(&agent), "Startup website section animations");
+
+        agent.attention = Attention::Working;
+        agent.title = "⠦ Startup website section animations".into();
+        assert_eq!(display_title(&agent), "Startup website section animations");
+
+        agent.title = "✳art direction".into();
+        assert_eq!(display_title(&agent), "✳art direction");
+    }
+
+    #[test]
     fn display_title_keeps_grok_working_directory_stable() {
         let mut agent = test_agent("Grok", Attention::Working, AgentOrigin::Tmux);
         agent.cwd = "/work/sample-project".into();
@@ -2567,8 +2675,19 @@ mod tests {
                 &mut list,
                 &agents,
             ),
-            ListAction::Close
+            ListAction::None
         );
+        assert!(list.confirming_quit);
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::None
+        );
+        assert!(!list.confirming_quit);
+        assert!(!list.searching);
         assert_eq!(
             handle_list_key(
                 KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
@@ -2579,7 +2698,7 @@ mod tests {
         );
         assert!(list.searching);
 
-        for character in ['j', 'k', 'r', 'q'] {
+        for character in ['a', 'j', 'k', 'r', 'q'] {
             assert_eq!(
                 handle_list_key(
                     KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
@@ -2589,7 +2708,7 @@ mod tests {
                 ListAction::None
             );
         }
-        assert_eq!(list.query, "jkrq");
+        assert_eq!(list.query, "ajkrq");
 
         assert_eq!(
             handle_list_key(
@@ -2601,6 +2720,137 @@ mod tests {
         );
         assert!(!list.searching);
         assert!(list.query.is_empty());
+    }
+
+    #[test]
+    fn quit_confirmation_only_accepts_y() {
+        let agents = vec![test_agent("Codex", Attention::Working, AgentOrigin::Tmux)];
+
+        for confirmation in ['y', 'Y'] {
+            let mut list = AgentListState::default();
+            assert_eq!(
+                handle_list_key(
+                    KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                    &mut list,
+                    &agents,
+                ),
+                ListAction::None
+            );
+            assert!(list.confirming_quit);
+            assert_eq!(
+                handle_list_key(
+                    KeyEvent::new(KeyCode::Char(confirmation), KeyModifiers::NONE),
+                    &mut list,
+                    &agents,
+                ),
+                ListAction::Close
+            );
+        }
+    }
+
+    #[test]
+    fn quit_confirmation_cancels_without_running_the_key_action() {
+        let agents = vec![
+            test_agent("Codex", Attention::Working, AgentOrigin::Tmux),
+            test_agent("Claude", Attention::Idle, AgentOrigin::Tmux),
+        ];
+
+        for key in [
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('q'),
+            KeyCode::Char('r'),
+            KeyCode::Char('/'),
+            KeyCode::Down,
+        ] {
+            let mut list = AgentListState::default();
+            list.reconcile_selection(&agents);
+            let selected = list.selected_id.clone();
+            assert_eq!(
+                handle_list_key(
+                    KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                    &mut list,
+                    &agents,
+                ),
+                ListAction::None
+            );
+            assert_eq!(
+                handle_list_key(KeyEvent::new(key, KeyModifiers::NONE), &mut list, &agents),
+                ListAction::None
+            );
+            assert!(!list.confirming_quit, "key {key:?}");
+            assert!(!list.searching, "key {key:?}");
+            assert_eq!(list.selected_id, selected, "key {key:?}");
+        }
+    }
+
+    #[test]
+    fn a_requests_mark_all_read_only_outside_search() {
+        let agents = vec![test_agent("Codex", Attention::Done, AgentOrigin::Tmux)];
+        let mut list = AgentListState::default();
+        list.reconcile_selection(&agents);
+        let selected = list.selected_id.clone();
+
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::MarkAllRead
+        );
+        assert_eq!(list.selected_id, selected);
+
+        list.enter_search();
+        assert_eq!(
+            handle_list_key(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &mut list,
+                &agents,
+            ),
+            ListAction::None
+        );
+        assert_eq!(list.query, "a");
+    }
+
+    #[tokio::test]
+    async fn mark_all_read_reports_the_marked_count_or_an_empty_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths {
+            socket: directory.path().join("daemon.sock"),
+            runners: directory.path().join("runners"),
+            state: directory.path().join("state.json"),
+            acknowledgements: directory.path().join("acknowledged.json"),
+            log: directory.path().join("daemon.log"),
+        };
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let server = tokio::spawn(async move {
+            for count in [3, 0] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                assert!(matches!(
+                    serde_json::from_str(&line).unwrap(),
+                    crate::model::IpcRequest::MarkAllRead
+                ));
+                let mut response =
+                    serde_json::to_vec(&crate::model::IpcResponse::Acknowledged { count }).unwrap();
+                response.push(b'\n');
+                writer.write_all(&response).await.unwrap();
+            }
+        });
+        let mut message = UiMessage::default();
+
+        mark_all_read(&paths, &mut message).await;
+        assert_eq!(message.text(), "marked 3 read");
+
+        mark_all_read(&paths, &mut message).await;
+        assert_eq!(message.text(), "no unread completions");
+        server.await.unwrap();
     }
 
     #[test]
@@ -2643,6 +2893,7 @@ mod tests {
         let agents = vec![test_agent("Codex", Attention::Working, AgentOrigin::Tmux)];
         let mut list = AgentListState::default();
         list.reconcile_selection(&agents);
+        list.confirming_quit = true;
 
         assert_eq!(
             handle_list_key(
@@ -2652,6 +2903,7 @@ mod tests {
             ),
             ListAction::SyncSharedSelection
         );
+        assert!(list.confirming_quit);
     }
 
     #[test]
@@ -3539,18 +3791,238 @@ mod tests {
     }
 
     #[test]
-    fn successful_focus_remains_completed_when_mark_used_is_unsupported() {
-        const CHILD_ENV: &str = "TMUX_AGENT_ACTIVATION_TEST_CHILD";
+    fn transport_only_activation_reports_partial_focus_in_persistent_and_popup_ui() {
+        const CHILD_ENV: &str = "TMUX_AGENT_TRANSPORT_ONLY_UI_TEST_CHILD";
         if std::env::var_os(CHILD_ENV).is_some() {
             let runtime = tokio::runtime::Runtime::new().unwrap();
-            runtime.block_on(successful_focus_with_unsupported_mark_used_child());
+            runtime.block_on(async {
+                for popup in [false, true] {
+                    for (session, precomputed) in [
+                        ("other-session", false),
+                        ("selected-session", false),
+                        ("selected-session", true),
+                    ] {
+                        transport_only_activation_child(popup, session, precomputed).await;
+                    }
+                }
+            });
             return;
         }
 
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "ui::tests::successful_focus_remains_completed_when_mark_used_is_unsupported",
+                "ui::tests::transport_only_activation_reports_partial_focus_in_persistent_and_popup_ui",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+    }
+
+    async fn transport_only_activation_child(popup: bool, session: &str, precomputed: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket_name = format!(
+            "tmux-agent-ui-transport-only-{}-{nonce}",
+            std::process::id()
+        );
+        let config = Config {
+            tmux_args: vec!["-L".into(), socket_name.clone()],
+            ..Config::default()
+        };
+        let paths = RuntimePaths {
+            socket: directory.path().join("daemon.sock"),
+            runners: directory.path().join("runners"),
+            state: directory.path().join("state.json"),
+            acknowledgements: directory.path().join("acknowledged.json"),
+            log: directory.path().join("daemon.log"),
+        };
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let started = Command::new("tmux")
+            .args([
+                "-L",
+                &socket_name,
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "local",
+                "sleep 30",
+            ])
+            .status()
+            .unwrap();
+        assert!(started.success());
+        let pane = Command::new("tmux")
+            .args([
+                "-L",
+                &socket_name,
+                "display-message",
+                "-p",
+                "-t",
+                "local",
+                "#{pane_id}",
+            ])
+            .output()
+            .unwrap();
+        assert!(pane.status.success());
+        let pane_id = String::from_utf8(pane.stdout).unwrap().trim().to_string();
+        for (option, value) in [
+            ("@tmux_agent_remote_host", "remote-mac"),
+            ("@tmux_agent_remote_session", session),
+        ] {
+            let marked = Command::new("tmux")
+                .args([
+                    "-L",
+                    &socket_name,
+                    "set-option",
+                    "-p",
+                    "-t",
+                    &pane_id,
+                    option,
+                    value,
+                ])
+                .status()
+                .unwrap();
+            assert!(marked.success());
+        }
+
+        let mut remote = test_agent("Codex", Attention::Done, AgentOrigin::Tmux);
+        remote.id = "remote/remote-mac/host/default/%1".into();
+        remote.remote_alias = Some("remote-mac".into());
+        remote.session_name = "selected-session".into();
+        remote.title = "selected-project".into();
+        remote.window_id = "@99999".into();
+        remote.pane_id = "%99999".into();
+        remote.goal = Some(GoalInfo {
+            state: GoalState::Achieved,
+            elapsed_seconds: 10,
+            achievement_pending: true,
+            achievement_observed_at_ms: 123_000,
+        });
+        if precomputed {
+            remote.focus_target = Some(crate::model::TmuxTarget {
+                session_name: "local".into(),
+                window_id: "@0".into(),
+                window_index: 0,
+                pane_id,
+                pane_index: 0,
+            });
+        }
+        let expected_id = remote.id.clone();
+        let mut acknowledged_snapshot = Snapshot {
+            agents: vec![remote.clone()],
+            ..Snapshot::default()
+        };
+        acknowledged_snapshot.agents[0].attention = Attention::Idle;
+        acknowledged_snapshot.agents[0].seen = true;
+        acknowledged_snapshot.agents[0]
+            .goal
+            .as_mut()
+            .unwrap()
+            .achievement_pending = false;
+        let server = tokio::spawn(async move {
+            let mut marked = None;
+            let mut acknowledged = None;
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request = serde_json::from_str::<crate::model::IpcRequest>(&line).unwrap();
+                let (response, done) = match request {
+                    crate::model::IpcRequest::MarkUsed { target } => {
+                        marked = Some(target);
+                        (crate::model::IpcResponse::Ack, false)
+                    }
+                    crate::model::IpcRequest::Acknowledge { target } => {
+                        acknowledged = Some(target);
+                        (crate::model::IpcResponse::Ack, false)
+                    }
+                    crate::model::IpcRequest::Snapshot { .. } => (
+                        crate::model::IpcResponse::Snapshot {
+                            snapshot: acknowledged_snapshot.clone(),
+                        },
+                        true,
+                    ),
+                    request => panic!("unexpected request: {request:?}"),
+                };
+                let mut response = serde_json::to_vec(&response).unwrap();
+                response.push(b'\n');
+                writer.write_all(&response).await.unwrap();
+                if done {
+                    return (marked, acknowledged);
+                }
+            }
+        });
+        let tmux = Tmux::new(&config);
+        let mut snapshot = Snapshot {
+            agents: vec![remote],
+            ..Snapshot::default()
+        };
+        let context = ActivationContext {
+            paths: &paths,
+            tmux: &tmux,
+            config: &config,
+            config_path: Path::new("/tmp/tmux-agent-config.toml"),
+            exit_after_focus: popup,
+        };
+        let mut message = UiMessage::default();
+
+        let activation = activate_record(&context, &mut snapshot, 0, &mut message)
+            .await
+            .unwrap();
+        let (marked, acknowledged) = tokio::time::timeout(Duration::from_millis(500), server)
+            .await
+            .expect("activation should finish acknowledgement IPC")
+            .unwrap();
+
+        let _ = Command::new("tmux")
+            .args(["-L", &socket_name, "kill-server"])
+            .status();
+        assert_eq!(activation, Activation::Completed);
+        assert!(
+            marked.is_none(),
+            "transport-only focus must not record usage"
+        );
+        assert_eq!(acknowledged.as_deref(), Some(expected_id.as_str()));
+        assert!(message.text().contains("focused remote transport only"));
+        assert!(
+            message
+                .text()
+                .contains("inner target not selected or verified")
+        );
+        assert_eq!(snapshot.agents[0].attention, Attention::Idle);
+        assert!(snapshot.agents[0].seen);
+        assert!(!snapshot.agents[0].goal.unwrap().achievement_pending);
+        assert_eq!(
+            apply_activation_outcome(activation, &mut AgentListState::default(), &snapshot.agents),
+            None
+        );
+    }
+
+    #[test]
+    fn popup_exact_focus_closes_when_mark_used_is_unsupported() {
+        const CHILD_ENV: &str = "TMUX_AGENT_ACTIVATION_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(popup_exact_focus_with_unsupported_mark_used_child());
+            return;
+        }
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ui::tests::popup_exact_focus_closes_when_mark_used_is_unsupported",
                 "--nocapture",
             ])
             .env(CHILD_ENV, "1")
@@ -3561,7 +4033,7 @@ mod tests {
         assert!(status.success());
     }
 
-    async fn successful_focus_with_unsupported_mark_used_child() {
+    async fn popup_exact_focus_with_unsupported_mark_used_child() {
         let directory = tempfile::tempdir().unwrap();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3665,7 +4137,7 @@ mod tests {
             tmux: &tmux,
             config: &config,
             config_path: Path::new("/tmp/tmux-agent-config.toml"),
-            exit_after_focus: false,
+            exit_after_focus: true,
         };
         let mut message = UiMessage::default();
 
@@ -3677,7 +4149,7 @@ mod tests {
         let _ = Command::new("tmux")
             .args(["-L", &socket_name, "kill-server"])
             .status();
-        assert_eq!(activation, Activation::Completed);
+        assert_eq!(activation, Activation::Close);
         let (marked, acknowledged) = requests
             .expect("successful focus should finish optional usage and acknowledgement IPC")
             .unwrap();

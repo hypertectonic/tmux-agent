@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Check before cargo, so a missing transport cannot become a skipped Rust test.
+for program in cargo docker tmux mosh-client mosh-server lsof python3 timeout; do
+    command -v "$program" >/dev/null 2>&1 || {
+        printf 'transport/UI gate requires %s\n' "$program" >&2
+        exit 1
+    }
+done
+[[ $(uname -s) == Linux ]] || {
+    printf '%s\n' 'transport/UI gate requires a Linux host' >&2
+    exit 1
+}
+docker info >/dev/null 2>&1 || {
+    printf '%s\n' 'transport/UI gate requires a running Docker daemon' >&2
+    exit 1
+}
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
+binary="$root/target/debug/tmux-agent"
+baseline=0
+if (($# != 0)); then
+    [[ $# == 2 && $1 == --binary ]] || {
+        printf 'usage: %s [--binary /absolute/native-linux-binary]\n' "$0" >&2
+        exit 2
+    }
+    binary=$2
+    [[ $binary == /* && -x $binary ]] || {
+        printf '%s\n' '--binary requires an absolute executable path' >&2
+        exit 2
+    }
+    baseline=1
+fi
+
+test_root=$(mktemp -d /tmp/tmux-agent-transport-ui.XXXXXX)
+container="tmux-agent-transport-ui-${test_root##*.}"
+cleanup() {
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    while IFS= read -r -d '' socket; do
+        tmux -S "$socket" kill-server 2>/dev/null || true
+    done < <(find "$test_root" -type s -path '*/tmux-[0-9]*/*' -print0)
+    find "$test_root" -depth -delete
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+mkdir -p "$test_root/tmux" "$test_root/runtime" "$test_root/state"
+
+cd "$root"
+if ((baseline == 0)); then
+    cargo build --locked
+fi
+docker build --tag tmux-agent-transport-ui:test "$root/tests/transport-ui"
+timeout --kill-after=10s 240s docker run --rm --name "$container" \
+    --network none \
+    --mount "type=bind,src=$binary,dst=/opt/tmux-agent,readonly" \
+    --mount "type=bind,src=$root/tests/transport-ui,dst=/opt/fixture,readonly" \
+    tmux-agent-transport-ui:test
+
+if ((baseline == 1)); then
+    printf '%s\n' 'PASS supplied-binary UI scenarios only; this is not the full source gate'
+    exit 0
+fi
+for test in \
+    focus::tests::real_mosh_inner_selection_validates_lifetime_session_client_and_target \
+    tmux::tests::live_mosh_attachments_focus_hidden_windows_and_follow_session_switches \
+    ui::tests::unavailable_remote_focus_acknowledges_pending_goal_on_activation \
+    ui::tests::transport_only_activation_reports_partial_focus_in_persistent_and_popup_ui; do
+    output="$test_root/rust-test.log"
+    if ! env -u TMUX -u TMUX_PANE \
+        TMPDIR="$test_root" TMUX_TMPDIR="$test_root/tmux" XDG_RUNTIME_DIR="$test_root/runtime" \
+        XDG_STATE_HOME="$test_root/state" \
+        timeout --kill-after=5s 120s cargo test --quiet --locked "$test" \
+        -- --exact --nocapture >"$output" 2>&1; then
+        sed -n '1,180p' "$output" >&2
+        exit 1
+    fi
+    if ! grep -q 'test result: ok. 1 passed; 0 failed' "$output" ||
+        grep -qi 'skipping' "$output"; then
+        printf 'named contract test did not execute: %s\n' "$test" >&2
+        sed -n '1,180p' "$output" >&2
+        exit 1
+    fi
+    printf 'PASS %s\n' "$test"
+done
+printf '%s\n' 'PASS mandatory transport/UI gate'

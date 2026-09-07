@@ -1,7 +1,7 @@
 use crate::config::{Config, shell_join};
 use crate::model::{
-    AgentRecord, SshConnection, SshTransport, TmuxTarget, terminal_safe,
-    trim_braille_activity_prefix,
+    AgentRecord, ClientConnection, MoshEndpoint, SessionConnections, SshConnection, SshTransport,
+    TmuxTarget, terminal_safe, trim_braille_activity_prefix,
 };
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
@@ -16,6 +16,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "linux")]
+mod linux_ssh;
 
 const SEPARATOR: char = '\u{1f}';
 const ESCAPED_SEPARATOR: &str = r"\037";
@@ -99,6 +102,199 @@ pub struct RemotePaneBinding {
     pub session: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusOutcome {
+    Exact,
+    TransportOnly,
+}
+
+pub struct FocusPlan {
+    pub target: TmuxTarget,
+    pub outcome: FocusOutcome,
+    pub transport: Option<SshTransport>,
+}
+
+/// One activation's tmux server and invoking client, captured before selection.
+pub struct FocusContext {
+    pub tmux: Tmux,
+    server_identity: String,
+    client: FocusClient,
+}
+
+enum FocusClient {
+    OutsideTmux,
+    Attached(LocalClient),
+    Unavailable,
+}
+
+#[derive(PartialEq, Eq)]
+struct LocalClient {
+    name: String,
+    pid: u32,
+    created: u64,
+}
+
+impl LocalClient {
+    fn parse(fields: &[&str]) -> Option<Self> {
+        let [name, pid, created] = fields else {
+            return None;
+        };
+        if name.is_empty() {
+            return None;
+        }
+        Some(Self {
+            name: (*name).into(),
+            pid: pid.parse().ok()?,
+            created: created.parse().ok()?,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct FocusLocation {
+    session_id: String,
+    window_id: String,
+    pane_id: String,
+}
+
+impl FocusLocation {
+    fn parse(fields: &[&str]) -> Option<Self> {
+        let [session_id, window_id, pane_id] = fields else {
+            return None;
+        };
+        Some(Self {
+            session_id: (*session_id).into(),
+            window_id: (*window_id).into(),
+            pane_id: (*pane_id).into(),
+        })
+    }
+}
+
+impl FocusContext {
+    pub fn select(&self, target: &TmuxTarget) -> Result<FocusLocation> {
+        self.verify_server()?;
+        let pane = self
+            .tmux
+            .list_panes()?
+            .into_iter()
+            .find(|pane| {
+                pane.session_name == target.session_name
+                    && pane.window_id == target.window_id
+                    && pane.pane_id == target.pane_id
+                    && !pane.dead
+            })
+            .context("local focus target vanished or changed sessions")?;
+        let location = FocusLocation {
+            session_id: pane.session_id,
+            window_id: pane.window_id,
+            pane_id: pane.pane_id,
+        };
+        if matches!(self.client, FocusClient::Unavailable) {
+            bail!("no initiating tmux client is attached");
+        }
+        if let FocusClient::Attached(client) = &self.client {
+            self.current_client()?;
+            let server = format!("#{{==:#{{pid}} #{{start_time}},{}}}", self.server_identity);
+            let pid = format!("#{{==:#{{client_pid}},{}}}", client.pid);
+            let created = format!("#{{==:#{{client_created}},{}}}", client.created);
+            let shared_pane = "#{==:#{m:*active-pane*,#{client_flags}},0}";
+            let guard = format!("#{{&&:{server},#{{&&:{pid},#{{&&:{created},{shared_pane}}}}}}}");
+            let target = format!(
+                "{}:{}.{}",
+                location.session_id, location.window_id, location.pane_id
+            );
+            let selection = shell_join(&[
+                "switch-client".into(),
+                "-c".into(),
+                client.name.clone(),
+                "-t".into(),
+                target,
+            ]);
+            // if-shell -F inserts its branch synchronously, without a shell or
+            // event-loop yield before switch-client. The latter selects the
+            // full numeric target in one command on tmux 3.2 and newer.
+            let output = self.tmux.run(&[
+                "if-shell",
+                "-F",
+                &guard,
+                &format!("{selection} ; display-message -p tmux-agent-focus-selected"),
+                "display-message -p tmux-agent-focus-client-changed",
+            ])?;
+            if output.trim() != "tmux-agent-focus-selected" {
+                bail!(
+                    "initiating tmux client or server changed before selection; refresh and retry"
+                );
+            }
+        } else {
+            self.tmux.status(&[
+                "select-window",
+                "-t",
+                &format!("{}:{}", location.session_id, location.window_id),
+            ])?;
+            self.tmux
+                .status(&["select-pane", "-t", &location.pane_id])?;
+        }
+        self.verify(&location)?;
+        Ok(location)
+    }
+
+    pub fn verify(&self, target: &FocusLocation) -> Result<()> {
+        self.verify_server()?;
+        let selected = if !matches!(self.client, FocusClient::OutsideTmux) {
+            self.current_client()?
+        } else {
+            // CLI calls outside tmux select a session's active window and pane.
+            let value = self.tmux.run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{}:", target.session_id),
+                "#{session_id}\t#{window_id}\t#{pane_id}",
+            ])?;
+            FocusLocation::parse(&value.trim().split('\t').collect::<Vec<_>>())
+                .context("local tmux selection unavailable")?
+        };
+        if selected != *target {
+            bail!("initiating tmux client changed selection during focus; refresh and retry");
+        }
+        Ok(())
+    }
+
+    fn verify_server(&self) -> Result<()> {
+        if self
+            .tmux
+            .run(&["display-message", "-p", "#{pid} #{start_time}"])?
+            .trim()
+            != self.server_identity
+        {
+            bail!("local tmux server changed during focus; refresh and retry");
+        }
+        Ok(())
+    }
+
+    fn current_client(&self) -> Result<FocusLocation> {
+        let FocusClient::Attached(client) = &self.client else {
+            bail!("no initiating tmux client is attached");
+        };
+        let output = self.tmux.run(&["list-clients", "-F", "#{client_name}\t#{client_pid}\t#{client_created}\t#{session_id}\t#{window_id}\t#{pane_id}\t#{client_flags}"])?;
+        let (location, flags) = output
+            .lines()
+            .find_map(|line| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                if fields.len() != 7 || LocalClient::parse(&fields[..3]).as_ref() != Some(client) {
+                    return None;
+                }
+                Some((FocusLocation::parse(&fields[3..6])?, fields[6]))
+            })
+            .context("initiating tmux client detached or was replaced during focus")?;
+        validate_focus_client_flags(flags)?;
+        Ok(location)
+    }
+}
+
+pub const TRANSPORT_ONLY_FOCUS_MESSAGE: &str =
+    "focused remote transport only; inner target not selected or verified";
+
 #[derive(Debug, Clone)]
 struct Process {
     uid: u32,
@@ -130,6 +326,7 @@ pub struct ProcessSnapshot {
     pub live_pids: HashSet<u32>,
     pub parent_pids: HashMap<u32, u32>,
     pub ssh_connections: HashMap<u32, SshConnection>,
+    pub client_connections: HashMap<u32, ClientConnection>,
     pub ssh_transports: Vec<SshTransport>,
 }
 
@@ -140,6 +337,7 @@ struct ProcessInventory {
     tcp_connections: HashMap<u32, Vec<TcpSocket>>,
     parent_pids: HashMap<u32, u32>,
     ssh_connections: HashMap<u32, SshConnection>,
+    client_connections: HashMap<u32, ClientConnection>,
 }
 
 #[derive(Debug)]
@@ -205,6 +403,7 @@ struct FocusTargetMissing {
     alias: String,
     title: String,
     session: Option<String>,
+    live_session: bool,
 }
 
 impl fmt::Display for FocusTargetMissing {
@@ -212,6 +411,12 @@ impl fmt::Display for FocusTargetMissing {
         if let Some(session) = &self.session {
             let alias = terminal_safe(&self.alias);
             let session = terminal_safe(session);
+            if self.live_session {
+                return write!(
+                    formatter,
+                    "no live local transport for {alias}/{session}; attach this remote session, then refresh. Translated or proxied endpoints may not support automatic association"
+                );
+            }
             return write!(
                 formatter,
                 "no local pane is bound to {}/{}; run tmux-agent remote bind {} {} --pane <local-pane-id> on this machine",
@@ -314,6 +519,77 @@ impl Tmux {
         self.process_snapshot_with(panes, Instant::now, || self.refresh_process_inventory())
     }
 
+    pub fn fresh_process_snapshot(&self, panes: &[Pane]) -> Result<ProcessSnapshot> {
+        Ok(self.project_process_snapshot(panes, &self.refresh_process_inventory()?))
+    }
+
+    pub fn live_focus_transport(&self, record: &AgentRecord) -> Result<Option<SshTransport>> {
+        let panes = self.list_panes()?;
+        let processes = self.fresh_process_snapshot(&panes)?;
+        match session_transports(record, &processes.ssh_transports).as_slice() {
+            [transport] => Ok(Some((*transport).clone())),
+            [] => Ok(None),
+            _ => bail!("multiple live local transports; detach duplicate clients, then refresh"),
+        }
+    }
+
+    pub fn session_connections(
+        &self,
+        processes: &ProcessSnapshot,
+    ) -> Result<HashMap<String, SessionConnections>> {
+        let format = [
+            "#{session_id}",
+            "#{session_created}",
+            "#{pid}",
+            "#{start_time}",
+        ]
+        .join(&SEPARATOR.to_string());
+        let sessions = self
+            .run_optional(&["list-sessions", "-F", &format])?
+            .unwrap_or_default();
+        let mut result = HashMap::new();
+        for line in sessions.lines() {
+            let line = line.replace(ESCAPED_SEPARATOR, &SEPARATOR.to_string());
+            let fields = line.split(SEPARATOR).collect::<Vec<_>>();
+            if let [id, created, pid, started] = fields.as_slice() {
+                result.insert(
+                    (*id).to_string(),
+                    SessionConnections {
+                        server_pid: parse_number(pid, "server pid")?,
+                        server_started_at: parse_number(started, "server start")?,
+                        session_created_at: parse_number(created, "session creation")?,
+                        complete: true,
+                        clients: Vec::new(),
+                    },
+                );
+            } else {
+                bail!("tmux did not report session attachment identity");
+            }
+        }
+        let format = ["#{session_id}", "#{client_pid}"].join(&SEPARATOR.to_string());
+        let clients = self
+            .run_optional(&["list-clients", "-F", &format])?
+            .unwrap_or_default();
+        for line in clients.lines() {
+            let line = line.replace(ESCAPED_SEPARATOR, &SEPARATOR.to_string());
+            let Some((session, pid)) = line.split_once(SEPARATOR) else {
+                bail!("tmux did not report client attachment identity");
+            };
+            let Some(session) = result.get_mut(session) else {
+                continue;
+            };
+            match pid
+                .parse()
+                .ok()
+                .and_then(|pid| processes.client_connections.get(&pid))
+            {
+                Some(connection) => session.clients.push(connection.clone()),
+                None => session.complete = false,
+            }
+        }
+        Ok(result)
+    }
+
     fn process_snapshot_with<N, F>(
         &self,
         panes: &[Pane],
@@ -352,6 +628,8 @@ impl Tmux {
     }
 
     fn refresh_process_inventory(&self) -> Result<ProcessInventory> {
+        #[cfg(target_os = "linux")]
+        let snapshot_before = linux_ssh::snapshot_cutoff();
         let output = Command::new("ps")
             .args(["-axww", "-o", PROCESS_COLUMNS])
             .output()
@@ -396,14 +674,71 @@ impl Tmux {
                     .map(|connection| (*pid, ssh_connection(&connection.right, &connection.left)))
             })
             .collect::<HashMap<_, _>>();
+        #[cfg(target_os = "linux")]
+        let sshd_connections = {
+            let mut connections = sshd_connections;
+            if connections.len() < sshd_pids.len() {
+                let clients = self
+                    .run_optional(&["list-clients", "-F", "#{client_pid}"])?
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|pid| pid.parse().ok())
+                    .collect::<Vec<_>>();
+                linux_ssh::recover_connections(
+                    Path::new("/proc"),
+                    &processes,
+                    &clients,
+                    snapshot_before,
+                    &mut connections,
+                );
+            }
+            connections
+        };
         let ssh_connections =
             unambiguous_ssh_connections(&processes, &parent_pids, &sshd_pids, &sshd_connections);
+        let mosh_pids = processes
+            .iter()
+            .filter(|process| program_name(&process.args) == Some("mosh-server"))
+            .map(|process| process.pid)
+            .collect::<HashSet<_>>();
+        let mosh_endpoints = if mosh_pids.is_empty() {
+            HashMap::new()
+        } else {
+            let pids = mosh_pids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            Command::new("lsof")
+                .args(["-nP", "-a", "-p", &pids, "-iUDP", "-Fpn"])
+                .output()
+                .ok()
+                .map(|output| parse_lsof_udp_endpoints(&output.stdout))
+                .unwrap_or_default()
+        };
+        let client_connections = processes
+            .iter()
+            .filter_map(|process| {
+                let connection =
+                    if let Some(pid) = find_ancestor(process.pid, &parent_pids, &mosh_pids) {
+                        ClientConnection::Mosh {
+                            endpoint: mosh_endpoints.get(&pid)?.clone(),
+                        }
+                    } else {
+                        ClientConnection::Ssh {
+                            connection: ssh_connections.get(&process.pid)?.clone(),
+                        }
+                    };
+                Some((process.pid, connection))
+            })
+            .collect();
         Ok(ProcessInventory {
             processes,
             process_started_at_ms,
             tcp_connections,
             parent_pids,
             ssh_connections,
+            client_connections,
         })
     }
 
@@ -457,6 +792,21 @@ impl Tmux {
                     &self.host_aliases,
                 ));
             }
+            for process in pane_pids
+                .get(&pane.pane_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|pid| processes.iter().find(|process| process.pid == *pid))
+            {
+                if let Some((host, endpoint)) = mosh_client_endpoint(&process.args) {
+                    found_ssh = true;
+                    let remote_host = pane.mirror_host.as_deref().unwrap_or(host);
+                    let mut transport =
+                        local_ssh_transport(pane, remote_host, None, &self.host_aliases);
+                    transport.mosh_endpoint = Some(endpoint);
+                    ssh_transports.push(transport);
+                }
+            }
             if !found_ssh && let Some(remote_host) = pane.mirror_host.as_deref() {
                 ssh_transports.push(local_ssh_transport(
                     pane,
@@ -491,6 +841,7 @@ impl Tmux {
             ),
             parent_pids: inventory.parent_pids.clone(),
             ssh_connections: inventory.ssh_connections.clone(),
+            client_connections: inventory.client_connections.clone(),
             ssh_transports,
         }
     }
@@ -570,30 +921,119 @@ impl Tmux {
             .unwrap_or_default()
     }
 
-    pub fn focus_agent(&self, record: &AgentRecord) -> Result<()> {
+    pub fn focus_context(&self) -> Result<FocusContext> {
+        let output = self.run_optional(&["display-message", "-p", "#{socket_path}"])?;
+        let socket = required_focus_socket(output.as_deref())?;
+        let mut tmux = self.clone();
+        tmux.args = vec!["-S".into(), socket.into()];
+        let server_identity = tmux
+            .run(&["display-message", "-p", "#{pid} #{start_time}"])?
+            .trim()
+            .to_string();
+        let client = if has_current_tmux_client(env::var_os("TMUX").as_deref()) {
+            // tmux chooses the current/most recently active client once here.
+            // Repeating that lookup after switch-client can select a spectator.
+            let value = tmux.run(&[
+                "display-message",
+                "-p",
+                "#{client_name}\t#{client_pid}\t#{client_created}",
+            ])?;
+            // Preserve missing-target acknowledgement when no client is attached.
+            // Selection still refuses this captured absence instead of guessing later.
+            LocalClient::parse(&value.trim().split('\t').collect::<Vec<_>>())
+                .map(FocusClient::Attached)
+                .unwrap_or(FocusClient::Unavailable)
+        } else {
+            FocusClient::OutsideTmux
+        };
+        Ok(FocusContext {
+            tmux,
+            server_identity,
+            client,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn focus_agent(&self, record: &AgentRecord) -> Result<FocusOutcome> {
+        let context = self.focus_context()?;
+        let plan = context.tmux.resolve_agent_focus(record)?;
+        context.select(&plan.target)?;
+        Ok(plan.outcome)
+    }
+
+    pub fn resolve_agent_focus(&self, record: &AgentRecord) -> Result<FocusPlan> {
+        let resolved = |target, outcome| FocusPlan {
+            target,
+            outcome,
+            transport: None,
+        };
         if let Some(alias) = &record.remote_alias {
+            if record.is_tmux()
+                && let Some(connections) = &record.session_connections
+            {
+                let panes = self.list_panes()?;
+                let processes = self.fresh_process_snapshot(&panes)?;
+                let transports = session_transports(record, &processes.ssh_transports);
+                let target = match transports.as_slice() {
+                    [transport] => transport.target.clone(),
+                    [] if !connections.complete => {
+                        let pane = find_mirror_pane(&panes, alias, &record.session_name)?
+                            .ok_or_else(|| FocusTargetMissing {
+                                alias: alias.clone(),
+                                title: record.title.clone(),
+                                session: Some(record.session_name.clone()),
+                                live_session: false,
+                            })?;
+                        local_ssh_transport(pane, alias, None, &self.host_aliases).target
+                    }
+                    [] => {
+                        return Err(FocusTargetMissing {
+                            alias: alias.clone(),
+                            title: record.title.clone(),
+                            session: Some(record.session_name.clone()),
+                            live_session: true,
+                        }
+                        .into());
+                    }
+                    _ => bail!(
+                        "multiple live local transports for {alias}/{}; detach duplicate clients, then refresh",
+                        record.session_name
+                    ),
+                };
+                return Ok(FocusPlan {
+                    target,
+                    outcome: FocusOutcome::TransportOnly,
+                    transport: transports.first().map(|transport| (*transport).clone()),
+                });
+            }
             if let Some(target) = &record.focus_target {
-                return self.focus_location(
-                    &target.session_name,
-                    &target.window_id,
-                    &target.pane_id,
-                );
+                return Ok(resolved(
+                    target.clone(),
+                    if record.is_tmux() {
+                        FocusOutcome::TransportOnly
+                    } else {
+                        FocusOutcome::Exact
+                    },
+                ));
             }
             if record.is_tmux() {
-                if let Some(mirror) = self.find_or_repair_mirror(alias, record)? {
-                    return self.focus_location(
-                        &mirror.session_name,
-                        &mirror.window_id,
-                        &mirror.pane_id,
-                    );
+                if let Some((mirror, outcome)) = self.find_or_repair_mirror(alias, record)? {
+                    return Ok(resolved(pane_target(&mirror), outcome));
+                }
+                if let Some(transport) = self.find_bound_host_transport(alias)? {
+                    return Ok(resolved(
+                        pane_target(&transport),
+                        FocusOutcome::TransportOnly,
+                    ));
                 }
             } else if let Some(pane) = self.find_transport_pane(alias, &record.title)? {
-                return self.focus_location(&pane.session_name, &pane.window_id, &pane.pane_id);
+                return Ok(resolved(pane_target(&pane), FocusOutcome::Exact));
             }
             return Err(FocusTargetMissing {
                 alias: alias.clone(),
                 title: record.title.clone(),
                 session: record.is_tmux().then(|| record.session_name.clone()),
+                live_session: false,
             }
             .into());
         }
@@ -603,17 +1043,26 @@ impl Tmux {
                 record.location()
             );
         }
-        self.focus_location(&record.session_name, &record.window_id, &record.pane_id)
+        Ok(resolved(
+            TmuxTarget {
+                session_name: record.session_name.clone(),
+                window_id: record.window_id.clone(),
+                window_index: record.window_index,
+                pane_id: record.pane_id.clone(),
+                pane_index: record.pane_index,
+            },
+            FocusOutcome::Exact,
+        ))
     }
 
     fn find_or_repair_mirror(
         &self,
         remote_alias: &str,
         record: &AgentRecord,
-    ) -> Result<Option<Pane>> {
+    ) -> Result<Option<(Pane, FocusOutcome)>> {
         let panes = self.list_panes()?;
         if let Some(pane) = find_mirror_pane(&panes, remote_alias, &record.session_name)? {
-            return Ok(Some(pane.clone()));
+            return Ok(Some((pane.clone(), FocusOutcome::TransportOnly)));
         }
         let Some(pane) =
             find_stale_mirror_pane(&panes, remote_alias, &record.session_name, &record.title)
@@ -622,13 +1071,16 @@ impl Tmux {
             if let Some(pane) =
                 find_running_mosh_mirror(&panes, &processes.panes, remote_alias, &record.title)?
             {
-                return Ok(Some(self.mark_remote_mirror(
-                    pane,
-                    remote_alias,
-                    &record.session_name,
-                )?));
+                return Ok(Some((
+                    self.mark_remote_mirror(pane, remote_alias, &record.session_name)?,
+                    FocusOutcome::TransportOnly,
+                )));
             }
-            return self.recover_detached_mirror(&panes, &processes.panes, remote_alias, record);
+            // Detached recovery selects the remote target and verifies attachment.
+            // Finding or repairing an existing binding only locates its transport.
+            return Ok(self
+                .recover_detached_mirror(&panes, &processes.panes, remote_alias, record)?
+                .map(|pane| (pane, FocusOutcome::Exact)));
         };
         self.status(&[
             "set-option",
@@ -640,7 +1092,7 @@ impl Tmux {
         ])?;
         let mut repaired = pane.clone();
         repaired.mirror_session = Some(record.session_name.clone());
-        Ok(Some(repaired))
+        Ok(Some((repaired, FocusOutcome::TransportOnly)))
     }
 
     fn recover_detached_mirror(
@@ -750,6 +1202,10 @@ impl Tmux {
         let panes = self.list_panes()?;
         let processes = self.process_snapshot(&panes)?;
         Ok(find_transport_pane(&panes, &processes.panes, remote_alias, title)?.cloned())
+    }
+
+    fn find_bound_host_transport(&self, remote_alias: &str) -> Result<Option<Pane>> {
+        Ok(find_bound_host_transport(&self.list_panes()?, remote_alias)?.cloned())
     }
 
     pub fn set_ui_marker(&self, pane_id: &str, enabled: bool) -> Result<()> {
@@ -871,16 +1327,7 @@ impl Tmux {
         self.status(&["display-popup", "-E", "-w", "85%", "-h", "80%", command])
     }
 
-    pub fn focus_location(&self, session: &str, window: &str, pane: &str) -> Result<()> {
-        if has_current_tmux_client(std::env::var_os("TMUX").as_deref()) {
-            self.status(&["switch-client", "-t", session])?;
-        }
-        self.status(&["select-window", "-t", window])?;
-        self.status(&["select-pane", "-t", pane])?;
-        Ok(())
-    }
-
-    fn run(&self, command_args: &[&str]) -> Result<String> {
+    pub(crate) fn run(&self, command_args: &[&str]) -> Result<String> {
         let mut command = Command::new("tmux");
         command.args(&self.args).args(command_args);
         let output = command
@@ -911,6 +1358,34 @@ impl Tmux {
 
     fn status(&self, command_args: &[&str]) -> Result<()> {
         self.run(command_args).map(|_| ())
+    }
+}
+
+pub(crate) fn validate_focus_client_flags(flags: &str) -> Result<()> {
+    if flags.split(',').any(|flag| flag == "active-pane") {
+        // list-clients reports the window's active pane, not this mode's
+        // independent input pane. Do not claim that selection was verified.
+        bail!(
+            "focus cannot verify tmux active-pane clients; use shared-pane mode or focus manually"
+        );
+    }
+    Ok(())
+}
+
+fn required_focus_socket(output: Option<&str>) -> Result<&str> {
+    output
+        .map(str::trim)
+        .filter(|socket| !socket.is_empty())
+        .context("local tmux socket path is unavailable; cannot pin focus server")
+}
+
+fn pane_target(pane: &Pane) -> TmuxTarget {
+    TmuxTarget {
+        session_name: pane.session_name.clone(),
+        window_id: pane.window_id.clone(),
+        window_index: pane.window_index,
+        pane_id: pane.pane_id.clone(),
+        pane_index: pane.pane_index,
     }
 }
 
@@ -986,19 +1461,14 @@ fn local_ssh_transport(
 ) -> SshTransport {
     SshTransport {
         connection,
+        mosh_endpoint: None,
         remote_host: resolved_host_alias(aliases, remote_host),
         remote_host_explicit: pane.mirror_host.is_some(),
         remote_session: pane.mirror_session.clone(),
         title: normalize_transport_title(&pane.title),
         label: pane.label.clone(),
         visible: pane.visible,
-        target: TmuxTarget {
-            session_name: pane.session_name.clone(),
-            window_id: pane.window_id.clone(),
-            window_index: pane.window_index,
-            pane_id: pane.pane_id.clone(),
-            pane_index: pane.pane_index,
-        },
+        target: pane_target(pane),
     }
 }
 
@@ -1442,6 +1912,139 @@ fn parse_lsof_tcp_connections(output: &[u8]) -> HashMap<u32, Vec<TcpSocket>> {
     result
 }
 
+fn parse_lsof_udp_endpoints(output: &[u8]) -> HashMap<u32, MoshEndpoint> {
+    let mut candidates = HashMap::<u32, Vec<MoshEndpoint>>::new();
+    let mut pid = None;
+    for line in String::from_utf8_lossy(output).lines() {
+        if let Some(value) = line.strip_prefix('p') {
+            pid = value.parse().ok();
+        } else if let (Some(pid), Some(value)) = (pid, line.strip_prefix('n'))
+            && let Some(endpoint) = parse_tcp_endpoint(value.split("->").next().unwrap_or(value))
+        {
+            let endpoint = MoshEndpoint {
+                address: endpoint.address,
+                port: endpoint.port,
+            };
+            let values = candidates.entry(pid).or_default();
+            if !values.contains(&endpoint) {
+                values.push(endpoint);
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(pid, values)| match values.as_slice() {
+            [endpoint] => Some((pid, endpoint.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn mosh_client_endpoint(command: &str) -> Option<(&str, MoshEndpoint)> {
+    let destination = mosh_destination_for_command(command);
+    if !is_mosh_client(&command.split_whitespace().collect::<Vec<_>>()) {
+        return None;
+    }
+    let (_, endpoint) = command.rsplit_once(" | ")?;
+    let fields = endpoint.split_whitespace().collect::<Vec<_>>();
+    let [address, port] = fields.as_slice() else {
+        return None;
+    };
+    let address = address.parse::<std::net::IpAddr>().ok()?.to_string();
+    let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
+    Some((
+        destination.unwrap_or(fields[0]),
+        MoshEndpoint { address, port },
+    ))
+}
+
+fn is_mosh_client(fields: &[&str]) -> bool {
+    let Some(executable) = fields.first() else {
+        return false;
+    };
+    if executable.rsplit('/').next() == Some("mosh-client") {
+        return true;
+    }
+    let Some(separator) = fields.iter().position(|field| *field == "|") else {
+        return false;
+    };
+    if fields.get(1) != Some(&"-#") || separator < 2 || fields.len() != separator + 3 {
+        return false;
+    }
+    // Mosh preserves its original --client option in the -# process title.
+    // Check its exact executable independently of host parsing: embedded SSH
+    // arguments lose their quoting in this title. Never inspect a remote command.
+    let options = &fields[2..separator];
+    let mut declared_client = None;
+    for (index, field) in options
+        .iter()
+        .take_while(|field| **field != "--")
+        .enumerate()
+    {
+        if *field == "--client" {
+            declared_client = options.get(index + 1).copied();
+        } else if let Some(client) = field.strip_prefix("--client=") {
+            declared_client = Some(client);
+        }
+    }
+    declared_client == Some(*executable)
+        && fields[separator + 1].parse::<std::net::IpAddr>().is_ok()
+        && fields[separator + 2]
+            .parse::<u16>()
+            .is_ok_and(|port| port != 0)
+}
+
+fn same_address(left: &str, right: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|address| match address {
+                std::net::IpAddr::V6(address) => address
+                    .to_ipv4_mapped()
+                    .map(std::net::IpAddr::V4)
+                    .unwrap_or(std::net::IpAddr::V6(address)),
+                address => address,
+            })
+    };
+    normalize(left)
+        .zip(normalize(right))
+        .is_some_and(|(left, right)| left == right)
+}
+
+/// Resolve only current attachment evidence. Callers decide whether unavailable
+/// inspection permits an explicit binding; authoritative absence never does.
+pub fn session_transports<'a>(
+    record: &AgentRecord,
+    transports: &'a [SshTransport],
+) -> Vec<&'a SshTransport> {
+    let Some(session) = &record.session_connections else {
+        return Vec::new();
+    };
+    let mut matches = transports
+        .iter()
+        .filter(|transport| {
+            session.clients.iter().any(|client| match client {
+                ClientConnection::Ssh { connection } => {
+                    transport.connection.as_ref() == Some(connection)
+                }
+                ClientConnection::Mosh { endpoint } => {
+                    transport.mosh_endpoint.as_ref().is_some_and(|local| {
+                        endpoint.port == local.port
+                            && (same_address(&endpoint.address, &local.address)
+                                || (matches!(endpoint.address.as_str(), "*" | "0.0.0.0" | "::")
+                                    && record.remote_alias.as_deref()
+                                        == Some(transport.remote_host.as_str())))
+                    })
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| left.target.pane_id.cmp(&right.target.pane_id));
+    matches.dedup_by(|left, right| left.target.pane_id == right.target.pane_id);
+    matches
+}
+
 fn ssh_transport_connection(sockets: &[TcpSocket]) -> Option<TcpConnection> {
     sockets
         .iter()
@@ -1618,6 +2221,32 @@ fn find_mirror_pane<'a>(
             matches
                 .iter()
                 .map(|pane| pane.pane_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn find_bound_host_transport<'a>(
+    panes: &'a [Pane],
+    remote_alias: &str,
+) -> Result<Option<&'a Pane>> {
+    let matches = panes
+        .iter()
+        .filter(|pane| !pane.dead && !pane.is_agent_ui)
+        .filter(|pane| {
+            pane.mirror_host.as_deref() == Some(remote_alias) && pane.mirror_session.is_some()
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [pane] => Ok(Some(*pane)),
+        _ => bail!(
+            "multiple local transport panes are bound to {}: {}",
+            terminal_safe(remote_alias),
+            matches
+                .iter()
+                .map(|pane| terminal_safe(&pane.pane_id))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -1836,18 +2465,96 @@ fn transport_destination_for_command(command: &str) -> Option<&str> {
 
 fn mosh_destination_for_command(command: &str) -> Option<&str> {
     let fields = command.split_whitespace().collect::<Vec<_>>();
-    let executable = fields.first()?;
-    let program = executable.rsplit('/').next().unwrap_or(executable);
-    if program != "mosh-client" {
+    if !is_mosh_client(&fields) {
         return None;
     }
     let separator = fields.iter().position(|field| *field == "|")?;
-    let alias = separator
-        .checked_sub(1)
-        .and_then(|index| fields.get(index))?;
+    let mut destination_index = 1;
+    while destination_index < separator {
+        let field = fields[destination_index];
+        if field == "--" {
+            destination_index += 1;
+            break;
+        }
+        if !field.starts_with('-') {
+            break;
+        }
+        let takes_value = matches!(
+            field,
+            "--client"
+                | "--server"
+                | "--predict"
+                | "--port"
+                | "-p"
+                | "--family"
+                | "--ssh"
+                | "--bind-server"
+                | "--experimental-remote-ip"
+        );
+        let flag = matches!(
+            field,
+            "-#" | "-a"
+                | "-n"
+                | "-o"
+                | "-4"
+                | "-6"
+                | "--predict-overwrite"
+                | "--no-predict-overwrite"
+                | "--ssh-pty"
+                | "--no-ssh-pty"
+                | "--init"
+                | "--no-init"
+                | "--local"
+                | "--help"
+                | "--version"
+                | "--fake-proxy"
+                | "--no-fake-proxy"
+        );
+        let has_attached_value = (field.starts_with("-p=") && field.len() > 3)
+            || [
+                "--client=",
+                "--server=",
+                "--predict=",
+                "--port=",
+                "--family=",
+                "--ssh=",
+                "--bind-server=",
+                "--experimental-remote-ip=",
+            ]
+            .iter()
+            .any(|prefix| field.starts_with(prefix));
+        destination_index += if takes_value {
+            2
+        } else if flag || has_attached_value {
+            1
+        } else {
+            return None;
+        };
+    }
+    if destination_index >= separator {
+        return None;
+    }
+    let mut remote_command_separators = fields[destination_index + 1..separator]
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, field)| (*field == "--").then_some(destination_index + 1 + offset));
+    let remote_command_separator = remote_command_separators.next();
+    if remote_command_separators.next().is_some() {
+        return None;
+    }
+    let alias = match remote_command_separator {
+        Some(index) if index == destination_index + 1 && index + 1 < separator => {
+            fields.get(destination_index)?
+        }
+        Some(_) => return None,
+        None => separator
+            .checked_sub(1)
+            .and_then(|index| fields.get(index))?,
+    };
     fields.get(separator + 1)?;
     fields.get(separator + 2)?;
-    (!alias.starts_with('-')).then(|| alias.rsplit('@').next().unwrap_or(alias))
+    let alias = alias.rsplit('@').next().unwrap_or(alias);
+    (!alias.is_empty() && !alias.starts_with('-')).then_some(alias)
 }
 
 fn ssh_destination_for_command(command: &str) -> Option<&str> {
@@ -1924,6 +2631,342 @@ mod tests {
     use crate::model::{AgentOrigin, AgentState, Attention, EvidenceSource};
     use tempfile::tempdir;
 
+    #[test]
+    fn focus_requires_a_reported_socket_path_without_a_runtime_key_fallback() {
+        for missing in [None, Some(""), Some(" \n")] {
+            assert!(required_focus_socket(missing).is_err());
+        }
+        assert_eq!(
+            required_focus_socket(Some("/tmp/tmux-test/default\n")).unwrap(),
+            "/tmp/tmux-test/default"
+        );
+    }
+    #[test]
+    fn mosh_endpoint_parsing_handles_linux_and_macos_socket_records() {
+        let sockets = parse_lsof_udp_endpoints(b"p10\nf4\nn[2001:db8::1]:60001\np20\nn192.0.2.1:60002\np30\nf4\nn*:60003\np40\nn127.0.0.1:60004\nn127.0.0.1:60005\n");
+        assert_eq!(sockets[&10].address, "2001:db8::1");
+        assert_eq!(sockets[&20].port, 60002);
+        assert_eq!(sockets[&30].address, "*");
+        assert!(!sockets.contains_key(&40));
+        let (_, endpoint) = mosh_client_endpoint("/usr/bin/mosh-client -# --ssh=ssh -o BatchMode=yes remote-host -- tmux attach | 2001:db8::1 60001").unwrap();
+        assert_eq!(endpoint, sockets[&10]);
+        assert!(mosh_client_endpoint("mosh-client -# host | 127.0.0.1 0").is_none());
+        assert!(mosh_client_endpoint("mosh-client -# host | <address> <port>").is_none());
+        assert!(same_address("::ffff:192.0.2.1", "192.0.2.1"));
+        assert!(same_address("2001:0db8:0::1", "2001:db8::1"));
+    }
+
+    #[test]
+    fn custom_mosh_clients_require_the_exact_declared_executable() {
+        for option in [
+            "--client=/opt/bin/mobile-shell",
+            "--client /opt/bin/mobile-shell",
+        ] {
+            let command = format!(
+                "/opt/bin/mobile-shell -# {option} --no-init remote-host | 192.0.2.1 60001"
+            );
+            let (host, endpoint) = mosh_client_endpoint(&command).unwrap();
+            assert_eq!(host, "remote-host");
+            assert_eq!(endpoint.port, 60001);
+            assert_eq!(mosh_destination_for_command(&command), Some("remote-host"));
+        }
+        let command = "/opt/bin/mobile-shell -# --client=/opt/bin/mobile-shell --ssh=ssh -o BatchMode=yes remote-host -- tmux attach | 192.0.2.1 60001";
+        assert!(mosh_destination_for_command(command).is_none());
+        assert_eq!(
+            mosh_client_endpoint(command).unwrap().1.address,
+            "192.0.2.1"
+        );
+        for command in [
+            "/opt/bin/mobile-shell -# remote-host | 192.0.2.1 60001",
+            "/opt/bin/mobile-shell --client=/opt/bin/mobile-shell remote-host | 192.0.2.1 60001",
+            "/opt/bin/mobile-shell -# --client=/other/mobile-shell remote-host | 192.0.2.1 60001",
+            "/opt/bin/mobile-shell -# remote-host -- program --client=/opt/bin/mobile-shell | 192.0.2.1 60001",
+            "/opt/bin/mobile-shell -# --client=/opt/bin/mobile-shell remote-host | invalid 60001",
+            "/opt/bin/mobile-shell -# --client=/opt/bin/mobile-shell remote-host | 192.0.2.1 0",
+            "sleep 30 | 192.0.2.1 60001",
+            "/opt/bin/mobile-shell -# --client=/opt/bin/mobile-shell --client=/other/client remote-host | 192.0.2.1 60001",
+        ] {
+            assert!(
+                mosh_client_endpoint(command).is_none(),
+                "accepted {command}"
+            );
+            assert!(
+                mosh_destination_for_command(command).is_none(),
+                "accepted {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_mosh_attachments_focus_hidden_windows_and_follow_session_switches() {
+        const SOCKET_ENV: &str = "TMUX_AGENT_LIVE_ATTACHMENT_TEST";
+        if let Ok(local_socket) = env::var(SOCKET_ENV) {
+            let remote_socket = format!("{local_socket}-remote");
+            struct Servers(Vec<String>);
+            impl Drop for Servers {
+                fn drop(&mut self) {
+                    for socket in &self.0 {
+                        let _ = Command::new("tmux")
+                            .args(["-L", socket, "kill-server"])
+                            .output();
+                    }
+                }
+            }
+            let _servers = Servers(vec![remote_socket.clone(), local_socket.clone()]);
+            let custom_client_directory = tempdir().unwrap();
+            let custom_client = custom_client_directory.path().join("mobile-shell");
+            let installed_client = Command::new("sh")
+                .args(["-c", "command -v mosh-client"])
+                .output()
+                .unwrap();
+            assert!(installed_client.status.success());
+            std::os::unix::fs::symlink(
+                String::from_utf8(installed_client.stdout).unwrap().trim(),
+                &custom_client,
+            )
+            .unwrap();
+            let local = Tmux::new(&Config {
+                tmux_args: vec!["-L".into(), local_socket.clone()],
+                ..Config::default()
+            });
+            let remote = Tmux::new(&Config {
+                tmux_args: vec!["-L".into(), remote_socket.clone()],
+                ..Config::default()
+            });
+            let ui = new_test_tmux_pane(&local_socket, "local", None);
+            test_tmux_output(
+                &local_socket,
+                &["set-option", "-pt", &ui, "@tmux_agent_ui", "1"],
+            );
+            for session in ["s", "t"] {
+                new_test_tmux_command_pane(&remote_socket, session, None, "sh");
+                test_tmux_output(
+                    &remote_socket,
+                    &[
+                        "new-window",
+                        "-d",
+                        "-t",
+                        &format!("{session}:"),
+                        "-n",
+                        "hidden-agent",
+                        "sleep 60",
+                    ],
+                );
+            }
+            let attach = |session: &str| {
+                let mut args = vec![
+                    "python3".into(),
+                    format!(
+                        "{}/tests/fixtures/mosh-attachment.py",
+                        env!("CARGO_MANIFEST_DIR")
+                    ),
+                    remote_socket.clone(),
+                    session.into(),
+                ];
+                if session == "t" {
+                    args.push(custom_client.to_string_lossy().into_owned());
+                    args.push("0.0.0.0".into());
+                }
+                let command = shell_join(&args);
+                test_tmux_value(
+                    &local_socket,
+                    &[
+                        "new-window",
+                        "-d",
+                        "-t",
+                        "local:",
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                        &command,
+                    ],
+                )
+            };
+            let first = attach("s");
+            let second = attach("t");
+            mark_test_remote_pane(&local_socket, &second, "remote-mac", "t", "active shell");
+            test_tmux_output(
+                &local_socket,
+                &[
+                    "set-option",
+                    "-pt",
+                    &second,
+                    "@pane_label",
+                    "explicit transport",
+                ],
+            );
+            let record = |session: &str| {
+                let panes = remote.list_panes().unwrap();
+                let pane = panes
+                    .iter()
+                    .find(|pane| pane.session_name == session && pane.window_name == "hidden-agent")
+                    .unwrap();
+                let mut record =
+                    remote_tmux_record(session, "hidden agent unrelated to shell title");
+                record.session_id = pane.session_id.clone();
+                record.pane_id = pane.pane_id.clone();
+                record.window_id = pane.window_id.clone();
+                record.visible = false;
+                let processes = remote.process_snapshot(&panes).unwrap();
+                record.session_connections = remote
+                    .session_connections(&processes)
+                    .unwrap()
+                    .remove(&record.session_id);
+                record
+            };
+            let wait_for = |condition: &dyn Fn() -> bool| {
+                let deadline = Instant::now() + Duration::from_secs(8);
+                while !condition() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "live attachment did not reach expected state: s={:?}, t={:?}, local panes={:?}",
+                        record("s").session_connections,
+                        record("t").session_connections,
+                        local
+                            .list_panes()
+                            .unwrap()
+                            .iter()
+                            .map(|pane| (&pane.pane_id, &pane.current_command))
+                            .collect::<Vec<_>>()
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            };
+            wait_for(&|| {
+                ["s", "t"].iter().all(|session| {
+                    record(session)
+                        .session_connections
+                        .as_ref()
+                        .is_some_and(|connections| {
+                            connections.complete && connections.clients.len() == 1
+                        })
+                })
+            });
+            for (session, expected) in [("s", &first), ("t", &second)] {
+                wait_for(&|| local.focus_agent(&record(session)).is_ok());
+                assert_eq!(
+                    local.focus_agent(&record(session)).unwrap(),
+                    FocusOutcome::TransportOnly
+                );
+                assert_eq!(
+                    test_tmux_value(&local_socket, &["display-message", "-p", "#{pane_id}"]),
+                    *expected
+                );
+                assert_eq!(
+                    test_tmux_value(
+                        &remote_socket,
+                        &["display-message", "-p", "-t", session, "#{window_index}"]
+                    ),
+                    "0"
+                );
+            }
+            // The wildcard-bound remote server needs host attribution. Explicit
+            // markers survive a title whose embedded SSH options hide its host.
+            let processes = local
+                .process_snapshot(&local.list_panes().unwrap())
+                .unwrap();
+            let transport = processes
+                .ssh_transports
+                .iter()
+                .find(|transport| transport.target.pane_id == second)
+                .unwrap();
+            assert_eq!(transport.remote_host, "remote-mac");
+            assert!(transport.remote_host_explicit);
+            assert_eq!(
+                transport.mosh_endpoint.as_ref().unwrap().address,
+                "127.0.0.1"
+            );
+            let mut records = vec![record("t")];
+            assert!(
+                matches!(&records[0].session_connections.as_ref().unwrap().clients[0], ClientConnection::Mosh { endpoint } if matches!(endpoint.address.as_str(), "0.0.0.0" | "*"))
+            );
+            crate::daemon::reconcile_transports(&mut records, &processes.ssh_transports);
+            assert_eq!(records[0].focus_target.as_ref().unwrap().pane_id, second);
+            assert_eq!(records[0].label.as_deref(), Some("explicit transport"));
+            assert!(!records[0].visible);
+            // An obsolete explicit binding cannot override a supported live association.
+            mark_test_remote_pane(&local_socket, &first, "remote-mac", "s", "unrelated shell");
+            let first_client = test_tmux_value(
+                &remote_socket,
+                &["list-clients", "-t", "s", "-F", "#{client_name}"],
+            );
+            test_tmux_output(
+                &remote_socket,
+                &["switch-client", "-c", &first_client, "-t", "t"],
+            );
+            let missing = local.focus_agent(&record("s")).unwrap_err();
+            assert!(missing.to_string().contains("no live local transport"));
+            assert!(is_focus_target_missing(&missing));
+            assert!(
+                local
+                    .focus_agent(&record("t"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("multiple live local transports")
+            );
+            test_tmux_output(
+                &local_socket,
+                &["set-option", "-pt", &first, "@tmux_agent_ui", "1"],
+            );
+            assert_eq!(
+                local.focus_agent(&record("t")).unwrap(),
+                FocusOutcome::TransportOnly
+            );
+            assert_eq!(
+                test_tmux_value(&local_socket, &["display-message", "-p", "#{pane_id}"]),
+                second
+            );
+            test_tmux_output(
+                &local_socket,
+                &["set-option", "-pt", &first, "@tmux_agent_ui", "0"],
+            );
+            test_tmux_output(&remote_socket, &["detach-client", "-t", &first_client]);
+            wait_for(&|| {
+                record("t")
+                    .session_connections
+                    .as_ref()
+                    .unwrap()
+                    .clients
+                    .len()
+                    == 1
+            });
+            assert_eq!(
+                local.focus_agent(&record("t")).unwrap(),
+                FocusOutcome::TransportOnly
+            );
+            let reconnected = attach("s");
+            wait_for(&|| local.focus_agent(&record("s")).is_ok());
+            assert_eq!(
+                test_tmux_value(&local_socket, &["display-message", "-p", "#{pane_id}"]),
+                reconnected
+            );
+            test_tmux_output(
+                &local_socket,
+                &["set-option", "-wt", &reconnected, "remain-on-exit", "on"],
+            );
+            let client = test_tmux_value(
+                &remote_socket,
+                &["list-clients", "-t", "s", "-F", "#{client_name}"],
+            );
+            test_tmux_output(&remote_socket, &["detach-client", "-t", &client]);
+            assert!(local.focus_agent(&record("s")).is_err());
+            return;
+        }
+        for program in ["tmux", "mosh-client", "mosh-server", "python3", "lsof"] {
+            if Command::new(program).arg("--version").output().is_err() {
+                eprintln!("skipping live Mosh test: {program} unavailable");
+                return;
+            }
+        }
+        let directory = tempdir().unwrap();
+        let status = Command::new(env::current_exe().unwrap())
+            .args(["--exact", "tmux::tests::live_mosh_attachments_focus_hidden_windows_and_follow_session_switches", "--nocapture"])
+            .env(SOCKET_ENV, format!("tmux-agent-live-{}", std::process::id()))
+            .env("TMUX_TMPDIR", directory.path())
+            .env_remove("TMUX").env_remove("TMUX_PANE").status().unwrap();
+        assert!(status.success());
+    }
+
     fn pane(pane_id: &str, session: &str, title: &str) -> Pane {
         Pane {
             pane_id: pane_id.into(),
@@ -1973,6 +3016,7 @@ mod tests {
             terminal: None,
             remote_alias: Some("remote-mac".into()),
             ssh_connection: None,
+            session_connections: None,
             focus_target: None,
             goal: None,
             subagent: None,
@@ -2145,6 +3189,241 @@ mod tests {
     }
 
     #[test]
+    fn focus_distinguishes_remote_transport_from_exact_targets() {
+        const SOCKET_ENV: &str = "TMUX_AGENT_TRANSPORT_ONLY_FOCUS_TEST_SOCKET";
+        if let Some(socket_name) = std::env::var_os(SOCKET_ENV) {
+            let socket_name = socket_name.to_string_lossy().into_owned();
+            let current = new_test_tmux_pane(&socket_name, "local", None);
+            let transport = test_tmux_value(
+                &socket_name,
+                &[
+                    "new-window",
+                    "-d",
+                    "-t",
+                    "local",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "sleep 30",
+                ],
+            );
+            mark_test_remote_pane(
+                &socket_name,
+                &transport,
+                "remote-mac",
+                "other-session",
+                "[mosh] · other-project",
+            );
+            test_tmux_output(&socket_name, &["select-window", "-t", "local:0"]);
+            test_tmux_output(&socket_name, &["select-pane", "-t", &current]);
+
+            let config = Config {
+                tmux_args: vec!["-L".into(), socket_name.clone()],
+                ..Config::default()
+            };
+            let tmux = Tmux::new(&config);
+
+            let outcome = tmux
+                .focus_agent(&remote_tmux_record("selected-session", "selected-project"))
+                .unwrap();
+
+            assert_eq!(outcome, FocusOutcome::TransportOnly);
+            assert_eq!(
+                test_tmux_value(
+                    &socket_name,
+                    &[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &transport,
+                        "#{window_active}:#{pane_active}"
+                    ],
+                ),
+                "1:1"
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &transport, REMOTE_HOST_OPTION),
+                "remote-mac"
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &transport, REMOTE_SESSION_OPTION),
+                "other-session"
+            );
+
+            // A matching session binding does not prove its background target.
+            new_test_tmux_pane(&socket_name, "other-session", None);
+            let background = test_tmux_value(
+                &socket_name,
+                &[
+                    "new-window",
+                    "-d",
+                    "-t",
+                    "other-session",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "sleep 30",
+                ],
+            );
+            let mut remote = remote_tmux_record("other-session", "background-project");
+            remote.window_id = test_tmux_value(
+                &socket_name,
+                &["display-message", "-p", "-t", &background, "#{window_id}"],
+            );
+            remote.pane_id = background.clone();
+            test_tmux_output(&socket_name, &["select-window", "-t", "local:0"]);
+            assert_eq!(
+                tmux.focus_agent(&remote).unwrap(),
+                FocusOutcome::TransportOnly
+            );
+            assert_eq!(
+                test_tmux_value(
+                    &socket_name,
+                    &[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &transport,
+                        "#{window_active}:#{pane_active}"
+                    ]
+                ),
+                "1:1"
+            );
+            assert_eq!(
+                test_tmux_value(
+                    &socket_name,
+                    &[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &background,
+                        "#{window_active}"
+                    ]
+                ),
+                "0",
+                "the inner background window must remain unchanged"
+            );
+
+            remote.window_id = "@99999".into();
+            remote.pane_id = "%99999".into();
+            assert_eq!(
+                tmux.focus_agent(&remote).unwrap(),
+                FocusOutcome::TransportOnly
+            );
+
+            let window_id = test_tmux_value(
+                &socket_name,
+                &["display-message", "-p", "-t", &transport, "#{window_id}"],
+            );
+            remote.focus_target = Some(crate::model::TmuxTarget {
+                session_name: "local".into(),
+                window_id: window_id.clone(),
+                window_index: 1,
+                pane_id: transport.clone(),
+                pane_index: 0,
+            });
+            test_tmux_output(&socket_name, &["select-window", "-t", "local:0"]);
+            assert_eq!(
+                tmux.focus_agent(&remote).unwrap(),
+                FocusOutcome::TransportOnly
+            );
+            assert_eq!(
+                test_tmux_value(
+                    &socket_name,
+                    &[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &transport,
+                        "#{window_active}:#{pane_active}"
+                    ]
+                ),
+                "1:1"
+            );
+
+            let mut terminal = remote_terminal_record("ordinary-terminal");
+            terminal.focus_target = remote.focus_target.clone();
+            assert_eq!(tmux.focus_agent(&terminal).unwrap(), FocusOutcome::Exact);
+
+            let mut local = remote_tmux_record("local", "local-project");
+            local.remote_alias = None;
+            local.window_id = window_id;
+            local.pane_id = transport.clone();
+            test_tmux_output(&socket_name, &["select-window", "-t", "local:0"]);
+            assert_eq!(tmux.focus_agent(&local).unwrap(), FocusOutcome::Exact);
+            assert_eq!(
+                test_tmux_value(
+                    &socket_name,
+                    &[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &transport,
+                        "#{window_active}:#{pane_active}"
+                    ]
+                ),
+                "1:1"
+            );
+            local.origin = AgentOrigin::Terminal;
+            assert!(
+                tmux.focus_agent(&local)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ordinary terminal")
+            );
+
+            let second = new_test_tmux_pane(&socket_name, "local", Some(&transport));
+            mark_test_remote_pane(
+                &socket_name,
+                &second,
+                "remote-mac",
+                "second-session",
+                "[mosh] · second-project",
+            );
+            let error = tmux
+                .focus_agent(&remote_tmux_record("missing-session", "missing-project"))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("multiple local transport panes are bound to remote-mac")
+            );
+            assert!(error.to_string().contains(&transport));
+            assert!(error.to_string().contains(&second));
+            return;
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket_name = format!(
+            "tmux-agent-transport-only-focus-{}-{nonce}",
+            std::process::id()
+        );
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tmux::tests::focus_distinguishes_remote_transport_from_exact_targets",
+                "--nocapture",
+            ])
+            .env(SOCKET_ENV, &socket_name)
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .output()
+            .unwrap();
+        let _ = Command::new("tmux")
+            .args(["-L", &socket_name, "kill-server"])
+            .status();
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn remote_tmux_focus_repairs_only_a_unique_stale_mosh_binding() {
         const SOCKET_ENV: &str = "TMUX_AGENT_REMOTE_FOCUS_TEST_SOCKET";
         if let Some(socket_name) = std::env::var_os(SOCKET_ENV) {
@@ -2163,8 +3442,11 @@ mod tests {
                 ..Config::default()
             };
             let tmux = Tmux::new(&config);
-            tmux.focus_agent(&remote_tmux_record("0", "recovered-project"))
-                .unwrap();
+            assert_eq!(
+                tmux.focus_agent(&remote_tmux_record("0", "recovered-project"))
+                    .unwrap(),
+                FocusOutcome::TransportOnly
+            );
             assert_eq!(
                 test_pane_option(&socket_name, &pane_id, REMOTE_SESSION_OPTION),
                 "0"
@@ -2191,8 +3473,11 @@ mod tests {
                 "unrelated-title",
             );
             test_tmux_output(&socket_name, &["select-pane", "-t", &stale]);
-            tmux.focus_agent(&remote_tmux_record("fresh-exact", "exact-title"))
-                .unwrap();
+            assert_eq!(
+                tmux.focus_agent(&remote_tmux_record("fresh-exact", "exact-title"))
+                    .unwrap(),
+                FocusOutcome::TransportOnly
+            );
             assert_eq!(
                 test_tmux_value(
                     &socket_name,
@@ -2224,11 +3509,10 @@ mod tests {
             let error = tmux
                 .focus_agent(&remote_tmux_record("fresh-ambiguous", "ambiguous-title"))
                 .unwrap_err();
-            assert!(is_focus_target_missing(&error));
             assert!(
                 error
                     .to_string()
-                    .contains("no local pane is bound to remote-mac/fresh-ambiguous")
+                    .contains("multiple local transport panes are bound to remote-mac")
             );
             assert_eq!(
                 test_pane_option(&socket_name, &first, REMOTE_SESSION_OPTION),
@@ -2375,14 +3659,18 @@ exit 1
             let mut named = remote_tmux_record("named-session", "recovered-project");
             named.server = "named".into();
             named.cwd = record.cwd.clone();
-            let error = tmux.focus_agent(&named).unwrap_err();
-            assert!(is_focus_target_missing(&error));
+            assert_eq!(
+                tmux.focus_agent(&named).unwrap(),
+                FocusOutcome::TransportOnly
+            );
             assert!(!log_path.exists());
 
             let mut missing = remote_tmux_record("missing-session", "missing-project");
             missing.cwd = "/Users/example/Developer/Omu/missing-project".into();
-            let error = tmux.focus_agent(&missing).unwrap_err();
-            assert!(is_focus_target_missing(&error));
+            assert_eq!(
+                tmux.focus_agent(&missing).unwrap(),
+                FocusOutcome::TransportOnly
+            );
 
             let mut ambiguous = remote_tmux_record("ambiguous-session", "ambiguous-project");
             ambiguous.cwd = "/Users/example/Developer/Omu/ambiguous-project".into();
@@ -2418,7 +3706,7 @@ exit 1
                 ""
             );
 
-            tmux.focus_agent(&record).unwrap();
+            assert_eq!(tmux.focus_agent(&record).unwrap(), FocusOutcome::Exact);
 
             assert_eq!(
                 std::fs::read_to_string(&log_path).unwrap(),
@@ -2497,6 +3785,8 @@ exit 1
         if let Some(socket_name) = std::env::var_os(SOCKET_ENV) {
             let socket_name = socket_name.to_string_lossy().into_owned();
             let mosh_command = "/bin/bash -c 'exec -a \"mosh-client -# --no-init remote-mac | <address> <port>\" sleep 30'";
+            let restored_mosh_command = "/bin/bash -c 'exec -a \"mosh-client -# --no-init remote-mac -- tmux attach-session -t work | <address> <port>\" sleep 30'";
+            let wrong_host_command = "/bin/bash -c 'exec -a \"mosh-client -# --no-init other-remote -- tmux attach-session -t work | <address> <port>\" sleep 30'";
             let current = new_test_tmux_pane(&socket_name, "local", None);
             let other_session =
                 new_test_tmux_command_pane(&socket_name, "local", Some(&current), mosh_command);
@@ -2561,15 +3851,27 @@ exit 1
                     "-P",
                     "-F",
                     "#{pane_id}",
-                    mosh_command,
+                    restored_mosh_command,
                 ],
             );
             wait_for_test_process_title(
                 &socket_name,
                 &running,
-                "mosh-client -# --no-init remote-mac",
+                "mosh-client -# --no-init remote-mac -- tmux attach-session -t work",
             );
             set_test_pane_title(&socket_name, &running, "[mosh] · ⣹ sample-robot-project");
+            let wrong_host = new_test_tmux_command_pane(
+                &socket_name,
+                "local",
+                Some(&running),
+                wrong_host_command,
+            );
+            wait_for_test_process_title(
+                &socket_name,
+                &wrong_host,
+                "mosh-client -# --no-init other-remote -- tmux attach-session -t work",
+            );
+            set_test_pane_title(&socket_name, &wrong_host, "[mosh] · ⣹ sample-robot-project");
             test_tmux_output(&socket_name, &["select-window", "-t", "local:0"]);
             test_tmux_output(&socket_name, &["select-pane", "-t", &current]);
 
@@ -2599,8 +3901,11 @@ exit 1
                 ""
             );
 
-            tmux.focus_agent(&remote_tmux_record("new-session", "renamed-project"))
-                .unwrap();
+            assert_eq!(
+                tmux.focus_agent(&remote_tmux_record("new-session", "renamed-project"))
+                    .unwrap(),
+                FocusOutcome::TransportOnly
+            );
             assert_eq!(
                 test_tmux_value(
                     &socket_name,
@@ -2623,11 +3928,14 @@ exit 1
                 "new-session"
             );
 
-            tmux.focus_agent(&remote_tmux_record(
-                "simulation - development",
-                "sample-robot-project",
-            ))
-            .unwrap();
+            assert_eq!(
+                tmux.focus_agent(&remote_tmux_record(
+                    "simulation - development",
+                    "sample-robot-project",
+                ))
+                .unwrap(),
+                FocusOutcome::TransportOnly
+            );
 
             assert_eq!(
                 test_tmux_value(
@@ -2654,6 +3962,14 @@ exit 1
             assert_eq!(
                 test_pane_option(&socket_name, &other_session, REMOTE_SESSION_OPTION),
                 "other-session"
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &wrong_host, REMOTE_HOST_OPTION),
+                ""
+            );
+            assert_eq!(
+                test_pane_option(&socket_name, &wrong_host, REMOTE_SESSION_OPTION),
+                ""
             );
             return;
         }
@@ -3042,6 +4358,7 @@ exit 1
                 tcp_connections: HashMap::new(),
                 parent_pids: HashMap::new(),
                 ssh_connections: HashMap::new(),
+                client_connections: HashMap::new(),
             }
         }
 
@@ -3097,6 +4414,7 @@ exit 1
                 tcp_connections: HashMap::new(),
                 parent_pids: HashMap::new(),
                 ssh_connections: HashMap::new(),
+                client_connections: HashMap::new(),
             }
         }
 
@@ -3576,6 +4894,60 @@ exit 1
     }
 
     #[test]
+    fn host_transport_fallback_rejects_ambiguous_bindings() {
+        let panes = ["%63", "%64"].map(|pane_id| {
+            let mut pane = pane(pane_id, "local", "remote session");
+            pane.mirror_host = Some("remote-mac".into());
+            pane.mirror_session = Some(format!("session-{pane_id}"));
+            pane
+        });
+
+        let error = find_bound_host_transport(&panes, "remote-mac").unwrap_err();
+
+        assert!(error.to_string().contains("remote-mac"));
+        assert!(error.to_string().contains("%63, %64"));
+    }
+
+    #[test]
+    fn host_transport_fallback_excludes_dead_ui_and_partial_bindings() {
+        let mut dead = pane("%dead", "local", "dead");
+        dead.dead = true;
+        dead.mirror_host = Some("remote-mac".into());
+        dead.mirror_session = Some("dead-session".into());
+
+        let mut ui = pane("%ui", "local", "ui");
+        ui.is_agent_ui = true;
+        ui.mirror_host = Some("remote-mac".into());
+        ui.mirror_session = Some("ui-session".into());
+
+        let mut host_only = pane("%host", "local", "host only");
+        host_only.mirror_host = Some("remote-mac".into());
+
+        let mut session_only = pane("%session", "local", "session only");
+        session_only.mirror_session = Some("remote-session".into());
+
+        let mut eligible = pane("%eligible", "local", "eligible");
+        eligible.mirror_host = Some("remote-mac".into());
+        eligible.mirror_session = Some("other-session".into());
+
+        let excluded = [dead, ui, host_only, session_only];
+        assert!(
+            find_bound_host_transport(&excluded, "remote-mac")
+                .unwrap()
+                .is_none()
+        );
+
+        let mut panes = excluded.to_vec();
+        panes.push(eligible);
+        assert_eq!(
+            find_bound_host_transport(&panes, "remote-mac")
+                .unwrap()
+                .map(|pane| pane.pane_id.as_str()),
+            Some("%eligible")
+        );
+    }
+
+    #[test]
     fn transport_titles_ignore_provider_braille_spinners() {
         assert_eq!(normalize_transport_title("⠂ project"), "project");
         assert_eq!(normalize_transport_title("⠸ project"), "project");
@@ -3696,6 +5068,60 @@ exit 1
             ),
             Some("remote-mac")
         );
+        assert_eq!(
+            transport_destination("mosh-client -# --no-init -- build-host | <address> <port>"),
+            Some("build-host")
+        );
+        assert_eq!(
+            transport_destination("mosh-client -# --no-init -- user@build-host | <address> <port>"),
+            Some("build-host")
+        );
+        assert_eq!(
+            transport_destination("mosh-client -# -p 60000 -- build-host | <address> <port>"),
+            Some("build-host")
+        );
+        assert_eq!(
+            transport_destination("mosh-client -# -p 60000 -- user@build-host | <address> <port>"),
+            Some("build-host")
+        );
+        assert_eq!(
+            transport_destination("mosh-client -# -p=60000 -- build-host | <address> <port>"),
+            Some("build-host")
+        );
+        assert_eq!(
+            transport_destination(
+                "mosh-client -# --ssh=ssh -J jump -- build-host | <address> <port>"
+            ),
+            None
+        );
+        assert_eq!(
+            transport_destination(
+                "mosh-client -# -pretend build-host -- tmux attach-session | <address> <port>"
+            ),
+            None
+        );
+        assert_eq!(
+            transport_destination(
+                "mosh-client -# build-host -- tmux attach-session -t work | <address> <port>"
+            ),
+            Some("build-host")
+        );
+        assert_eq!(
+            transport_destination(
+                "mosh-client -# user@build-host -- tmux attach-session -t work | <address> <port>"
+            ),
+            Some("build-host")
+        );
+        assert_eq!(
+            transport_destination("mosh-client -# build-host -- | <address> <port>"),
+            None
+        );
+        assert_eq!(
+            transport_destination(
+                "mosh-client -# build-host -- tmux -- attach-session | <address> <port>"
+            ),
+            None
+        );
         assert_eq!(transport_destination("mosh remote-mac"), None);
         assert_eq!(
             transport_destination("mosh-client -# --no-init remote-mac | <address>"),
@@ -3709,6 +5135,7 @@ exit 1
             alias: "remote-mac".into(),
             title: "project".into(),
             session: None,
+            live_session: false,
         });
         assert!(is_focus_target_missing(&missing));
         assert!(!is_focus_target_missing(&anyhow::anyhow!("tmux failed")));
@@ -3720,6 +5147,7 @@ exit 1
             alias: "thinkcat".into(),
             title: "project".into(),
             session: Some("tmux-agent-res".into()),
+            live_session: false,
         };
 
         assert_eq!(

@@ -98,6 +98,19 @@ impl Config {
 }
 
 impl MachineConfig {
+    pub fn focus_command(&self) -> Vec<String> {
+        vec![
+            "ssh".into(),
+            "-T".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=5".into(),
+            format!("{}@{}", self.ssh_user, self.host),
+            format!("{} remote-focus", shell_quote(&self.binary)),
+        ]
+    }
+
     fn collector(&self) -> RemoteConfig {
         let target = format!("{}@{}", self.ssh_user, self.host);
         RemoteConfig {
@@ -371,6 +384,13 @@ mod tests {
         assert_eq!(
             config.collectors()[0].command.last().map(String::as_str),
             Some("'/Users/user/My Tools/tmux-agent'\"'\"'s copy' watch --jsonl --local-only")
+        );
+        let focus = config.machines[0].focus_command();
+        assert_eq!(focus[1], "-T");
+        assert!(focus.iter().any(|argument| argument == "BatchMode=yes"));
+        assert_eq!(
+            focus.last().unwrap(),
+            "'/Users/user/My Tools/tmux-agent'\"'\"'s copy' remote-focus"
         );
     }
 

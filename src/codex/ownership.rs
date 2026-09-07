@@ -386,6 +386,7 @@ fn insert_synthetic_thread(
             terminal: parent.terminal,
             remote_alias: None,
             ssh_connection: parent.ssh_connection,
+            session_connections: parent.session_connections,
             focus_target: None,
             goal: None,
             subagent: Some(SubagentInfo {

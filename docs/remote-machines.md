@@ -72,8 +72,8 @@ ssh -T agent@build-host.example.ts.net \
 ```
 
 These are ordinary SSH commands initiated and authorized by the user. Remote
-configuration grants federation read access only; it never grants tmux-agent
-authority to run lifecycle commands on another machine.
+configuration permits federation reads and explicit focus or child-view actions;
+it never grants tmux-agent authority to run lifecycle commands on another machine.
 
 ## What crosses SSH
 
@@ -97,95 +97,132 @@ persistence.
 
 ## Remote focus
 
-When a remote session was reached through an SSH process inside local tmux,
-tmux-agent matches the two endpoints of that established connection and can
-focus the local pane carrying it. An ordinary remote terminal reached through
-mosh can also be focused when exactly one live, unmarked local pane has a
-`mosh-client` process title naming the configured remote and its normalized
-pane title matches the selected agent. The process title stays local.
+For remote tmux, tmux-agent finds the session currently attached through each
+local SSH or Mosh pane. Selecting an agent in a hidden remote window focuses
+its outer transport and selects the requested inner window and pane, even when
+the active remote window contains only a shell or editor. Multiple sessions on
+one host resolve independently. Two local
+transports attached to the same selected session are ambiguous.
 
-An integration that provides mirror panes can set:
+This discovery needs `lsof` on both machines. The remote collector reads the
+owning tmux server's live clients and follows each client's ancestry to its SSH
+or Mosh server socket. Local Mosh clients expose their numeric server endpoint
+after the bootstrap SSH connection ends, so discovery survives Mosh roaming.
+Named tmux servers are supported when the configured remote collector targets
+that server. No launch wrapper, registry, extra service, or dotfile edit is
+needed.
 
-```tmux
-set -pt:. @tmux_agent_remote_host 'build-host'
-set -pt:. @tmux_agent_remote_session 'agents'
-```
+Linux SSH login processes can hide their sockets from the logged-in user. In
+that case tmux-agent reads only `SSH_CONNECTION` from the attached tmux client's
+current login ancestry and checks it against an established inbound connection.
+It does not need root, changed process permissions, or session-global tmux
+environment. Missing or conflicting evidence leaves discovery incomplete;
+multiple terminal channels sharing one SSH connection remain ambiguous.
 
-Only the public `@tmux_agent_remote_host` and
-`@tmux_agent_remote_session` marker names are recognized.
+Custom Mosh clients are recognized when the original `--client` option names
+the exact running executable and its process title carries a numeric server
+endpoint. Custom executable paths containing whitespace are not supported.
 
-Set both markers on a local pane that attaches to a tmux session on the remote
-machine. tmux-agent does not use a matching title alone for a remote tmux
-agent because another SSH pane can have the same title.
+Session switches update the association on the next scan. Disconnect removes
+it; reconnect discovers a new client. Socket and process updates can take about
+one second. Dead panes and tmux-agent UI panes are excluded. Stale host/session
+markers cannot override a known live association, and no arbitrary same-host
+pane is selected when the selected session has no matching transport.
 
-Explicitly marked panes are reserved for remote tmux bindings and are not
-ordinary-terminal candidates. Dead panes and tmux-agent UI panes are also
-excluded. If no unique local SSH, mosh, or mirror pane can be resolved,
-tmux-agent reports the ambiguity or missing focus target instead of guessing.
-Ordinary mosh focus does not write pane options.
+Inner selection uses a separate non-interactive SSH command from the configured
+`[[machine]]`, including when the visible transport uses Mosh and bootstrap SSH
+has exited. Both peers must advertise `remote_tmux_focus_v1`. The operation sends
+typed JSON on stdin, validates the configured tmux server's PID and start time,
+session ID and creation time, live client endpoint, and requested window and pane
+IDs, then confirms the selection. Names with spaces are supported. No shell text
+is sent to an interactive pane and no extra terminal opens.
 
-For a uniquely resolved remote agent, completion visibility requires both the
-remote agent pane and its local transport pane to be visible. A completion in a
-hidden local transport is shown as `done`. Opening that transport marks the
-completion seen. Ambiguous and unresolved transports keep the peer's reported
-visibility and attention state.
+The remote binary must use the same configuration for `watch` and `remote-focus`.
+For a named server, set `tmux_args` in that remote configuration or use the same
+configured binary wrapper for both commands. If SSH control reaches a different
+server, the operation rejects the request rather than searching other servers.
+The complete SSH operation has a five-second timeout and bounded input/output.
 
-An exact host and session binding takes priority. Without one, focus can adopt
-exactly one live mosh pane that names the configured remote and is already
-displaying the selected agent with the nested tmux title shape `[mosh] · ...`.
-The pane may be unmarked or carry a complete stale binding for a different
-host; the live mosh destination must prove the configured remote before both
-markers are replaced. The ordinary-terminal shape `[mosh] title` is not
-adopted as a tmux binding. A binding for another session on the same host does
-not block this recovery. Zero or multiple matching panes are left unchanged.
+Tmux shares window selection among clients attached to the same session. Pane
+selection is shared by default across views of the same window, including linked
+windows; clients using tmux's `active-pane` flag retain independent pane
+selection. Selecting an agent therefore changes what those clients see. It does not switch
+any client to another session. A second local transport to the same session
+remains ambiguous and prevents selection.
 
-For a detached default-server tmux session, focus can instead create the
-initial mosh binding when exactly one unmarked pane names the configured remote
-and its shell working-directory title matches the remote agent directory.
-tmux-agent selects the exact remote window and pane, types the attach command
-into that shell, verifies that the local pane adopts the selected agent title,
-then writes the markers and focuses it. Another binding on the host does not
-block a unique alias and working-directory match. Named tmux servers and zero
-or multiple shell matches fail closed.
+On the local machine, activation selects the current tmux client once before
+contacting SSH control. If the transport is in another local session, only
+that client switches sessions; spectators remain in the original UI session.
+Client lifetime is checked within the same synchronous tmux command queue as
+selection. A replacement on the same terminal or a newly current client causes
+activation to refuse before changing the selected session, window, or pane.
+A target in the same session retains tmux's shared window selection. Views using
+the default shared-pane mode also change their selected pane together; clients
+using `active-pane` retain independent pane selection. Remote confirmation
+verifies the initiating client's selected session, window,
+and pane; it does not switch a second client or undo navigation while control
+was running. Detaching or changing selection during control reports unconfirmed
+focus.
 
-Other nested remote tmux connections, including SSH connections that cannot be
-matched to the remote agent process or mosh panes without the nested title
-shape, need an initial explicit local-pane binding. Run this on the local
-machine before entering the remote shell, or pass the local pane ID from
-another local pane:
+Focus does not support an initiating local client or matched remote client
+using tmux's `active-pane` flag. Tmux's pane-reporting format cannot verify that
+client's independent input pane, so tmux-agent reports an error instead of exact
+focus. Use shared-pane mode or focus manually. Tmux-agent never changes client
+flags; enabling the flag during an operation also fails its final verification.
 
-```sh
-tmux-agent remote bind build-host agents --pane %42
-```
+Older peers without the capability, raw `[[remote]]` collectors, and explicit
+bindings without inspectable client evidence retain outer-only focus. The UI
+reports why inner selection is unavailable and keeps a popup open; the CLI prints
+the notice to stderr and exits successfully. Activating a completion or pending
+goal achievement still acknowledges it, but partial focus does not change
+last-used ordering. A missing outer target still permits the UI's existing
+acknowledgement action; ambiguous transports remain errors.
 
-The command writes the two public marker options above. The binding belongs to
-that pane and disappears with it. Inspect or remove bindings with:
+If the target disappears, the association changes, or SSH control fails, the
+operation reports that the outer pane was focused but inner focus was not
+confirmed. These failures keep the popup open and do not acknowledge or update
+last-used ordering. Only a confirmed remote selection followed by a rechecked
+local transport and initiating client returns exact focus and allows the popup
+to close.
 
-```sh
-tmux-agent remote bindings
-tmux-agent remote unbind --pane %42
-```
-
-When `--pane` is omitted, bind and unbind use the current local `$TMUX_PANE`.
-The bind command rejects names that are not present in the local tmux-agent
-configuration and never chooses between several mosh or SSH panes. If the bound
-remote tmux session is later recreated under a different name, focusing its
-agent repairs the session marker only when that host has one live, non-UI bound
-pane with a matching normalized title. Reusing a pane for another configured
-mosh destination can repair both markers when the live destination and nested
-title identify one unique pane. Zero or multiple matches leave the binding
-unchanged and report the normal focus error.
-
-A local transport pane can also provide the label shown beside its remote
-agent:
+Completion visibility requires both the remote agent pane and its uniquely
+resolved local transport to be visible. Outer-only focus leaves hidden remote
+agents hidden; successful inner selection becomes visible on the next remote
+snapshot. A transport label takes precedence over a remote pane
+label only for a unique association:
 
 ```tmux
 set -pt:. @pane_label 'testing env'
 ```
 
-The local label takes precedence over a remote pane label only when the
-transport is resolved uniquely. An ambiguous or unrelated pane does not
-contribute a label.
+If client ancestry or sockets cannot be inspected, explicitly bind the local
+pane to the selected remote session:
+
+```sh
+tmux-agent remote bind build-host agents --pane %42
+tmux-agent remote bindings
+tmux-agent remote unbind --pane %42
+```
+
+The binding uses pane-local `@tmux_agent_remote_host` and
+`@tmux_agent_remote_session` options and disappears with that pane. Omitting
+`--pane` uses the current local `$TMUX_PANE`. Bind validates the configured
+remote name and never chooses a pane for you. Update the binding yourself after
+switching sessions when automatic inspection is unavailable.
+
+Automatic association may be unavailable for translated server addresses,
+SSH proxy or multiplex setups that obscure the connection, or remote tmux
+clients running inside another tmux server. When every attached client's
+transport is inspectable, no local match fails closed even when old markers
+exist. Restore direct endpoint visibility for these cases. If some attached
+clients cannot be inspected, an exact explicit binding can identify an
+uninspectable client even when other known clients have no local match. You
+must update that binding after switching sessions.
+
+Ordinary remote terminals retain their existing SSH connection matching and
+unique unmarked Mosh destination/title matching. Older compatibility records
+without attachment metadata retain legacy binding/title recovery; live peers
+must all use federation protocol 4.
 
 ## Custom SSH commands
 
@@ -198,4 +235,6 @@ command = ["ssh", "-T", "build-host", "tmux-agent", "watch", "--jsonl", "--local
 ```
 
 The structured `[[machine]]` form is preferred because it also supports
-diagnostics and remote Codex child viewing.
+diagnostics, inner tmux focus, and remote Codex child viewing. Raw collector
+commands do not define a focus control channel; tmux-agent does not infer one
+from their command text.

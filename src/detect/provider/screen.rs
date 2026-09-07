@@ -92,6 +92,10 @@ pub(super) struct Lines<'a> {
 }
 
 impl Lines<'_> {
+    pub(super) fn iter(&self) -> impl Iterator<Item = &str> {
+        self.lines.iter().copied()
+    }
+
     pub(super) fn contains(&self, needle: &str) -> bool {
         let needle = needle.to_lowercase();
         self.lines
