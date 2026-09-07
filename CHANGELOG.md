@@ -6,6 +6,36 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+## [0.9.0] - 2026-09-07
+
+### Added
+
+- Press `a` in normal UI mode to mark all currently unread completions as read.
+- Confirm closing the UI with `q`, then `y` or `Y`; cancel with `Esc`.
+- Select and verify the inner window and pane of a remote tmux agent through
+  configured SSH control, including when its visible transport uses Mosh.
+
+### Changed
+
+- Federation now uses protocol 4. Update all connected machines together and
+  restart existing daemon, UI, and collector processes after updating.
+- Report outer-only remote focus separately from verified inner selection.
+  Partial focus keeps popups open and does not change last-used ordering.
+- Remove Claude activity glyphs from displayed task titles.
+
+### Fixed
+
+- Match remote tmux sessions to live SSH or Mosh attachments instead of relying
+  on the title of the active remote window, with guarded Linux SSH discovery.
+- Parse Mosh destinations correctly when the command includes a remote command
+  or explicitly configured client executable.
+- Preserve the initiating local client during remote focus and reject stale
+  process, session, server, or client identities before reporting exact focus.
+- Keep completed Claude turns idle when persistent background shells remain,
+  while preserving active-turn and permission-prompt detection.
+- Discover Claude native versioned entrypoints even when their process name is
+  a version number, without matching arbitrary version-named executables.
+
 ## [0.8.1] - 2026-08-31
 
 ### Fixed

@@ -93,6 +93,15 @@ popup_process_ready() {
     pgrep -f "$data_dir/current ui --popup" >/dev/null 2>&1
 }
 
+popup_process_stopped() {
+    ! popup_process_ready
+}
+
+only_shell_window() {
+    [[ $(tmux -L "$socket_name" list-windows -t "$session_name" \
+        -F '#{window_name}') == shell ]]
+}
+
 client_stopped() {
     ! kill -0 "$client_pid" 2>/dev/null
 }
@@ -164,8 +173,10 @@ verify_runtime() {
     tmux -L "$socket_name" capture-pane -p \
         -t "$session_name:tmux-agent-ui.0" >"$ui_capture"
     grep -F 'tmux-agent' "$ui_capture" >/dev/null
+    # Detached UIs suspend redraws; the attached popup case checks the prompt.
     tmux -L "$socket_name" send-keys \
-        -t "$session_name:tmux-agent-ui.0" q
+        -t "$session_name:tmux-agent-ui.0" q y
+    wait_for 'UI window closing' only_shell_window
 }
 
 case "$scenario" in
@@ -228,8 +239,10 @@ EOF
         wait_for 'tmux-agent popup rendering' \
             grep -aFq 'tmux-agent' "$client_log"
         printf 'q' >&3
-        sleep 1
-        tmux -L "$socket_name" display-popup -C >/dev/null 2>&1 || true
+        wait_for 'popup quit confirmation' \
+            grep -aFq 'Quit tmux-agent?' "$client_log"
+        printf 'y' >&3
+        wait_for 'popup closing after confirmation' popup_process_stopped
         printf '\002d' >&3
         exec 3>&-
         wait_for 'tmux client detaching' client_stopped
