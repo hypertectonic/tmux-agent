@@ -1450,11 +1450,27 @@ fn render_agent_list(
             } else {
                 0
             };
-            let goal_width = goal_label
+            let child_count_width = child_count
                 .as_ref()
                 .map(|label| label.chars().count() + 2)
                 .unwrap_or(0);
-            let child_count_width = child_count
+            // Keep the activity explanation intact before spending space on goal details.
+            let goal_budget = list_width.saturating_sub(
+                2 + PROVIDER_WIDTH + PROVIDER_TITLE_GAP + 1 + state_width + child_count_width,
+            );
+            let goal_label = goal_label
+                .map(|label| {
+                    if label.chars().count() + 2 <= goal_budget {
+                        label
+                    } else {
+                        match agent.goal.as_ref().map(|goal| goal.state) {
+                            Some(GoalState::Achieved) => "goal✓".to_string(),
+                            _ => "goal".to_string(),
+                        }
+                    }
+                })
+                .filter(|label| label.chars().count() + 2 <= goal_budget);
+            let goal_width = goal_label
                 .as_ref()
                 .map(|label| label.chars().count() + 2)
                 .unwrap_or(0);
@@ -2411,6 +2427,43 @@ mod tests {
                     assert!(row_text(&terminal, 4).contains(attention.icon()));
                     assert_eq!(snapshot.agents[0], parent);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn descendant_activity_label_fits_alongside_goal_metadata() {
+        let mut parent = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
+        parent.goal = Some(GoalInfo {
+            state: GoalState::Pursuing,
+            elapsed_seconds: 1_122,
+            achievement_pending: false,
+            achievement_observed_at_ms: 0,
+        });
+        let mut child = test_agent("child", Attention::Working, AgentOrigin::Terminal);
+        child.state = AgentState::Working;
+        child.subagent = Some(SubagentInfo {
+            parent_id: parent.id.clone(),
+            started_at_ms: 1,
+            finished_at_ms: None,
+            name: None,
+            thread_id: None,
+        });
+        let snapshot = Snapshot {
+            agents: vec![parent, child],
+            ..Snapshot::default()
+        };
+        for width in [47, 60, 61, 100] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 14)).unwrap();
+            terminal
+                .draw(|frame| render_live(frame, &snapshot, 0, "", 0))
+                .unwrap();
+            let row = row_text(&terminal, 4);
+            assert!(row.contains("1 subagent working"), "width {width}: {row}");
+            assert!(row.contains("idle"), "width {width}: {row}");
+            assert!(row.contains("goal"), "width {width}: {row}");
+            if width == 100 {
+                assert!(row.contains("Pursuing goal (18m 42s)"), "{row}");
             }
         }
     }
