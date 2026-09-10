@@ -869,6 +869,7 @@ async fn run_loop(
 }
 
 fn visible_timer_requirements(agents: &[AgentRecord], visible_indices: &[usize]) -> (bool, bool) {
+    let working_descendants = working_descendant_counts(agents);
     visible_indices.iter().fold(
         (false, false),
         |(has_working_agent, has_running_subagent), index| {
@@ -879,12 +880,55 @@ fn visible_timer_requirements(agents: &[AgentRecord], visible_indices: &[usize])
                     has_running_subagent || subagent.finished_at_ms.is_none(),
                 ),
                 None => (
-                    has_working_agent || agent.attention == Attention::Working,
+                    has_working_agent
+                        || agent.attention == Attention::Working
+                        || working_descendants.contains_key(agent.id.as_str()),
                     has_running_subagent,
                 ),
             }
         },
     )
+}
+
+/// Resolve complete parent chains before counting activity, so malformed cycles
+/// and dangling relationships cannot contribute to another session.
+fn working_descendant_counts(agents: &[AgentRecord]) -> HashMap<&str, usize> {
+    let records: HashMap<_, _> = agents
+        .iter()
+        .map(|agent| (agent.id.as_str(), agent))
+        .collect();
+    let mut counts = HashMap::new();
+    for agent in agents.iter().filter(|agent| {
+        agent.state == AgentState::Working
+            && agent
+                .subagent
+                .as_ref()
+                .is_some_and(|child| child.finished_at_ms.is_none())
+    }) {
+        let mut ancestors = Vec::new();
+        let mut visited = HashSet::from([agent.id.as_str()]);
+        let mut current = agent;
+        while let Some(child) = &current.subagent {
+            let Some(parent) = records.get(child.parent_id.as_str()).copied() else {
+                break;
+            };
+            if !visited.insert(parent.id.as_str())
+                || parent.host != agent.host
+                || parent.server != agent.server
+                || parent.remote_alias != agent.remote_alias
+            {
+                break;
+            }
+            ancestors.push(parent.id.as_str());
+            current = parent;
+        }
+        if current.subagent.is_none() {
+            for ancestor in ancestors {
+                *counts.entry(ancestor).or_default() += 1;
+            }
+        }
+    }
+    counts
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1288,20 +1332,7 @@ fn render_agent_list(
             counts[agent.attention.rank() as usize] += 1;
             counts
         });
-    let active_subagents = snapshot
-        .agents
-        .iter()
-        .filter_map(|agent| {
-            agent
-                .subagent
-                .as_ref()
-                .filter(|subagent| subagent.finished_at_ms.is_none())
-                .map(|subagent| subagent.parent_id.as_str())
-        })
-        .fold(HashMap::<&str, usize>::new(), |mut counts, parent_id| {
-            *counts.entry(parent_id).or_default() += 1;
-            counts
-        });
+    let working_descendants = working_descendant_counts(&snapshot.agents);
     let subagent_depths = subagent_depths(&snapshot.agents);
     let search_line = if list.searching {
         Line::from(vec![
@@ -1402,15 +1433,15 @@ fn render_agent_list(
                         .map(|goal| goal_label(goal, list_width < 60))
                 })
                 .flatten();
-            let child_count = active_subagents
+            let child_count = working_descendants
                 .get(agent.id.as_str())
                 .copied()
                 .filter(|count| *count > 0)
                 .map(|count| {
                     if count == 1 {
-                        "+1 agent".to_string()
+                        "1 subagent working".to_string()
                     } else {
-                        format!("+{count} agents")
+                        format!("{count} subagents working")
                     }
                 })
                 .filter(|_| show_state);
@@ -1419,11 +1450,27 @@ fn render_agent_list(
             } else {
                 0
             };
-            let goal_width = goal_label
+            let child_count_width = child_count
                 .as_ref()
                 .map(|label| label.chars().count() + 2)
                 .unwrap_or(0);
-            let child_count_width = child_count
+            // Keep the activity explanation intact before spending space on goal details.
+            let goal_budget = list_width.saturating_sub(
+                2 + PROVIDER_WIDTH + PROVIDER_TITLE_GAP + 1 + state_width + child_count_width,
+            );
+            let goal_label = goal_label
+                .map(|label| {
+                    if label.chars().count() + 2 <= goal_budget {
+                        label
+                    } else {
+                        match agent.goal.as_ref().map(|goal| goal.state) {
+                            Some(GoalState::Achieved) => "goal✓".to_string(),
+                            _ => "goal".to_string(),
+                        }
+                    }
+                })
+                .filter(|label| label.chars().count() + 2 <= goal_budget);
+            let goal_width = goal_label
                 .as_ref()
                 .map(|label| label.chars().count() + 2)
                 .unwrap_or(0);
@@ -1450,8 +1497,17 @@ fn render_agent_list(
                     .fg(Color::Rgb(145, 165, 171))
                     .bg(Color::Rgb(45, 45, 45))
             };
-            let glyph = attention_glyph(agent.attention, spinner_frame);
-            let glyph_color = if agent.attention == Attention::Working {
+            let session_working = agent.attention == Attention::Working
+                || working_descendants.contains_key(agent.id.as_str());
+            let glyph = attention_glyph(
+                if session_working {
+                    Attention::Working
+                } else {
+                    agent.attention
+                },
+                spinner_frame,
+            );
+            let glyph_color = if session_working {
                 provider_style.fg.unwrap_or(color)
             } else {
                 color
@@ -2285,6 +2341,160 @@ mod tests {
         assert_eq!(timer, UiTimer::VisibilityProbe);
         schedule.visibility_checked(true, deadline);
         assert!(!schedule.should_render());
+    }
+
+    #[test]
+    fn descendant_activity_drives_filtered_parent_rendering_and_timers() {
+        for provider in ["Codex", "Claude", "OpenCode", "FutureProvider"] {
+            for remote in [None, Some("peer")] {
+                for attention in [Attention::Idle, Attention::Blocked, Attention::Done] {
+                    let mut parent = test_agent(provider, attention, AgentOrigin::Tmux);
+                    parent.title = "parent-only".into();
+                    parent.remote_alias = remote.map(str::to_string);
+                    let mut child = parent.clone();
+                    child.id = format!("{}/child", parent.id);
+                    child.title = "child".into();
+                    child.state = AgentState::Working;
+                    child.attention = Attention::Working;
+                    child.subagent = Some(SubagentInfo {
+                        parent_id: parent.id.clone(),
+                        started_at_ms: 1,
+                        finished_at_ms: None,
+                        name: Some("child".into()),
+                        thread_id: None,
+                    });
+                    let mut grandchild = child.clone();
+                    grandchild.id = format!("{}/nested", child.id);
+                    grandchild.subagent.as_mut().unwrap().parent_id = child.id.clone();
+                    let mut snapshot = Snapshot {
+                        agents: vec![parent.clone(), child, grandchild],
+                        ..Snapshot::default()
+                    };
+                    let list = AgentListState {
+                        searching: true,
+                        query: "parent-only".into(),
+                        ..AgentListState::default()
+                    };
+                    assert_eq!(list.visible_indices(&snapshot.agents), vec![0]);
+                    let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+                    for (frame_number, glyph) in [(0, "⠋"), (5, "⠴")] {
+                        terminal
+                            .draw(|frame| {
+                                render_agent_list(frame, &snapshot, &list, "", frame_number, 1000)
+                            })
+                            .unwrap();
+                        let row = row_text(&terminal, 4);
+                        assert!(row.contains(glyph), "{row}");
+                        assert!(row.contains("2 subagents working"), "{row}");
+                        assert!(row.contains(attention_label(attention)), "{row}");
+                    }
+                    assert_eq!(
+                        visible_timer_requirements(&snapshot.agents, &[0]),
+                        (true, false)
+                    );
+                    let schedule = UiSchedule::new(false, Instant::now());
+                    assert_ne!(
+                        schedule.next_timer(true, false).unwrap().1,
+                        UiTimer::AnimationFrame
+                    );
+                    snapshot.agents[1].state = AgentState::Blocked;
+                    assert_eq!(
+                        working_descendant_counts(&snapshot.agents).get(parent.id.as_str()),
+                        Some(&1)
+                    );
+                    let mut narrow_terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+                    narrow_terminal
+                        .draw(|frame| render_agent_list(frame, &snapshot, &list, "", 5, 1000))
+                        .unwrap();
+                    let row = row_text(&narrow_terminal, 4);
+                    assert!(row.contains("1 subagent working"), "{row}");
+                    assert!(row.contains(attention_label(attention)), "{row}");
+                    snapshot.agents[2].subagent.as_mut().unwrap().finished_at_ms = Some(1000);
+                    assert_eq!(
+                        visible_timer_requirements(&snapshot.agents, &[0]),
+                        (false, false)
+                    );
+                    snapshot.agents[2].subagent.as_mut().unwrap().finished_at_ms = None;
+                    snapshot.agents[2].state = AgentState::Idle;
+                    assert_eq!(
+                        visible_timer_requirements(&snapshot.agents, &[0]),
+                        (false, false)
+                    );
+                    terminal
+                        .draw(|frame| render_agent_list(frame, &snapshot, &list, "", 5, 1000))
+                        .unwrap();
+                    assert!(!row_text(&terminal, 4).contains("subagents working"));
+                    assert!(row_text(&terminal, 4).contains(attention.icon()));
+                    assert_eq!(snapshot.agents[0], parent);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn descendant_activity_label_fits_alongside_goal_metadata() {
+        let mut parent = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
+        parent.goal = Some(GoalInfo {
+            state: GoalState::Pursuing,
+            elapsed_seconds: 1_122,
+            achievement_pending: false,
+            achievement_observed_at_ms: 0,
+        });
+        let mut child = test_agent("child", Attention::Working, AgentOrigin::Terminal);
+        child.state = AgentState::Working;
+        child.subagent = Some(SubagentInfo {
+            parent_id: parent.id.clone(),
+            started_at_ms: 1,
+            finished_at_ms: None,
+            name: None,
+            thread_id: None,
+        });
+        let snapshot = Snapshot {
+            agents: vec![parent, child],
+            ..Snapshot::default()
+        };
+        for width in [47, 60, 61, 100] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 14)).unwrap();
+            terminal
+                .draw(|frame| render_live(frame, &snapshot, 0, "", 0))
+                .unwrap();
+            let row = row_text(&terminal, 4);
+            assert!(row.contains("1 subagent working"), "width {width}: {row}");
+            assert!(row.contains("idle"), "width {width}: {row}");
+            assert!(row.contains("goal"), "width {width}: {row}");
+            if width == 100 {
+                assert!(row.contains("Pursuing goal (18m 42s)"), "{row}");
+            }
+        }
+    }
+
+    #[test]
+    fn descendant_activity_rejects_unrelated_dangling_and_cyclic_chains() {
+        let parent = test_agent("root", Attention::Idle, AgentOrigin::Tmux);
+        let unrelated = test_agent("unrelated", Attention::Idle, AgentOrigin::Tmux);
+        let mut child = test_agent("child", Attention::Working, AgentOrigin::Terminal);
+        child.state = AgentState::Working;
+        child.subagent = Some(SubagentInfo {
+            parent_id: unrelated.id.clone(),
+            started_at_ms: 1,
+            finished_at_ms: None,
+            name: None,
+            thread_id: None,
+        });
+        let mut agents = vec![parent, unrelated, child];
+        assert_eq!(visible_timer_requirements(&agents, &[0]), (false, false));
+        assert_eq!(visible_timer_requirements(&agents, &[1]), (true, false));
+        agents[2].subagent.as_mut().unwrap().parent_id = "missing".into();
+        assert!(working_descendant_counts(&agents).is_empty());
+        agents[2].subagent.as_mut().unwrap().parent_id = agents[2].id.clone();
+        assert!(working_descendant_counts(&agents).is_empty());
+        agents[2].subagent.as_mut().unwrap().parent_id = agents[1].id.clone();
+        agents[1].subagent = agents[2].subagent.clone();
+        agents[1].subagent.as_mut().unwrap().parent_id = agents[2].id.clone();
+        assert!(working_descendant_counts(&agents).is_empty());
+        agents[1].subagent = None;
+        agents[2].remote_alias = Some("different-peer".into());
+        assert!(working_descendant_counts(&agents).is_empty());
     }
 
     #[test]
@@ -3438,7 +3648,7 @@ mod tests {
             .unwrap();
 
         assert!(row_text(&terminal, 4).contains("sample-project"));
-        assert!(row_text(&terminal, 4).contains("+1 agent"));
+        assert!(!row_text(&terminal, 4).contains("subagent working"));
         assert!(row_text(&terminal, 6).contains("↳ subagent: review"));
         assert!(row_text(&terminal, 6).contains("running  ·  2m 0s"));
         assert!(!row_text(&terminal, 6).contains("CODEX"));
@@ -3525,7 +3735,7 @@ mod tests {
             .draw(|frame| render_at(frame, &snapshot, 0, "", 5, 270_000))
             .unwrap();
 
-        assert!(!row_text(&terminal, 4).contains("+1 agent"));
+        assert!(!row_text(&terminal, 4).contains("subagent working"));
         assert!(row_text(&terminal, 6).contains("done  ·  4m 12s"));
         let done_x = row_text(&terminal, 6).find("done").unwrap() as u16;
         assert_eq!(terminal.backend().buffer()[(done_x, 6)].fg, Color::Green);

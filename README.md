@@ -102,6 +102,14 @@ Linux release archives require glibc 2.35 or newer. Windows is not supported.
 - Process-backed and in-process Codex children beneath their actual parent.
 - Local and SSH-federated machines in one view.
 
+A session's activity indicator animates while the parent or any recognized
+descendant is working. The parent keeps its own state, completion and
+acknowledgement behavior; `1 subagent working` or `2 subagents working` explains
+child activity. Counts include descendants hidden by search and use the reported
+activity and parent relationships for any provider, locally or over SSH.
+Unfinished idle or blocked children do not count. This does not add new provider
+discovery or improve the evidence used to detect activity.
+
 tmux-agent derives state from foreground process metadata and the visible
 terminal surface. Ordinary terminal sessions are detected from their TTY but
 remain `unknown` unless tmux-agent owns an inner PTY screen.
