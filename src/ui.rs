@@ -1963,6 +1963,7 @@ mod tests {
             server: "default".into(),
             pane_id: "%1".into(),
             pane_pid: 10,
+            process: None,
             session_id: "$1".into(),
             session_name: "project-one".into(),
             window_id: "@1".into(),

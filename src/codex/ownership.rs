@@ -366,6 +366,7 @@ fn insert_synthetic_thread(
             server: server.to_string(),
             pane_id: parent.pane_id,
             pane_pid: parent.pane_pid,
+            process: None,
             session_id: parent.session_id,
             session_name: parent.session_name,
             window_id: parent.window_id,

@@ -422,20 +422,26 @@ async fn main() -> Result<()> {
                 },
             )
             .await?;
-            let target = terminal_safe(&sent.target_id);
-            match sent.status {
+            let target = terminal_safe(&sent.record.target_id);
+            if let Some(warning) = &sent.audit_warning {
+                eprintln!("handoff audit warning: {}", terminal_safe(warning));
+            }
+            match sent.record.status {
                 handoff::SentStatus::Delivered => {
-                    println!("delivered {} to {target}", sent.handoff_id);
+                    println!("delivered {} to {target}", sent.record.handoff_id);
                     Ok(())
                 }
                 handoff::SentStatus::Duplicate => {
-                    println!("already delivered {} to {target}", sent.handoff_id);
+                    println!("already delivered {} to {target}", sent.record.handoff_id);
                     Ok(())
                 }
-                handoff::SentStatus::Failed | handoff::SentStatus::Sending => bail!(
+                handoff::SentStatus::Failed
+                | handoff::SentStatus::Sending
+                | handoff::SentStatus::Unconfirmed
+                | handoff::SentStatus::Incompatible => bail!(
                     "handoff {} to {target} failed: {}",
-                    sent.handoff_id,
-                    sent.message.as_deref().unwrap_or("no response")
+                    sent.record.handoff_id,
+                    sent.record.message.as_deref().unwrap_or("no response")
                 ),
             }
         }

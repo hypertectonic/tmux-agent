@@ -193,6 +193,16 @@ pub struct DetectionDetails {
     pub transition: Option<String>,
 }
 
+/// The foreground process group that carries the agent in its pane. A
+/// restarted agent gets a new leader, so this changes even when the pane and
+/// its shell survive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRecord {
     pub id: String,
@@ -200,6 +210,8 @@ pub struct AgentRecord {
     pub server: String,
     pub pane_id: String,
     pub pane_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessIdentity>,
     pub session_id: String,
     pub session_name: String,
     pub window_id: String,
@@ -506,6 +518,7 @@ mod tests {
             server: "default".into(),
             pane_id: format!("%{id}"),
             pane_pid: 10,
+            process: None,
             session_id: format!("${id}"),
             session_name: session_name.into(),
             window_id: format!("@{id}"),

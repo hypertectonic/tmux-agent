@@ -4,12 +4,13 @@
 //! snapshot and pastes a scoped message into that agent's pane, either on the
 //! local tmux server or through the configured SSH control command of the peer
 //! that owns the pane. The receiving side revalidates the target against live
-//! tmux and its own scan before pasting, so renamed sessions, recreated panes,
-//! replaced agents, and prompts waiting for input fail closed instead of
-//! receiving text. Delivery is synchronous: there is no mailbox, queue, or
-//! retry loop. A sender retries with the same handoff ID and the receiver
-//! treats an already delivered ID as a duplicate.
+//! tmux and its own scan before pasting, so a different server, a replaced
+//! session, a recreated pane, a restarted agent, and a prompt waiting for
+//! input all fail closed instead of receiving text. Delivery is synchronous:
+//! there is no mailbox, queue, or retry loop. A sender retries with the same
+//! handoff ID and the receiver answers an already delivered ID as a duplicate.
 use crate::config::{Config, MachineConfig, RuntimePaths};
+use crate::focus::ControlExit;
 use crate::model::{AgentRecord, AgentState, CAPABILITY_HANDOFF, Snapshot, terminal_safe};
 use crate::scanner::Scanner;
 use crate::tmux::Tmux;
@@ -32,6 +33,9 @@ const REQUEST_LIMIT: u64 = 64 * 1024;
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const LEDGER_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SENT_LIST_LIMIT: usize = 50;
+/// clap reports an unknown subcommand with this status, which is how an
+/// older peer binary without `remote-handoff` answers.
+const USAGE_EXIT_STATUS: i32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -54,7 +58,8 @@ impl HandoffKind {
 }
 
 /// Snapshot filters shared by `find` and `handoff send`. Every filter must
-/// match; substring filters are case-insensitive.
+/// match. Names compare case-insensitively, the working directory matches
+/// whole path components, and the title is a case-insensitive substring.
 #[derive(Debug, Default, Clone, clap::Args)]
 pub struct TargetFilters {
     /// Configured machine alias, or the local host name.
@@ -69,7 +74,8 @@ pub struct TargetFilters {
     /// tmux session name.
     #[arg(long)]
     pub session: Option<String>,
-    /// Substring of the working directory.
+    /// Working directory, or a run of its path components such as
+    /// `hypertectonic/tmux-agent`.
     #[arg(long)]
     pub cwd: Option<String>,
     /// Substring of the displayed title.
@@ -84,13 +90,6 @@ impl TargetFilters {
                 .as_deref()
                 .is_none_or(|filter| filter.eq_ignore_ascii_case(value))
         };
-        let contains = |filter: &Option<String>, value: &str| {
-            filter.as_deref().is_none_or(|filter| {
-                value
-                    .to_ascii_lowercase()
-                    .contains(&filter.to_ascii_lowercase())
-            })
-        };
         equals(&self.machine, &agent.host)
             && equals(&self.provider, &agent.agent)
             && equals(
@@ -98,16 +97,45 @@ impl TargetFilters {
                 &format!("{:?}", agent.attention).to_ascii_lowercase(),
             )
             && equals(&self.session, &agent.session_name)
-            && contains(&self.cwd, &agent.cwd)
-            && contains(&self.title, &agent.title)
+            && self
+                .cwd
+                .as_deref()
+                .is_none_or(|filter| path_components_match(filter, &agent.cwd))
+            && self.title.as_deref().is_none_or(|filter| {
+                agent
+                    .title
+                    .to_ascii_lowercase()
+                    .contains(&filter.to_ascii_lowercase())
+            })
     }
 }
 
+/// True when the filter's path components appear as one contiguous run of
+/// the directory's components. `agent` does not match `tmux-agent`, while
+/// `hypertectonic/tmux-agent` matches `/home/agent/hypertectonic/tmux-agent`.
+fn path_components_match(filter: &str, directory: &str) -> bool {
+    let wanted = filter
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let actual = directory
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if wanted.is_empty() {
+        return false;
+    }
+    actual.windows(wanted.len()).any(|window| window == wanted)
+}
+
+/// Top-level agents that satisfy every filter. Subagent records share their
+/// parent's pane and are never handoff targets, so they are excluded here
+/// rather than turning a pane ID into an ambiguous match.
 pub fn filter_agents<'a>(snapshot: &'a Snapshot, filters: &TargetFilters) -> Vec<&'a AgentRecord> {
     snapshot
         .agents
         .iter()
-        .filter(|agent| filters.matches(agent))
+        .filter(|agent| agent.subagent.is_none() && filters.matches(agent))
         .collect()
 }
 
@@ -166,18 +194,27 @@ pub fn print_agents(agents: &[&AgentRecord], json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Typed request sent to the owning machine. Only numeric tmux IDs and the
-/// composed text cross the control channel; the receiver never interprets
-/// names or shell text.
+/// Typed request sent to the owning machine. It names the tmux server, the
+/// server and session lifetimes, the pane, the pane's foreground process
+/// group, and the provider. The receiver checks every field against its own
+/// live scan and never interprets names or shell text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HandoffRequest {
     pub version: u32,
     pub handoff_id: String,
+    /// The tmux server name the sender's snapshot reported for the record.
+    pub server: String,
+    pub server_pid: u32,
+    pub server_started_at: u64,
+    pub session_created_at: u64,
     pub session_id: String,
     pub window_id: String,
     pub pane_id: String,
     pub pane_pid: u32,
+    pub process_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_started_at_ms: Option<u64>,
     pub agent: String,
     pub allow_working: bool,
     pub text: String,
@@ -186,16 +223,70 @@ pub struct HandoffRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HandoffResponse {
-    Delivered { handoff_id: String, duplicate: bool },
-    Rejected { message: String },
+    Delivered {
+        handoff_id: String,
+        duplicate: bool,
+    },
+    Rejected {
+        message: String,
+    },
+    /// The receiver runs a binary with a different handoff operation version.
+    Unsupported {
+        supported_version: u32,
+    },
 }
 
 impl HandoffRequest {
+    /// Build the request from a snapshot record. Older peers report no
+    /// process identity and vanished sessions report zero lifetimes; both
+    /// fail closed here rather than on the receiver.
+    pub fn for_record(
+        handoff_id: &str,
+        record: &AgentRecord,
+        allow_working: bool,
+        text: String,
+    ) -> Result<Self> {
+        let session = record
+            .session_connections
+            .as_ref()
+            .filter(|session| {
+                session.server_pid != 0
+                    && session.server_started_at != 0
+                    && session.session_created_at != 0
+            })
+            .context(
+                "target reports no live tmux server and session identity; refresh and retry",
+            )?;
+        let process = record.process.context(
+            "target reports no agent process identity; update the owning tmux-agent binary",
+        )?;
+        let request = Self {
+            version: HANDOFF_VERSION,
+            handoff_id: handoff_id.to_string(),
+            server: record.server.clone(),
+            server_pid: session.server_pid,
+            server_started_at: session.server_started_at,
+            session_created_at: session.session_created_at,
+            session_id: record.session_id.clone(),
+            window_id: record.window_id.clone(),
+            pane_id: record.pane_id.clone(),
+            pane_pid: record.pane_pid,
+            process_pid: process.pid,
+            process_started_at_ms: process.started_at_ms,
+            agent: record.agent.clone(),
+            allow_working,
+            text,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.version != HANDOFF_VERSION {
             bail!("unsupported handoff operation version {}", self.version);
         }
         validate_handoff_id(&self.handoff_id)?;
+        validate_field("server", &self.server)?;
         for (value, prefix) in [
             (&self.session_id, '$'),
             (&self.window_id, '@'),
@@ -208,8 +299,11 @@ impl HandoffRequest {
                 bail!("handoff requires numeric tmux session, window and pane IDs");
             }
         }
-        if self.pane_pid == 0 {
-            bail!("handoff requires the target pane process identity");
+        if self.server_pid == 0 || self.server_started_at == 0 || self.session_created_at == 0 {
+            bail!("handoff requires tmux server and session lifetime identity");
+        }
+        if self.pane_pid == 0 || self.process_pid == 0 {
+            bail!("handoff requires the target pane and agent process identity");
         }
         if self.agent.is_empty() || !self.agent.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
             bail!("handoff requires an alphanumeric provider name");
@@ -302,10 +396,31 @@ pub fn compose_text(handoff_id: &str, options: &SendOptions) -> Result<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SentStatus {
+    /// The record was written and the control exchange has not finished.
     Sending,
     Delivered,
+    /// The receiver had already delivered this handoff ID; nothing was pasted.
     Duplicate,
+    /// The receiver refused before pasting anything.
     Failed,
+    /// The transport failed after the request left; the receiver may or may
+    /// not have pasted. A retry with the same ID resolves it.
+    Unconfirmed,
+    /// The peer binary does not speak this handoff operation version.
+    Incompatible,
+}
+
+impl SentStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sending => "sending",
+            Self::Delivered => "delivered",
+            Self::Duplicate => "duplicate",
+            Self::Failed => "failed",
+            Self::Unconfirmed => "unconfirmed",
+            Self::Incompatible => "incompatible",
+        }
+    }
 }
 
 /// Sender-side record of one handoff. It is the only trace on the sending
@@ -328,6 +443,12 @@ pub struct SentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub text: String,
+}
+
+pub struct SendReport {
+    pub record: SentRecord,
+    /// Delivery finished but the local sent record could not be updated.
+    pub audit_warning: Option<String>,
 }
 
 #[derive(Debug)]
@@ -376,7 +497,7 @@ pub async fn send(
     snapshot: &Snapshot,
     record: &AgentRecord,
     options: SendOptions,
-) -> Result<SentRecord> {
+) -> Result<SendReport> {
     let route = route(config, snapshot, record)?;
     let handoff_id = match &options.handoff_id {
         Some(id) => {
@@ -386,18 +507,7 @@ pub async fn send(
         None => generate_handoff_id()?,
     };
     let text = compose_text(&handoff_id, &options)?;
-    let request = HandoffRequest {
-        version: HANDOFF_VERSION,
-        handoff_id: handoff_id.clone(),
-        session_id: record.session_id.clone(),
-        window_id: record.window_id.clone(),
-        pane_id: record.pane_id.clone(),
-        pane_pid: record.pane_pid,
-        agent: record.agent.clone(),
-        allow_working: options.allow_working,
-        text: text.clone(),
-    };
-    request.validate()?;
+    let request = HandoffRequest::for_record(&handoff_id, record, options.allow_working, text)?;
     let mut sent = SentRecord {
         handoff_id,
         sent_at_ms: now_ms(),
@@ -415,32 +525,77 @@ pub async fn send(
         from: options.from.trim().to_string(),
         status: SentStatus::Sending,
         message: None,
-        text,
+        text: request.text.clone(),
     };
     write_sent(paths, &sent)?;
     let outcome = match route {
-        Route::Local => deliver(tmux, config, paths, &request),
+        // A local rejection carries the same typed shape as a remote one.
+        Route::Local => Ok(
+            deliver(tmux, config, paths, &request).unwrap_or_else(|error| {
+                HandoffResponse::Rejected {
+                    message: format!("{error:#}"),
+                }
+            }),
+        ),
         Route::Machine(machine) => send_control(&machine, &request).await,
     };
+    let (status, message) = classify_outcome(&request, outcome);
+    sent.status = status;
+    sent.message = message;
+    let audit_warning = write_sent(paths, &sent).err().map(|error| {
+        format!(
+            "handoff {} {}, but its sent record could not be updated: {error:#}",
+            sent.handoff_id,
+            sent.status.label()
+        )
+    });
+    Ok(SendReport {
+        record: sent,
+        audit_warning,
+    })
+}
+
+/// Map the control exchange to a sender status. Only an explicit receiver
+/// rejection means nothing was pasted; a transport error after the request
+/// left is unconfirmed until a retry with the same ID answers.
+fn classify_outcome(
+    request: &HandoffRequest,
+    outcome: Result<HandoffResponse>,
+) -> (SentStatus, Option<String>) {
     match outcome {
-        Ok(HandoffResponse::Delivered { duplicate, .. }) => {
-            sent.status = if duplicate {
-                SentStatus::Duplicate
-            } else {
-                SentStatus::Delivered
-            };
-        }
+        Ok(HandoffResponse::Delivered { handoff_id, .. }) if handoff_id != request.handoff_id => (
+            SentStatus::Unconfirmed,
+            Some("peer confirmed a different handoff ID; retry with the same --handoff-id".into()),
+        ),
+        Ok(HandoffResponse::Delivered {
+            duplicate: true, ..
+        }) => (SentStatus::Duplicate, None),
+        Ok(HandoffResponse::Delivered { .. }) => (SentStatus::Delivered, None),
         Ok(HandoffResponse::Rejected { message }) => {
-            sent.status = SentStatus::Failed;
-            sent.message = Some(terminal_safe(&message));
+            (SentStatus::Failed, Some(terminal_safe(&message)))
         }
-        Err(error) => {
-            sent.status = SentStatus::Failed;
-            sent.message = Some(terminal_safe(&format!("{error:#}")));
-        }
+        Ok(HandoffResponse::Unsupported { supported_version }) => (
+            SentStatus::Incompatible,
+            Some(format!(
+                "peer supports handoff operation version {supported_version}, this binary sends version {HANDOFF_VERSION}; update both machines together"
+            )),
+        ),
+        Err(error) => match error.downcast_ref::<ControlExit>() {
+            Some(ControlExit(Some(USAGE_EXIT_STATUS))) => (
+                SentStatus::Incompatible,
+                Some(
+                    "peer binary has no remote-handoff operation; update the remote binary".into(),
+                ),
+            ),
+            _ => (
+                SentStatus::Unconfirmed,
+                Some(format!(
+                    "{}; retry with the same --handoff-id, the receiver answers duplicate if it was delivered",
+                    terminal_safe(&format!("{error:#}"))
+                )),
+            ),
+        },
     }
-    write_sent(paths, &sent)?;
-    Ok(sent)
 }
 
 async fn send_control(
@@ -455,18 +610,11 @@ async fn send_control(
         DELIVERY_TIMEOUT,
     )
     .await?;
-    let response: HandoffResponse =
-        serde_json::from_slice(&response).context("invalid remote handoff response")?;
-    if let HandoffResponse::Delivered { handoff_id, .. } = &response
-        && *handoff_id != request.handoff_id
-    {
-        bail!("remote confirmed a different handoff");
-    }
-    Ok(response)
+    serde_json::from_slice(&response).context("invalid remote handoff response")
 }
 
 /// Receiving side of the SSH control command. Always answers with a typed
-/// response on stdout so the sender can record the exact rejection.
+/// response on stdout so the sender can record the exact outcome.
 pub fn serve(tmux: &Tmux, config: &Config, paths: &RuntimePaths) -> Result<()> {
     let result = (|| {
         let mut input = Vec::new();
@@ -475,6 +623,15 @@ pub fn serve(tmux: &Tmux, config: &Config, paths: &RuntimePaths) -> Result<()> {
             .read_to_end(&mut input)?;
         if input.len() as u64 > REQUEST_LIMIT {
             bail!("handoff request exceeded size limit");
+        }
+        // Read only the version first so a newer sender gets a typed answer
+        // instead of an unknown-field rejection.
+        let version: VersionOnly =
+            serde_json::from_slice(&input).context("invalid handoff request")?;
+        if version.version != HANDOFF_VERSION {
+            return Ok(HandoffResponse::Unsupported {
+                supported_version: HANDOFF_VERSION,
+            });
         }
         let request: HandoffRequest =
             serde_json::from_slice(&input).context("invalid handoff request")?;
@@ -490,20 +647,100 @@ pub fn serve(tmux: &Tmux, config: &Config, paths: &RuntimePaths) -> Result<()> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct VersionOnly {
+    version: u32,
+}
+
 fn deliver(
     tmux: &Tmux,
     config: &Config,
     paths: &RuntimePaths,
     request: &HandoffRequest,
 ) -> Result<HandoffResponse> {
+    deliver_with(tmux, paths, request, || scan_once(tmux, config, paths))
+}
+
+/// Under the pane lock: answer an already delivered ID first, then validate
+/// against a fresh scan, claim the ledger entry, and paste. Claiming before
+/// pasting means a transport failure after the paste is answered as a
+/// duplicate on retry rather than pasted twice.
+fn deliver_with(
+    tmux: &Tmux,
+    paths: &RuntimePaths,
+    request: &HandoffRequest,
+    scan: impl FnOnce() -> Result<Snapshot>,
+) -> Result<HandoffResponse> {
     request.validate()?;
-    let snapshot = scan_once(tmux, config, paths)?;
+    let root = ensure_dir(&paths.handoffs)?;
+    let ledger = ensure_dir(&root.join("delivered"))?;
+    let locks = ensure_dir(&root.join("locks"))?;
+    let _lock = PaneLock::acquire(&locks.join(request.pane_id.trim_start_matches('%')))?;
+    let marker = ledger.join(&request.handoff_id);
+    if marker.exists() {
+        return Ok(HandoffResponse::Delivered {
+            handoff_id: request.handoff_id.clone(),
+            duplicate: true,
+        });
+    }
+    let snapshot = scan()?;
     validate_against_snapshot(&snapshot, request)?;
-    let duplicate = paste(tmux, paths, request)?;
+    let live = tmux
+        .list_panes()?
+        .into_iter()
+        .find(|pane| pane.pane_id == request.pane_id && !pane.dead)
+        .context("target pane vanished before delivery")?;
+    if live.pane_pid != request.pane_pid {
+        bail!("target pane was recreated before delivery");
+    }
+    fs::write(&marker, b"")
+        .with_context(|| format!("claim delivered handoff {}", marker.display()))?;
+    if let Err(error) = paste(tmux, &root, request) {
+        // Nothing reached the pane, so the ID may be retried.
+        let _ = fs::remove_file(&marker);
+        return Err(error);
+    }
+    prune_ledger(&ledger);
     Ok(HandoffResponse::Delivered {
         handoff_id: request.handoff_id.clone(),
-        duplicate,
+        duplicate: false,
     })
+}
+
+/// Load the text into a named buffer, paste it as one bracketed block, and
+/// submit it. Failures before the paste leave nothing in the pane and return
+/// an error so the ledger claim is released.
+fn paste(tmux: &Tmux, root: &Path, request: &HandoffRequest) -> Result<()> {
+    let buffer = format!("tmux-agent-handoff-{}", request.handoff_id);
+    let staged = root.join(format!("{}.{}.txt", request.handoff_id, std::process::id()));
+    fs::write(&staged, request.text.as_bytes())
+        .with_context(|| format!("stage handoff text {}", staged.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
+    let staged_path = staged.to_string_lossy().into_owned();
+    let loaded = tmux.run(&["load-buffer", "-b", &buffer, &staged_path]);
+    let _ = fs::remove_file(&staged);
+    loaded?;
+    // One tmux command sequence: the paste and Enter are queued together on
+    // the server, and the buffer is deleted by the paste itself.
+    if let Err(error) = tmux.run(&[
+        "paste-buffer",
+        "-p",
+        "-d",
+        "-b",
+        &buffer,
+        "-t",
+        &request.pane_id,
+        ";",
+        "send-keys",
+        "-t",
+        &request.pane_id,
+        "Enter",
+    ]) {
+        let _ = tmux.run(&["delete-buffer", "-b", &buffer]);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn scan_once(tmux: &Tmux, config: &Config, paths: &RuntimePaths) -> Result<Snapshot> {
@@ -528,18 +765,53 @@ pub fn validate_against_snapshot<'a>(
     snapshot: &'a Snapshot,
     request: &HandoffRequest,
 ) -> Result<&'a AgentRecord> {
+    if snapshot.server != request.server {
+        bail!(
+            "configured SSH control targets tmux server {}, not {}; configure the same server for watch and remote-handoff",
+            terminal_safe(&snapshot.server),
+            terminal_safe(&request.server)
+        );
+    }
     let record = snapshot
         .agents
         .iter()
         .find(|agent| {
-            agent.is_tmux() && agent.remote_alias.is_none() && agent.pane_id == request.pane_id
+            agent.is_tmux()
+                && agent.remote_alias.is_none()
+                && agent.subagent.is_none()
+                && agent.pane_id == request.pane_id
         })
         .context("no agent is detected in the target pane; it may have exited or been replaced")?;
-    if record.session_id != request.session_id || record.window_id != request.window_id {
-        bail!("target pane moved to another window or its session was replaced");
+    let session = record
+        .session_connections
+        .as_ref()
+        .context("target session lifetime is unavailable")?;
+    if session.server_pid != request.server_pid
+        || session.server_started_at != request.server_started_at
+    {
+        bail!("target belongs to a different or restarted tmux server");
+    }
+    if record.session_id != request.session_id
+        || session.session_created_at != request.session_created_at
+    {
+        bail!("target session was replaced or the pane changed sessions");
+    }
+    if record.window_id != request.window_id {
+        bail!("target pane moved to another window");
     }
     if record.pane_pid != request.pane_pid {
         bail!("target pane was recreated since the sender looked it up");
+    }
+    let process = record
+        .process
+        .context("target agent process identity is unavailable")?;
+    if process.pid != request.process_pid
+        || process
+            .started_at_ms
+            .zip(request.process_started_at_ms)
+            .is_some_and(|(actual, expected)| actual != expected)
+    {
+        bail!("target agent process was restarted or replaced since the sender looked it up");
     }
     if !record.agent.eq_ignore_ascii_case(&request.agent) {
         bail!(
@@ -547,9 +819,6 @@ pub fn validate_against_snapshot<'a>(
             terminal_safe(&record.agent),
             terminal_safe(&request.agent)
         );
-    }
-    if record.subagent.is_some() {
-        bail!("target pane is a subagent view, not a top-level agent");
     }
     match record.state {
         AgentState::Blocked => {
@@ -561,56 +830,6 @@ pub fn validate_against_snapshot<'a>(
         }
         AgentState::Working | AgentState::Idle => Ok(record),
     }
-}
-
-/// Paste the text as one bracketed block and submit it. Returns true when the
-/// handoff ID was already delivered, in which case nothing is pasted.
-fn paste(tmux: &Tmux, paths: &RuntimePaths, request: &HandoffRequest) -> Result<bool> {
-    let root = ensure_dir(&paths.handoffs)?;
-    let ledger = ensure_dir(&root.join("delivered"))?;
-    let locks = ensure_dir(&root.join("locks"))?;
-    let marker = ledger.join(&request.handoff_id);
-    // One delivery at a time per pane, so two senders cannot interleave
-    // their lines into a single submitted message.
-    let _lock = PaneLock::acquire(&locks.join(request.pane_id.trim_start_matches('%')))?;
-    if marker.exists() {
-        return Ok(true);
-    }
-    let live = tmux
-        .list_panes()?
-        .into_iter()
-        .find(|pane| pane.pane_id == request.pane_id && !pane.dead)
-        .context("target pane vanished before delivery")?;
-    if live.pane_pid != request.pane_pid {
-        bail!("target pane was recreated before delivery");
-    }
-    let buffer = format!("tmux-agent-handoff-{}", request.handoff_id);
-    let staged = root.join(format!("{}.{}.txt", request.handoff_id, std::process::id()));
-    fs::write(&staged, request.text.as_bytes())
-        .with_context(|| format!("stage handoff text {}", staged.display()))?;
-    #[cfg(unix)]
-    fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
-    let staged_path = staged.to_string_lossy().into_owned();
-    let result = tmux
-        .run(&["load-buffer", "-b", &buffer, &staged_path])
-        .and_then(|_| {
-            tmux.run(&[
-                "paste-buffer",
-                "-p",
-                "-d",
-                "-b",
-                &buffer,
-                "-t",
-                &request.pane_id,
-            ])
-        })
-        .and_then(|_| tmux.run(&["send-keys", "-t", &request.pane_id, "Enter"]));
-    let _ = fs::remove_file(&staged);
-    result?;
-    fs::write(&marker, b"")
-        .with_context(|| format!("record delivered handoff {}", marker.display()))?;
-    prune_ledger(&ledger);
-    Ok(false)
 }
 
 fn prune_ledger(ledger: &Path) {
@@ -711,7 +930,6 @@ pub fn print_sent(records: &[SentRecord], json: bool) -> Result<()> {
         return Ok(());
     }
     for record in records {
-        let status = format!("{:?}", record.status).to_ascii_lowercase();
         let detail = record
             .message
             .as_deref()
@@ -720,7 +938,7 @@ pub fn print_sent(records: &[SentRecord], json: bool) -> Result<()> {
         println!(
             "{}\t{}\t{}\t{}\t{}@{}{}",
             record.handoff_id,
-            status,
+            record.status.label(),
             terminal_safe(&record.target_id),
             record.kind.label(),
             terminal_safe(&record.repository),
@@ -751,10 +969,21 @@ mod tests {
     use super::*;
     use crate::model::{
         AgentOrigin, AgentState, Attention, ClientConnection, MoshEndpoint, PeerStatus,
-        SessionConnections, SubagentInfo,
+        ProcessIdentity, SessionConnections, SubagentInfo,
     };
+    use crate::tmux::Pane;
     use std::process::Command;
     use std::time::Instant;
+
+    fn session() -> SessionConnections {
+        SessionConnections {
+            server_pid: 10,
+            server_started_at: 20,
+            session_created_at: 30,
+            complete: true,
+            clients: Vec::new(),
+        }
+    }
 
     fn record(id: &str, pane: &str) -> AgentRecord {
         AgentRecord {
@@ -763,6 +992,10 @@ mod tests {
             server: "default".into(),
             pane_id: pane.into(),
             pane_pid: 4242,
+            process: Some(ProcessIdentity {
+                pid: 4300,
+                started_at_ms: Some(1_000),
+            }),
             session_id: "$1".into(),
             session_name: "work".into(),
             window_id: "@2".into(),
@@ -775,7 +1008,7 @@ mod tests {
             source: Default::default(),
             title: "fix parser".into(),
             label: None,
-            cwd: "/home/agent/project".into(),
+            cwd: "/home/agent/hypertectonic/tmux-agent".into(),
             visible: true,
             seen: true,
             changed_at_ms: 1,
@@ -783,7 +1016,7 @@ mod tests {
             terminal: None,
             remote_alias: None,
             ssh_connection: None,
-            session_connections: None,
+            session_connections: Some(session()),
             focus_target: None,
             goal: None,
             subagent: None,
@@ -800,6 +1033,7 @@ mod tests {
 
     fn snapshot(agents: Vec<AgentRecord>, peers: Vec<PeerStatus>) -> Snapshot {
         Snapshot {
+            server: "default".into(),
             agents,
             peers,
             ..Snapshot::default()
@@ -828,17 +1062,13 @@ mod tests {
     }
 
     fn request(text: &str) -> HandoffRequest {
-        HandoffRequest {
-            version: HANDOFF_VERSION,
-            handoff_id: "abc-123".into(),
-            session_id: "$1".into(),
-            window_id: "@2".into(),
-            pane_id: "%3".into(),
-            pane_pid: 4242,
-            agent: "codex".into(),
-            allow_working: false,
-            text: text.into(),
-        }
+        HandoffRequest::for_record(
+            "abc-123",
+            &record("local/default/%3", "%3"),
+            false,
+            text.into(),
+        )
+        .unwrap()
     }
 
     fn options() -> SendOptions {
@@ -855,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn request_validation_rejects_bad_ids_versions_and_control_text() {
+    fn request_validation_rejects_bad_ids_versions_lifetimes_and_control_text() {
         request("hello").validate().unwrap();
         let mut stale = request("hello");
         stale.version = 2;
@@ -867,6 +1097,8 @@ mod tests {
             ("id", "../escape"),
             ("id", ""),
             ("agent", "co dex"),
+            ("server", ""),
+            ("server", "default\n"),
         ] {
             let mut bad = request("hello");
             match field {
@@ -875,17 +1107,60 @@ mod tests {
                 "pane" => bad.pane_id = value.into(),
                 "id" => bad.handoff_id = value.into(),
                 "agent" => bad.agent = value.into(),
+                "server" => bad.server = value.into(),
                 _ => unreachable!(),
             }
             assert!(bad.validate().is_err(), "accepted {field} {value:?}");
         }
-        let mut zero = request("hello");
-        zero.pane_pid = 0;
-        assert!(zero.validate().is_err());
-        assert!(request("   \n").validate().is_err());
+        for field in ["pane", "process", "server", "started", "created"] {
+            let mut zero = request("hello");
+            match field {
+                "pane" => zero.pane_pid = 0,
+                "process" => zero.process_pid = 0,
+                "server" => zero.server_pid = 0,
+                "started" => zero.server_started_at = 0,
+                "created" => zero.session_created_at = 0,
+                _ => unreachable!(),
+            }
+            assert!(zero.validate().is_err(), "accepted zero {field}");
+        }
         assert!(request("line\x1b[2J").validate().is_err());
         assert!(request("tabs\tand\nnewlines are fine").validate().is_ok());
         assert!(request(&"x".repeat(TEXT_LIMIT + 1)).validate().is_err());
+    }
+
+    #[test]
+    fn request_construction_fails_closed_without_lifetime_or_process_identity() {
+        let mut vanished = record("local/default/%3", "%3");
+        vanished.session_connections = Some(SessionConnections {
+            server_pid: 0,
+            server_started_at: 0,
+            session_created_at: 0,
+            complete: true,
+            clients: Vec::new(),
+        });
+        assert!(HandoffRequest::for_record("id", &vanished, false, "x".into()).is_err());
+        let mut no_session = record("local/default/%3", "%3");
+        no_session.session_connections = None;
+        assert!(HandoffRequest::for_record("id", &no_session, false, "x".into()).is_err());
+        let mut older_peer = record("local/default/%3", "%3");
+        older_peer.process = None;
+        let error = HandoffRequest::for_record("id", &older_peer, false, "x".into()).unwrap_err();
+        assert!(error.to_string().contains("update"), "{error}");
+        let full = request("x");
+        assert_eq!(
+            (
+                full.server.as_str(),
+                full.server_pid,
+                full.server_started_at,
+                full.session_created_at
+            ),
+            ("default", 10, 20, 30)
+        );
+        assert_eq!(
+            (full.process_pid, full.process_started_at_ms),
+            (4300, Some(1_000))
+        );
     }
 
     #[test]
@@ -911,18 +1186,30 @@ mod tests {
     }
 
     #[test]
-    fn target_resolution_requires_exactly_one_match() {
+    fn target_resolution_requires_exactly_one_top_level_match() {
         let mut other = record("local/default/%2", "%2");
         other.agent = "claude".into();
         other.cwd = "/home/agent/other".into();
         other.attention = Attention::Working;
-        let snapshot = snapshot(vec![record("local/default/%1", "%1"), other], vec![]);
+        // A Codex child shares its parent's pane and must not make the pane
+        // ID ambiguous.
+        let mut child = record("local/default/%1/thread-9", "%1");
+        child.subagent = Some(SubagentInfo {
+            parent_id: "local/default/%1".into(),
+            started_at_ms: 1,
+            finished_at_ms: None,
+            name: Some("worker".into()),
+            thread_id: Some("thread-9".into()),
+        });
+        let snapshot = snapshot(vec![record("local/default/%1", "%1"), other, child], vec![]);
         let filters = TargetFilters::default();
+        assert_eq!(filter_agents(&snapshot, &filters).len(), 2);
         assert!(resolve_target(&snapshot, None, &filters).is_err());
         assert_eq!(
             resolve_target(&snapshot, Some("%1"), &filters).unwrap().id,
             "local/default/%1"
         );
+        assert!(resolve_target(&snapshot, Some("thread-9"), &filters).is_err());
         let by_provider = TargetFilters {
             provider: Some("Claude".into()),
             ..TargetFilters::default()
@@ -934,7 +1221,7 @@ mod tests {
             "%2"
         );
         let by_cwd_and_state = TargetFilters {
-            cwd: Some("OTHER".into()),
+            cwd: Some("other".into()),
             state: Some("working".into()),
             ..TargetFilters::default()
         };
@@ -952,6 +1239,31 @@ mod tests {
     }
 
     #[test]
+    fn cwd_filter_matches_whole_path_components_only() {
+        let directory = "/home/agent/hypertectonic/tmux-agent";
+        for filter in [
+            "tmux-agent",
+            "hypertectonic/tmux-agent",
+            "/home/agent",
+            "agent/hypertectonic",
+            "/home/agent/hypertectonic/tmux-agent",
+            "/home/agent/hypertectonic/tmux-agent/",
+        ] {
+            assert!(path_components_match(filter, directory), "{filter}");
+        }
+        for filter in [
+            "agent",
+            "mux-agent",
+            "home/hypertectonic",
+            "tmux-agent/src",
+            "",
+            "/",
+        ] {
+            assert!(!path_components_match(filter, directory), "{filter}");
+        }
+    }
+
+    #[test]
     fn routing_uses_the_configured_machine_and_its_advertised_capability() {
         let config = Config {
             machines: vec![machine("build-host")],
@@ -966,16 +1278,13 @@ mod tests {
 
         let mut mosh_transport = remote_record("build-host", "%7");
         mosh_transport.session_connections = Some(SessionConnections {
-            server_pid: 10,
-            server_started_at: 20,
-            session_created_at: 30,
-            complete: true,
             clients: vec![ClientConnection::Mosh {
                 endpoint: MoshEndpoint {
                     address: "127.0.0.1".into(),
                     port: 60001,
                 },
             }],
+            ..session()
         });
         // The visible transport may be Mosh; control still uses configured SSH.
         match route(&config, &advertised, &mosh_transport).unwrap() {
@@ -1013,7 +1322,59 @@ mod tests {
     }
 
     #[test]
-    fn receiver_validation_rejects_stale_replaced_and_busy_targets() {
+    fn outcomes_distinguish_rejection_transport_loss_and_incompatibility() {
+        let request = request("hello");
+        let delivered = classify_outcome(
+            &request,
+            Ok(HandoffResponse::Delivered {
+                handoff_id: "abc-123".into(),
+                duplicate: false,
+            }),
+        );
+        assert_eq!(delivered.0, SentStatus::Delivered);
+        let duplicate = classify_outcome(
+            &request,
+            Ok(HandoffResponse::Delivered {
+                handoff_id: "abc-123".into(),
+                duplicate: true,
+            }),
+        );
+        assert_eq!(duplicate.0, SentStatus::Duplicate);
+        let other_id = classify_outcome(
+            &request,
+            Ok(HandoffResponse::Delivered {
+                handoff_id: "zzz".into(),
+                duplicate: false,
+            }),
+        );
+        assert_eq!(other_id.0, SentStatus::Unconfirmed);
+        let rejected = classify_outcome(
+            &request,
+            Ok(HandoffResponse::Rejected {
+                message: "target is blocked\x1b".into(),
+            }),
+        );
+        assert_eq!(rejected.0, SentStatus::Failed);
+        assert_eq!(rejected.1.as_deref(), Some("target is blocked "));
+        let unsupported = classify_outcome(
+            &request,
+            Ok(HandoffResponse::Unsupported {
+                supported_version: 7,
+            }),
+        );
+        assert_eq!(unsupported.0, SentStatus::Incompatible);
+        assert!(unsupported.1.unwrap().contains("version 7"));
+        let missing_command = classify_outcome(&request, Err(ControlExit(Some(2)).into()));
+        assert_eq!(missing_command.0, SentStatus::Incompatible);
+        let ssh_failure = classify_outcome(&request, Err(ControlExit(Some(255)).into()));
+        assert_eq!(ssh_failure.0, SentStatus::Unconfirmed);
+        assert!(ssh_failure.1.unwrap().contains("--handoff-id"));
+        let timeout = classify_outcome(&request, Err(anyhow::anyhow!("SSH control timed out")));
+        assert_eq!(timeout.0, SentStatus::Unconfirmed);
+    }
+
+    #[test]
+    fn receiver_validation_rejects_other_servers_stale_replaced_and_busy_targets() {
         let live = record("host/default/%3", "%3");
         let live_snapshot = snapshot(vec![live.clone()], vec![]);
         let request = request("hello");
@@ -1024,23 +1385,43 @@ mod tests {
             live.id
         );
 
-        let mut recreated = request.clone();
-        recreated.pane_pid = 4243;
-        assert!(
-            validate_against_snapshot(&live_snapshot, &recreated)
-                .unwrap_err()
-                .to_string()
-                .contains("recreated")
-        );
-        let mut moved = request.clone();
-        moved.window_id = "@9".into();
-        assert!(validate_against_snapshot(&live_snapshot, &moved).is_err());
-        let mut renamed_session = request.clone();
-        renamed_session.session_id = "$9".into();
-        assert!(validate_against_snapshot(&live_snapshot, &renamed_session).is_err());
+        let mut other_server = live_snapshot.clone();
+        other_server.server = "inner".into();
+        let error = validate_against_snapshot(&other_server, &request).unwrap_err();
+        assert!(error.to_string().contains("remote-handoff"), "{error}");
+
+        let cases: [(&str, Box<dyn Fn(&mut HandoffRequest)>); 8] = [
+            ("recreated pane", Box::new(|r| r.pane_pid = 4243)),
+            ("moved window", Box::new(|r| r.window_id = "@9".into())),
+            ("replaced session", Box::new(|r| r.session_id = "$9".into())),
+            ("older session", Box::new(|r| r.session_created_at = 31)),
+            ("restarted server", Box::new(|r| r.server_started_at = 21)),
+            ("other server pid", Box::new(|r| r.server_pid = 11)),
+            ("restarted agent", Box::new(|r| r.process_pid = 4301)),
+            (
+                "reused agent pid",
+                Box::new(|r| r.process_started_at_ms = Some(2_000)),
+            ),
+        ];
+        for (name, mutate) in cases {
+            let mut stale = request.clone();
+            mutate(&mut stale);
+            assert!(
+                validate_against_snapshot(&live_snapshot, &stale).is_err(),
+                "accepted {name}"
+            );
+        }
         let mut vanished = request.clone();
         vanished.pane_id = "%99".into();
         assert!(validate_against_snapshot(&live_snapshot, &vanished).is_err());
+
+        // A receiver that cannot report a start time still matches on the PID.
+        let mut no_start = live.clone();
+        no_start.process = Some(ProcessIdentity {
+            pid: 4300,
+            started_at_ms: None,
+        });
+        assert!(validate_against_snapshot(&snapshot(vec![no_start], vec![]), &request).is_ok());
 
         let mut other_provider = live.clone();
         other_provider.agent = "claude".into();
@@ -1091,7 +1472,7 @@ mod tests {
             text: "[header]\nbody".into(),
         };
         write_sent(&paths, &first).unwrap();
-        first.status = SentStatus::Failed;
+        first.status = SentStatus::Unconfirmed;
         first.message = Some("peer offline".into());
         write_sent(&paths, &first).unwrap();
         let second = SentRecord {
@@ -1109,7 +1490,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["second", "first"]
         );
-        assert_eq!(records[1].status, SentStatus::Failed);
+        assert_eq!(records[1].status, SentStatus::Unconfirmed);
         assert_eq!(records[1].message.as_deref(), Some("peer offline"));
         #[cfg(unix)]
         {
@@ -1152,7 +1533,9 @@ mod tests {
 
     /// An isolated tmux server whose only pane runs `cat` with its output
     /// discarded: the terminal echo shows each submitted line exactly once.
-    fn cat_server(label: &str) -> Option<(Server, Tmux, HandoffRequest)> {
+    /// The returned request carries the pane's real identity and a synthetic
+    /// agent process identity; `snapshot_for` builds the matching scan result.
+    fn cat_server(label: &str) -> Option<(Server, Tmux, HandoffRequest, Pane)> {
         if Command::new("tmux").arg("-V").output().is_err() {
             eprintln!("skipping {label}: tmux unavailable");
             return None;
@@ -1160,7 +1543,7 @@ mod tests {
         let name = format!("handoff-{label}-{}", std::process::id());
         let server = Server(name.clone());
         let tmux = Tmux::new(&Config {
-            tmux_args: vec!["-L".into(), name],
+            tmux_args: vec!["-L".into(), name.clone()],
             ..Config::default()
         });
         tmux.run(&[
@@ -1183,14 +1566,54 @@ mod tests {
             .into_iter()
             .find(|pane| pane.session_name == "target")
             .unwrap();
+        let processes = tmux
+            .fresh_process_snapshot(std::slice::from_ref(&pane))
+            .unwrap();
+        let session = tmux
+            .session_connections(&processes)
+            .unwrap()
+            .remove(&pane.session_id)
+            .unwrap();
         let request = HandoffRequest {
+            server: name,
+            server_pid: session.server_pid,
+            server_started_at: session.server_started_at,
+            session_created_at: session.session_created_at,
             session_id: pane.session_id.clone(),
             window_id: pane.window_id.clone(),
             pane_id: pane.pane_id.clone(),
             pane_pid: pane.pane_pid,
+            process_pid: pane.pane_pid,
+            process_started_at_ms: None,
             ..request("placeholder")
         };
-        Some((server, tmux, request))
+        Some((server, tmux, request, pane))
+    }
+
+    /// A scan result that agrees with the live pane, as the receiver's own
+    /// scanner would report for a detected idle agent.
+    fn snapshot_for(request: &HandoffRequest, pane: &Pane) -> Snapshot {
+        let mut record = record("host/x/%0", &request.pane_id);
+        record.server = request.server.clone();
+        record.pane_pid = pane.pane_pid;
+        record.process = Some(ProcessIdentity {
+            pid: request.process_pid,
+            started_at_ms: None,
+        });
+        record.session_id = request.session_id.clone();
+        record.window_id = request.window_id.clone();
+        record.session_connections = Some(SessionConnections {
+            server_pid: request.server_pid,
+            server_started_at: request.server_started_at,
+            session_created_at: request.session_created_at,
+            complete: true,
+            clients: Vec::new(),
+        });
+        Snapshot {
+            server: request.server.clone(),
+            agents: vec![record],
+            ..Snapshot::default()
+        }
     }
 
     fn capture(tmux: &Tmux, pane_id: &str) -> String {
@@ -1210,16 +1633,23 @@ mod tests {
     }
 
     #[test]
-    fn paste_submits_multiline_text_once_and_treats_a_retry_as_duplicate() {
-        let Some((_server, tmux, mut request)) = cat_server("multiline") else {
+    fn delivery_submits_multiline_text_once_and_answers_a_retry_as_duplicate() {
+        let Some((_server, tmux, mut request, pane)) = cat_server("multiline") else {
             return;
         };
         let directory = tempfile::tempdir().unwrap();
         let paths = test_paths(directory.path());
         request.text = compose_text(&request.handoff_id, &options()).unwrap();
-        assert!(!paste(&tmux, &paths, &request).unwrap());
+        let live = snapshot_for(&request, &pane);
+        let first = deliver_with(&tmux, &paths, &request, || Ok(live.clone())).unwrap();
+        assert_eq!(
+            first,
+            HandoffResponse::Delivered {
+                handoff_id: request.handoff_id.clone(),
+                duplicate: false
+            }
+        );
         let screen = wait_for(&tmux, &request.pane_id, "Run cargo test.");
-        // cat echoes the submitted block once, so each line appears once.
         for line in request.text.lines() {
             assert_eq!(
                 screen.matches(line).count(),
@@ -1227,13 +1657,29 @@ mod tests {
                 "line {line:?} in {screen:?}"
             );
         }
-        assert!(
-            paste(&tmux, &paths, &request).unwrap(),
-            "retry was not a duplicate"
+        // The ledger answers before any validation, so a retry whose target
+        // has since changed is still reported as delivered, not rejected.
+        let mut stale_retry = request.clone();
+        stale_retry.pane_pid += 1;
+        stale_retry.process_pid += 1;
+        let retry = deliver_with(&tmux, &paths, &stale_retry, || {
+            panic!("a duplicate must be answered without scanning")
+        })
+        .unwrap();
+        assert_eq!(
+            retry,
+            HandoffResponse::Delivered {
+                handoff_id: request.handoff_id.clone(),
+                duplicate: true
+            }
         );
         std::thread::sleep(Duration::from_millis(200));
-        let screen = capture(&tmux, &request.pane_id);
-        assert_eq!(screen.matches("Run cargo test.").count(), 1);
+        assert_eq!(
+            capture(&tmux, &request.pane_id)
+                .matches("Run cargo test.")
+                .count(),
+            1
+        );
         assert!(
             paths
                 .handoffs
@@ -1251,64 +1697,81 @@ mod tests {
     }
 
     #[test]
-    fn paste_refuses_a_recreated_or_missing_pane_without_typing() {
-        let Some((_server, tmux, request)) = cat_server("stale") else {
+    fn delivery_refuses_stale_targets_without_typing_or_claiming_the_id() {
+        let Some((_server, tmux, request, pane)) = cat_server("stale") else {
             return;
         };
         let directory = tempfile::tempdir().unwrap();
         let paths = test_paths(directory.path());
+        let live = snapshot_for(&request, &pane);
         let mut recreated = request.clone();
         recreated.pane_pid += 1;
         recreated.text = "must not appear".into();
-        assert!(paste(&tmux, &paths, &recreated).is_err());
+        assert!(deliver_with(&tmux, &paths, &recreated, || Ok(live.clone())).is_err());
+        let mut restarted = request.clone();
+        restarted.process_pid += 1;
+        restarted.text = "must not appear".into();
+        assert!(deliver_with(&tmux, &paths, &restarted, || Ok(live.clone())).is_err());
+        let mut other_server = request.clone();
+        other_server.server = "elsewhere".into();
+        other_server.text = "must not appear".into();
+        assert!(deliver_with(&tmux, &paths, &other_server, || Ok(live.clone())).is_err());
         let mut missing = request.clone();
         missing.pane_id = "%999".into();
         missing.text = "must not appear".into();
-        assert!(paste(&tmux, &paths, &missing).is_err());
+        assert!(deliver_with(&tmux, &paths, &missing, || Ok(live.clone())).is_err());
+        // Validation passes but the pane vanished between scan and paste.
+        let mut vanished = request.clone();
+        vanished.text = "must not appear".into();
+        let mut ghost = live.clone();
+        ghost.agents[0].pane_id = "%999".into();
+        vanished.pane_id = "%999".into();
+        assert!(deliver_with(&tmux, &paths, &vanished, || Ok(ghost.clone())).is_err());
         std::thread::sleep(Duration::from_millis(200));
         assert!(!capture(&tmux, &request.pane_id).contains("must not appear"));
+        let ledger = paths.handoffs.join("delivered");
         assert!(
-            !paths.handoffs.join("delivered").exists()
-                || fs::read_dir(paths.handoffs.join("delivered"))
-                    .unwrap()
-                    .count()
-                    == 0
+            fs::read_dir(&ledger)
+                .map(|entries| entries.count() == 0)
+                .unwrap_or(true)
         );
     }
 
     #[test]
     fn concurrent_deliveries_to_one_pane_never_interleave() {
-        let Some((_server, tmux, request)) = cat_server("concurrent") else {
+        let Some((_server, tmux, request, pane)) = cat_server("concurrent") else {
             return;
         };
         let directory = tempfile::tempdir().unwrap();
-        let paths = test_paths(directory.path());
+        let live = snapshot_for(&request, &pane);
         let senders = (0..4)
             .map(|index| {
                 let tmux = tmux.clone();
-                let paths = RuntimePaths {
-                    handoffs: paths.handoffs.clone(),
-                    ..test_paths(directory.path())
-                };
+                let paths = test_paths(directory.path());
+                let live = live.clone();
                 let mut request = request.clone();
                 request.handoff_id = format!("sender-{index}");
                 request.text = (0..3)
                     .map(|line| format!("sender{index} line{line}"))
                     .collect::<Vec<_>>()
                     .join("\n");
-                std::thread::spawn(move || paste(&tmux, &paths, &request).unwrap())
+                std::thread::spawn(move || {
+                    deliver_with(&tmux, &paths, &request, || Ok(live)).unwrap()
+                })
             })
             .collect::<Vec<_>>();
         for sender in senders {
-            assert!(!sender.join().unwrap());
+            assert!(matches!(
+                sender.join().unwrap(),
+                HandoffResponse::Delivered {
+                    duplicate: false,
+                    ..
+                }
+            ));
         }
-        let screen = wait_for(&tmux, &request.pane_id, "sender3 line2");
+        wait_for(&tmux, &request.pane_id, "sender3 line2");
         std::thread::sleep(Duration::from_millis(200));
-        let screen = if screen.contains("sender0 line2") {
-            screen
-        } else {
-            capture(&tmux, &request.pane_id)
-        };
+        let screen = capture(&tmux, &request.pane_id);
         let lines = screen
             .lines()
             .filter(|line| line.starts_with("sender"))
@@ -1325,16 +1788,16 @@ mod tests {
 
     #[test]
     fn nested_inner_server_receives_text_while_attached_from_an_outer_server() {
-        let Some((_inner_server, inner, mut request)) = cat_server("nested-inner") else {
+        let Some((inner_server, inner, mut request, pane)) = cat_server("nested-inner") else {
             return;
         };
         let outer_name = format!("handoff-nested-outer-{}", std::process::id());
-        let _outer_server = Server(outer_name.clone());
+        let outer_server = Server(outer_name.clone());
         let outer = Tmux::new(&Config {
             tmux_args: vec!["-L".into(), outer_name],
             ..Config::default()
         });
-        let attach = format!("tmux -L {} attach-session -t target", _inner_server.0);
+        let attach = format!("tmux -L {} attach-session -t target", inner_server.0);
         outer
             .run(&[
                 "-f",
@@ -1364,7 +1827,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let paths = test_paths(directory.path());
         request.text = "nested one\nnested two".into();
-        assert!(!paste(&inner, &paths, &request).unwrap());
+        let live = snapshot_for(&request, &pane);
+        // A scan of the outer server must not satisfy the inner request.
+        let mut outer_scan = live.clone();
+        outer_scan.server = outer_server.0.clone();
+        assert!(deliver_with(&inner, &paths, &request, || Ok(outer_scan.clone())).is_err());
+        deliver_with(&inner, &paths, &request, || Ok(live.clone())).unwrap();
         wait_for(&inner, &request.pane_id, "nested two");
         // The outer client mirrors the inner pane, so the text is visible there too.
         let outer_pane = outer

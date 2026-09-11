@@ -2996,6 +2996,7 @@ mod tests {
             server: "default".into(),
             pane_id: "%0".into(),
             pane_pid: 100,
+            process: None,
             session_id: "$0".into(),
             session_name: session.into(),
             window_id: "@0".into(),

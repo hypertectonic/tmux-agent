@@ -184,6 +184,22 @@ fn confirm_response(response: &[u8], request: &FocusRequest) -> Result<()> {
     }
 }
 
+/// The control command exited unsuccessfully. Callers can distinguish a peer
+/// binary that lacks the operation from a transport failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ControlExit(pub(crate) Option<i32>);
+
+impl std::fmt::Display for ControlExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(code) => write!(formatter, "SSH control failed with exit status {code}"),
+            None => write!(formatter, "SSH control was terminated by a signal"),
+        }
+    }
+}
+
+impl std::error::Error for ControlExit {}
+
 /// Run one bounded SSH control command: the payload goes to stdin, the typed
 /// response comes back on stdout, and the whole exchange shares one deadline.
 pub(crate) async fn control_output(
@@ -222,7 +238,7 @@ pub(crate) async fn control_output(
         }
         let status = child.wait().await?;
         if !status.success() {
-            bail!("SSH control failed with {status}");
+            return Err(ControlExit(status.code()).into());
         }
         Ok(response)
     };
@@ -861,6 +877,7 @@ mod tests {
             server: "default".into(),
             pane_id: request.pane_id.clone(),
             pane_pid: 1,
+            process: None,
             session_id: request.session_id.clone(),
             session_name: "session with spaces".into(),
             window_id: request.window_id.clone(),
