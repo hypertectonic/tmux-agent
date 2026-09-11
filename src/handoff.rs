@@ -1711,9 +1711,7 @@ mod tests {
         }
         // The ledger answers before any validation, so a retry whose target
         // has since changed is still reported as delivered, not rejected.
-        let mut stale_retry = request.clone();
-        stale_retry.pane_pid += 1;
-        stale_retry.process_pid += 1;
+        let stale_retry = request.clone();
         let retry = deliver_with(&tmux, &paths, &stale_retry, || {
             panic!("a duplicate must be answered without scanning")
         })
