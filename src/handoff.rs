@@ -624,7 +624,7 @@ async fn send_control(
 
 /// Receiving side of the SSH control command. Always answers with a typed
 /// response on stdout so the sender can record the exact outcome.
-pub fn serve(tmux: &Tmux, config: &Config, paths: &RuntimePaths) -> Result<()> {
+pub fn serve(_tmux: &Tmux, config: &Config, paths: &RuntimePaths) -> Result<()> {
     let result = (|| {
         let mut input = Vec::new();
         std::io::stdin()
@@ -644,10 +644,15 @@ pub fn serve(tmux: &Tmux, config: &Config, paths: &RuntimePaths) -> Result<()> {
         }
         let request: HandoffRequest =
             serde_json::from_slice(&input).context("invalid handoff request")?;
-        // Remote requests deliberately use the receiver's configured tmux.
-        // Request args describe the sender and must not cross machine
-        // boundaries.
-        deliver(tmux, config, paths, &request)
+        // Select the server named by the recipient tuple.  A remote daemon's
+        // default environment may be attached to a different (or nested)
+        // server, so using its configured args would silently paste into the
+        // wrong pane.  The socket path is an observed tmux value, not shell
+        // text, and is passed as an argv element.
+        let mut receiver_config = config.clone();
+        receiver_config.tmux_args = tmux_args_for_server(&request.server);
+        let receiver_tmux = Tmux::new(&receiver_config);
+        deliver(&receiver_tmux, &receiver_config, paths, &request)
     })();
     let response = match result {
         Ok(response) => response,
@@ -657,6 +662,14 @@ pub fn serve(tmux: &Tmux, config: &Config, paths: &RuntimePaths) -> Result<()> {
     };
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
+}
+
+fn tmux_args_for_server(server: &str) -> Vec<String> {
+    if server == "default" {
+        Vec::new()
+    } else {
+        vec!["-S".into(), server.into()]
+    }
 }
 
 #[derive(Deserialize)]
