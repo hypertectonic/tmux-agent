@@ -6,6 +6,17 @@ The project uses semantic versioning.
 
 ## Unreleased
 
+### Added
+
+- Experimental agent handoff: `tmux-agent find` filters the federated snapshot,
+  and `tmux-agent handoff send` pastes a scoped message with a provenance
+  header into exactly one resolved agent pane, locally or through a configured
+  machine's SSH control command. The owning machine revalidates the pane,
+  process, provider, and state before pasting, refuses blocked or unknown
+  targets, serializes concurrent senders per pane, and answers a retried
+  handoff ID as a duplicate. `tmux-agent handoff sent` lists sent handoffs.
+- Peers advertise the additive `handoff_v1` capability on protocol 4.
+
 ## [0.9.0] - 2026-09-07
 
 ### Added

@@ -211,6 +211,28 @@ pane. Older peers and raw collector commands retain reported outer-only focus.
 See [Remote machines](docs/remote-machines.md) for setup order, privacy
 boundaries, focus behavior, and safe multi-machine updates.
 
+## Agent handoff
+
+Experimental. One agent can send a scoped message into another running agent's
+pane, locally or on a configured machine:
+
+```sh
+tmux-agent find --machine build-host --provider codex
+tmux-agent handoff send --machine build-host --provider codex \
+  --kind review --repo hypertectonic/tmux-agent --branch develop \
+  --message-file request.md
+tmux-agent handoff sent
+```
+
+The owning machine revalidates the pane, its process, the provider, and the
+agent state before pasting, refuses blocked or unknown targets, and serializes
+concurrent senders. The pasted text starts with a provenance header that
+appears in the recipient's own transcript. Nothing is queued and no message
+content enters federation snapshots.
+
+See [Agent handoff](docs/handoff.md) for the commands, delivery rules, agent
+instructions, and limitations.
+
 ## Privacy and security
 
 - The daemon listens only on a mode `0600` local Unix socket.
@@ -260,6 +282,9 @@ tmux-agent acknowledge <id-or-pane>
 tmux-agent remote bind <remote> <session> [--pane <local-pane-id>]
 tmux-agent remote unbind [--pane <local-pane-id>]
 tmux-agent remote bindings
+tmux-agent find [filters] [--one] [--json]
+tmux-agent handoff send [<id-or-pane>] [filters] --kind <kind> --repo <name> --branch <name> --message-file <path|->
+tmux-agent handoff sent [<id>] [--json]
 tmux-agent codex [args...]
 tmux-agent claude [args...]
 tmux-agent opencode [args...]

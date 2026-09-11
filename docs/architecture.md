@@ -369,6 +369,32 @@ Mosh destination/title matching. Compatibility records without attachment
 metadata retain the older explicit-binding and title-based recovery paths.
 Federation protocol 4 rejects older peers before those records are merged.
 
+## Agent handoff
+
+`handoff send` is a CLI operation over the existing snapshot and control
+shapes; the daemon and federation protocol are unchanged apart from the
+additive `handoff_v1` capability. The sender resolves one record from the
+federated snapshot, composes the header and body, and writes a sent record
+under the daemon's handoff state directory. A local record is delivered in
+process. A record from a structured `[[machine]]` peer that advertises the
+capability is delivered through `ssh ... tmux-agent remote-handoff`, a
+one-shot process with bounded JSON on standard I/O and a ten-second deadline,
+mirroring `remote-focus`.
+
+The receiving side never trusts the sender's view. It runs one scan, requires
+an agent in the requested pane with the same session, window, pane process,
+and provider, and applies the state gate: `blocked` and `unknown` are refused,
+`working` needs the explicit flag, `idle` is accepted. It then holds a
+per-pane file lock, loads the text into a named tmux buffer from a mode 0600
+staging file, pastes it with bracketed paste, sends Enter, and records the
+handoff ID in a seven-day ledger so a retried ID is answered as a duplicate
+without pasting.
+
+The header line is the provenance record on both sides: the sender's JSON
+record and the recipient's transcript carry the same ID, sender, kind,
+repository, branch, and reference. No message content enters federation
+snapshots, the daemon socket, or repositories.
+
 ## Security boundaries
 
 - Runtime directories use mode `0700` and files use mode `0600`.
@@ -378,3 +404,5 @@ Federation protocol 4 rejects older peers before those records are merged.
 - Normal federation does not transport child transcript content.
 - Opening a remote Codex child uses a separate, explicit SSH viewer session.
 - Ambiguous process, parent, or focus matches are rejected instead of guessed.
+- Handoff text is pasted only after the owning machine revalidates the target
+  and its state; ambiguous targets and pending prompts are refused.

@@ -111,6 +111,19 @@ impl MachineConfig {
         ]
     }
 
+    pub fn handoff_command(&self) -> Vec<String> {
+        vec![
+            "ssh".into(),
+            "-T".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=5".into(),
+            format!("{}@{}", self.ssh_user, self.host),
+            format!("{} remote-handoff", shell_quote(&self.binary)),
+        ]
+    }
+
     fn collector(&self) -> RemoteConfig {
         let target = format!("{}@{}", self.ssh_user, self.host);
         RemoteConfig {
@@ -194,6 +207,8 @@ pub struct RuntimePaths {
     pub state: PathBuf,
     pub acknowledgements: PathBuf,
     pub log: PathBuf,
+    /// Sent handoff records, per-pane delivery locks, and the delivered ledger.
+    pub handoffs: PathBuf,
 }
 
 impl RuntimePaths {
@@ -217,6 +232,7 @@ impl RuntimePaths {
             state: state_root.join(format!("{slug}.json")),
             acknowledgements: state_root.join(format!("{slug}.acknowledged.json")),
             log: state_root.join(format!("{slug}.log")),
+            handoffs: state_root.join(format!("{slug}.handoffs")),
         })
     }
 

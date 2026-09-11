@@ -160,7 +160,14 @@ where
 }
 
 async fn send_control(machine: &MachineConfig, request: &FocusRequest) -> Result<()> {
-    let response = control_output(&machine.focus_command(), request, CONTROL_TIMEOUT).await?;
+    let payload = serde_json::to_vec(request)?;
+    let response = control_output(
+        &machine.focus_command(),
+        &payload,
+        CONTROL_LIMIT,
+        CONTROL_TIMEOUT,
+    )
+    .await?;
     confirm_response(&response, request)
 }
 
@@ -177,12 +184,14 @@ fn confirm_response(response: &[u8], request: &FocusRequest) -> Result<()> {
     }
 }
 
-async fn control_output(
+/// Run one bounded SSH control command: the payload goes to stdin, the typed
+/// response comes back on stdout, and the whole exchange shares one deadline.
+pub(crate) async fn control_output(
     command: &[String],
-    request: &FocusRequest,
+    payload: &[u8],
+    limit: u64,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    let payload = serde_json::to_vec(request)?;
     let mut child = tokio::process::Command::new(&command[0])
         .args(&command[1..])
         .stdin(Stdio::piped())
@@ -191,13 +200,13 @@ async fn control_output(
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .context("start SSH focus control")?;
+        .context("start SSH control")?;
     let operation = async {
         let mut stdin = child
             .stdin
             .take()
             .context("SSH control stdin unavailable")?;
-        stdin.write_all(&payload).await?;
+        stdin.write_all(payload).await?;
         stdin.shutdown().await?;
         drop(stdin);
         let mut response = Vec::new();
@@ -205,21 +214,21 @@ async fn control_output(
             .stdout
             .take()
             .context("SSH control stdout unavailable")?
-            .take(CONTROL_LIMIT + 1)
+            .take(limit + 1)
             .read_to_end(&mut response)
             .await?;
-        if response.len() as u64 > CONTROL_LIMIT {
-            bail!("SSH focus response exceeded size limit");
+        if response.len() as u64 > limit {
+            bail!("SSH control response exceeded size limit");
         }
         let status = child.wait().await?;
         if !status.success() {
-            bail!("SSH focus control failed with {status}");
+            bail!("SSH control failed with {status}");
         }
         Ok(response)
     };
     tokio::time::timeout(timeout, operation)
         .await
-        .context("SSH focus control timed out")?
+        .context("SSH control timed out")?
 }
 
 impl FocusRequest {
@@ -430,10 +439,16 @@ mod tests {
     #[tokio::test]
     async fn control_handles_stdin_bounds_failure_and_full_lifetime_timeout() {
         let request = request();
+        let payload = serde_json::to_vec(&request).unwrap();
         let command = |script: &str| vec!["sh".into(), "-c".into(), script.into()];
-        let output = control_output(&command("cat"), &request, Duration::from_secs(2))
-            .await
-            .unwrap();
+        let output = control_output(
+            &command("cat"),
+            &payload,
+            CONTROL_LIMIT,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             serde_json::from_slice::<FocusRequest>(&output).unwrap(),
             request
@@ -441,7 +456,8 @@ mod tests {
         assert!(
             control_output(
                 &command("cat >/dev/null; exit 7"),
-                &request,
+                &payload,
+                CONTROL_LIMIT,
                 Duration::from_secs(2)
             )
             .await
@@ -452,7 +468,8 @@ mod tests {
         assert!(
             control_output(
                 &command("cat >/dev/null; head -c 20000 /dev/zero"),
-                &request,
+                &payload,
+                CONTROL_LIMIT,
                 Duration::from_secs(2)
             )
             .await
@@ -464,7 +481,8 @@ mod tests {
         assert!(
             control_output(
                 &command("cat >/dev/null; exec sleep 10"),
-                &request,
+                &payload,
+                CONTROL_LIMIT,
                 Duration::from_millis(100)
             )
             .await

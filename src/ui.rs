@@ -3034,6 +3034,7 @@ mod tests {
             state: directory.path().join("state.json"),
             acknowledgements: directory.path().join("acknowledged.json"),
             log: directory.path().join("daemon.log"),
+            handoffs: directory.path().join("handoffs"),
         };
         let listener = UnixListener::bind(&paths.socket).unwrap();
         let server = tokio::spawn(async move {
@@ -4054,6 +4055,7 @@ mod tests {
             state: directory.path().join("state.json"),
             acknowledgements: directory.path().join("acknowledged.json"),
             log: directory.path().join("daemon.log"),
+            handoffs: directory.path().join("handoffs"),
         };
         let listener = UnixListener::bind(&paths.socket).unwrap();
         let started = Command::new("tmux")
@@ -4260,6 +4262,7 @@ mod tests {
             state: directory.path().join("state.json"),
             acknowledgements: directory.path().join("acknowledged.json"),
             log: directory.path().join("daemon.log"),
+            handoffs: directory.path().join("handoffs"),
         };
         let listener = UnixListener::bind(&paths.socket).unwrap();
         let started = Command::new("tmux")
