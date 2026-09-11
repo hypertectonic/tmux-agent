@@ -644,15 +644,11 @@ pub fn serve(_tmux: &Tmux, config: &Config, paths: &RuntimePaths) -> Result<()> 
         }
         let request: HandoffRequest =
             serde_json::from_slice(&input).context("invalid handoff request")?;
-        // Select the server named by the recipient tuple.  A remote daemon's
-        // default environment may be attached to a different (or nested)
-        // server, so using its configured args would silently paste into the
-        // wrong pane.  The socket path is an observed tmux value, not shell
-        // text, and is passed as an argv element.
-        let mut receiver_config = config.clone();
-        receiver_config.tmux_args = tmux_args_for_server(&request.server);
-        let receiver_tmux = Tmux::new(&receiver_config);
-        deliver(&receiver_tmux, &receiver_config, paths, &request)
+        // The request's server key is an observation from the sender.  Socket
+        // paths are host-local and must never be forwarded as recipient argv.
+        // Construct the receiver with its own configured server selection,
+        // then validate that selection against the request in `deliver`.
+        deliver(_tmux, config, paths, &request)
     })();
     let response = match result {
         Ok(response) => response,
@@ -662,14 +658,6 @@ pub fn serve(_tmux: &Tmux, config: &Config, paths: &RuntimePaths) -> Result<()> 
     };
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
-}
-
-fn tmux_args_for_server(server: &str) -> Vec<String> {
-    if server == "default" {
-        Vec::new()
-    } else {
-        vec!["-S".into(), server.into()]
-    }
 }
 
 #[derive(Deserialize)]
