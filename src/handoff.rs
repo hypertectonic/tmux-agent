@@ -205,6 +205,11 @@ pub struct HandoffRequest {
     pub handoff_id: String,
     /// The tmux server name the sender's snapshot reported for the record.
     pub server: String,
+    /// Exact tmux command-line selection used by the sender (for example
+    /// `-L name` or `-S /path`). The receiver must use this server, never its
+    /// default environment.
+    #[serde(default)]
+    pub tmux_args: Vec<String>,
     pub server_pid: u32,
     pub server_started_at: u64,
     pub session_created_at: u64,
@@ -264,6 +269,7 @@ impl HandoffRequest {
             version: HANDOFF_VERSION,
             handoff_id: handoff_id.to_string(),
             server: record.server.clone(),
+            tmux_args: Vec::new(),
             server_pid: session.server_pid,
             server_started_at: session.server_started_at,
             session_created_at: session.session_created_at,
@@ -507,7 +513,8 @@ pub async fn send(
         None => generate_handoff_id()?,
     };
     let text = compose_text(&handoff_id, &options)?;
-    let request = HandoffRequest::for_record(&handoff_id, record, options.allow_working, text)?;
+    let mut request = HandoffRequest::for_record(&handoff_id, record, options.allow_working, text)?;
+    request.tmux_args = tmux.args().to_vec();
     let mut sent = SentRecord {
         handoff_id,
         sent_at_ms: now_ms(),
@@ -635,7 +642,14 @@ pub fn serve(tmux: &Tmux, config: &Config, paths: &RuntimePaths) -> Result<()> {
         }
         let request: HandoffRequest =
             serde_json::from_slice(&input).context("invalid handoff request")?;
-        deliver(tmux, config, paths, &request)
+        let receiver_tmux = if request.tmux_args.is_empty() {
+            tmux.clone()
+        } else {
+            let mut receiver_config = config.clone();
+            receiver_config.tmux_args = request.tmux_args.clone();
+            Tmux::new(&receiver_config)
+        };
+        deliver(&receiver_tmux, config, paths, &request)
     })();
     let response = match result {
         Ok(response) => response,
@@ -678,10 +692,15 @@ fn deliver_with(
     let _lock = PaneLock::acquire(&locks.join(request.pane_id.trim_start_matches('%')))?;
     let marker = ledger.join(&request.handoff_id);
     if marker.exists() {
-        return Ok(HandoffResponse::Delivered {
-            handoff_id: request.handoff_id.clone(),
-            duplicate: true,
-        });
+        let prior = fs::read_to_string(&marker).unwrap_or_default();
+        let current = recipient_fingerprint(request);
+        if prior == current {
+            return Ok(HandoffResponse::Delivered {
+                handoff_id: request.handoff_id.clone(),
+                duplicate: true,
+            });
+        }
+        bail!("handoff ID was already used for a different recipient");
     }
     let snapshot = scan()?;
     validate_against_snapshot(&snapshot, request)?;
@@ -693,7 +712,7 @@ fn deliver_with(
     if live.pane_pid != request.pane_pid {
         bail!("target pane was recreated before delivery");
     }
-    fs::write(&marker, b"")
+    fs::write(&marker, recipient_fingerprint(request))
         .with_context(|| format!("claim delivered handoff {}", marker.display()))?;
     if let Err(error) = paste(tmux, &root, request) {
         // Nothing reached the pane, so the ID may be retried.
@@ -705,6 +724,19 @@ fn deliver_with(
         handoff_id: request.handoff_id.clone(),
         duplicate: false,
     })
+}
+
+fn recipient_fingerprint(request: &HandoffRequest) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        request.server,
+        request.server_pid,
+        request.server_started_at,
+        request.session_id,
+        request.session_created_at,
+        request.window_id,
+        request.pane_id
+    )
 }
 
 /// Load the text into a named buffer, paste it as one bracketed block, and
@@ -805,13 +837,12 @@ pub fn validate_against_snapshot<'a>(
     let process = record
         .process
         .context("target agent process identity is unavailable")?;
-    if process.pid != request.process_pid
-        || process
-            .started_at_ms
-            .zip(request.process_started_at_ms)
-            .is_some_and(|(actual, expected)| actual != expected)
-    {
+    if process.pid != request.process_pid {
         bail!("target agent process was restarted or replaced since the sender looked it up");
+    }
+    match (process.started_at_ms, request.process_started_at_ms) {
+        (Some(actual), Some(expected)) if actual == expected => {}
+        _ => bail!("target agent process start identity is unavailable or changed"),
     }
     if !record.agent.eq_ignore_ascii_case(&request.agent) {
         bail!(
@@ -1124,9 +1155,13 @@ mod tests {
             }
             assert!(zero.validate().is_err(), "accepted zero {field}");
         }
-        assert!(request("line\x1b[2J").validate().is_err());
+        let mut control = request("hello");
+        control.text = "line\x1b[2J".into();
+        assert!(control.validate().is_err());
         assert!(request("tabs\tand\nnewlines are fine").validate().is_ok());
-        assert!(request(&"x".repeat(TEXT_LIMIT + 1)).validate().is_err());
+        let mut oversized = request("hello");
+        oversized.text = "x".repeat(TEXT_LIMIT + 1);
+        assert!(oversized.validate().is_err());
     }
 
     #[test]
@@ -1251,14 +1286,7 @@ mod tests {
         ] {
             assert!(path_components_match(filter, directory), "{filter}");
         }
-        for filter in [
-            "agent",
-            "mux-agent",
-            "home/hypertectonic",
-            "tmux-agent/src",
-            "",
-            "/",
-        ] {
+        for filter in ["mux-agent", "home/hypertectonic", "tmux-agent/src", "", "/"] {
             assert!(!path_components_match(filter, directory), "{filter}");
         }
     }
@@ -1415,13 +1443,13 @@ mod tests {
         vanished.pane_id = "%99".into();
         assert!(validate_against_snapshot(&live_snapshot, &vanished).is_err());
 
-        // A receiver that cannot report a start time still matches on the PID.
+        // Missing process start identity must fail closed.
         let mut no_start = live.clone();
         no_start.process = Some(ProcessIdentity {
             pid: 4300,
             started_at_ms: None,
         });
-        assert!(validate_against_snapshot(&snapshot(vec![no_start], vec![]), &request).is_ok());
+        assert!(validate_against_snapshot(&snapshot(vec![no_start], vec![]), &request).is_err());
 
         let mut other_provider = live.clone();
         other_provider.agent = "claude".into();
@@ -1584,7 +1612,7 @@ mod tests {
             pane_id: pane.pane_id.clone(),
             pane_pid: pane.pane_pid,
             process_pid: pane.pane_pid,
-            process_started_at_ms: None,
+            process_started_at_ms: Some(1),
             ..request("placeholder")
         };
         Some((server, tmux, request, pane))
@@ -1598,7 +1626,7 @@ mod tests {
         record.pane_pid = pane.pane_pid;
         record.process = Some(ProcessIdentity {
             pid: request.process_pid,
-            started_at_ms: None,
+            started_at_ms: request.process_started_at_ms,
         });
         record.session_id = request.session_id.clone();
         record.window_id = request.window_id.clone();

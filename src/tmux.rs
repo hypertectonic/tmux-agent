@@ -453,6 +453,9 @@ pub fn is_server_missing(error: &anyhow::Error) -> bool {
 }
 
 impl Tmux {
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
     pub fn new(config: &Config) -> Self {
         Self {
             args: config.tmux_args.clone(),
