@@ -205,6 +205,11 @@ pub struct HandoffRequest {
     pub handoff_id: String,
     /// The tmux server name the sender's snapshot reported for the record.
     pub server: String,
+    /// Logical server selector configured on the recipient host. This is
+    /// deliberately separate from `server`, which may be a host-local socket
+    /// path and must never be forwarded as tmux argv.
+    #[serde(default = "default_server_selector")]
+    pub server_selector: String,
     /// Exact tmux command-line selection used by the sender (for example
     /// `-L name` or `-S /path`). The receiver must use this server, never its
     /// default environment.
@@ -269,6 +274,11 @@ impl HandoffRequest {
             version: HANDOFF_VERSION,
             handoff_id: handoff_id.to_string(),
             server: record.server.clone(),
+            server_selector: if record.server == "default" {
+                "default".into()
+            } else {
+                record.server.clone()
+            },
             tmux_args: Vec::new(),
             server_pid: session.server_pid,
             server_started_at: session.server_started_at,
@@ -293,6 +303,7 @@ impl HandoffRequest {
         }
         validate_handoff_id(&self.handoff_id)?;
         validate_field("server", &self.server)?;
+        validate_field("server selector", &self.server_selector)?;
         for (value, prefix) in [
             (&self.session_id, '$'),
             (&self.window_id, '@'),
@@ -648,7 +659,8 @@ pub fn serve(_tmux: &Tmux, config: &Config, paths: &RuntimePaths) -> Result<()> 
         // paths are host-local and must never be forwarded as recipient argv.
         // Construct the receiver with its own configured server selection,
         // then validate that selection against the request in `deliver`.
-        deliver(_tmux, config, paths, &request)
+        let (recipient_tmux, recipient_config) = recipient_server(_tmux, config, &request)?;
+        deliver(&recipient_tmux, &recipient_config, paths, &request)
     })();
     let response = match result {
         Ok(response) => response,
@@ -672,6 +684,39 @@ fn deliver(
     request: &HandoffRequest,
 ) -> Result<HandoffResponse> {
     deliver_with(tmux, paths, request, || scan_once(tmux, config, paths))
+}
+
+fn default_server_selector() -> String {
+    "default".into()
+}
+
+fn recipient_server(
+    tmux: &Tmux,
+    config: &Config,
+    request: &HandoffRequest,
+) -> Result<(Tmux, Config)> {
+    if let Some(args) = config.handoff_servers.get(&request.server_selector) {
+        let mut selected = config.clone();
+        selected.tmux_args = args.clone();
+        selected.server_name = Some(request.server_selector.clone());
+        return Ok((Tmux::new(&selected), selected));
+    }
+    let current = config
+        .server_name
+        .clone()
+        .or(tmux.server_key()?)
+        .unwrap_or_else(default_server_selector);
+    if request.server_selector == current
+        || (request.server_selector == "default"
+            && config.tmux_args.is_empty()
+            && config.server_name.is_none())
+    {
+        return Ok((tmux.clone(), config.clone()));
+    }
+    bail!(
+        "unknown recipient tmux server selector {}; configure it in handoff_servers on this host",
+        terminal_safe(&request.server_selector)
+    )
 }
 
 /// Under the pane lock: answer an already delivered ID first, then validate
@@ -746,7 +791,7 @@ fn recipient_fingerprint(request: &HandoffRequest) -> String {
         request.process_pid,
         request.process_started_at_ms.unwrap_or_default(),
         request.agent,
-        request.tmux_args.join("\u{1f}")
+        request.server_selector
     )
 }
 
@@ -1893,5 +1938,30 @@ mod tests {
             .find(|pane| pane.session_name == "outer")
             .unwrap();
         wait_for(&outer, &outer_pane.pane_id, "nested two");
+    }
+    #[test]
+    fn remote_control_selects_recipient_local_custom_server() {
+        let mut config = Config::default();
+        config.handoff_servers.insert(
+            "nested-work".into(),
+            vec!["-S".into(), "/tmp/recipient-inner.sock".into()],
+        );
+        let default_tmux = Tmux::new(&config);
+        let mut request = request("hello");
+        request.server = "nested-work".into();
+        request.server_selector = "nested-work".into();
+        // Exercise the serialized SSH control payload. No sender socket path
+        // is an argument to the selected recipient tmux instance.
+        request.tmux_args = vec!["-S".into(), "/tmp/sender.sock".into()];
+        let decoded: HandoffRequest =
+            serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        let (selected, selected_config) =
+            recipient_server(&default_tmux, &config, &decoded).unwrap();
+        assert_eq!(
+            selected.runtime_key(),
+            "tmux:-S\u{1f}/tmp/recipient-inner.sock"
+        );
+        assert_eq!(selected_config.server_name.as_deref(), Some("nested-work"));
+        assert_ne!(selected.runtime_key(), "/tmp/sender.sock");
     }
 }
