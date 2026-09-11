@@ -513,8 +513,10 @@ pub async fn send(
         None => generate_handoff_id()?,
     };
     let text = compose_text(&handoff_id, &options)?;
-    let mut request = HandoffRequest::for_record(&handoff_id, record, options.allow_working, text)?;
-    request.tmux_args = tmux.args().to_vec();
+    let request = HandoffRequest::for_record(&handoff_id, record, options.allow_working, text)?;
+    // The receiver owns tmux selection.  Never send the hub's local socket
+    // arguments to a remote machine; its daemon was started with the target
+    // server configuration.
     let mut sent = SentRecord {
         handoff_id,
         sent_at_ms: now_ms(),
@@ -642,14 +644,10 @@ pub fn serve(tmux: &Tmux, config: &Config, paths: &RuntimePaths) -> Result<()> {
         }
         let request: HandoffRequest =
             serde_json::from_slice(&input).context("invalid handoff request")?;
-        let receiver_tmux = if request.tmux_args.is_empty() {
-            tmux.clone()
-        } else {
-            let mut receiver_config = config.clone();
-            receiver_config.tmux_args = request.tmux_args.clone();
-            Tmux::new(&receiver_config)
-        };
-        deliver(&receiver_tmux, config, paths, &request)
+        // Remote requests deliberately use the receiver's configured tmux.
+        // Request args describe the sender and must not cross machine
+        // boundaries.
+        deliver(tmux, config, paths, &request)
     })();
     let response = match result {
         Ok(response) => response,
@@ -689,7 +687,14 @@ fn deliver_with(
     let root = ensure_dir(&paths.handoffs)?;
     let ledger = ensure_dir(&root.join("delivered"))?;
     let locks = ensure_dir(&root.join("locks"))?;
-    let _lock = PaneLock::acquire(&locks.join(request.pane_id.trim_start_matches('%')))?;
+    let lock_key = format!(
+        "{}-{}-{}-{}",
+        safe_lock_component(&request.server),
+        request.server_pid,
+        safe_lock_component(&request.session_id),
+        safe_lock_component(&request.pane_id)
+    );
+    let _lock = PaneLock::acquire(&locks.join(lock_key))?;
     let marker = ledger.join(&request.handoff_id);
     if marker.exists() {
         let prior = fs::read_to_string(&marker).unwrap_or_default();
@@ -728,15 +733,33 @@ fn deliver_with(
 
 fn recipient_fingerprint(request: &HandoffRequest) -> String {
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         request.server,
         request.server_pid,
         request.server_started_at,
         request.session_id,
         request.session_created_at,
         request.window_id,
-        request.pane_id
+        request.pane_id,
+        request.pane_pid,
+        request.process_pid,
+        request.process_started_at_ms.unwrap_or_default(),
+        request.agent,
+        request.tmux_args.join("\u{1f}")
     )
+}
+
+fn safe_lock_component(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() {
+                byte as char
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Load the text into a named buffer, paste it as one bracketed block, and
@@ -1418,6 +1441,7 @@ mod tests {
         let error = validate_against_snapshot(&other_server, &request).unwrap_err();
         assert!(error.to_string().contains("remote-handoff"), "{error}");
 
+        #[allow(clippy::type_complexity)]
         let cases: [(&str, Box<dyn Fn(&mut HandoffRequest)>); 8] = [
             ("recreated pane", Box::new(|r| r.pane_pid = 4243)),
             ("moved window", Box::new(|r| r.window_id = "@9".into())),
