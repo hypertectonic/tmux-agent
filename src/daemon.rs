@@ -2633,11 +2633,17 @@ mod tests {
     fn federated_snapshot_uses_logical_selector_instead_of_socket_path() {
         let mut snapshot = Snapshot {
             server: "/private/tmp/tmux-502/remote.sock".into(),
+            agents: vec![agent(
+                "remote/default/%1",
+                AgentState::Working,
+                Attention::Working,
+            )],
             ..Snapshot::default()
         };
 
         set_remote_server_selector(&mut snapshot, "thinkcat");
 
         assert_eq!(snapshot.server, "thinkcat");
+        assert_eq!(snapshot.agents[0].server, "thinkcat");
     }
 }
