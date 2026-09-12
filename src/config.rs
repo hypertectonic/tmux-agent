@@ -17,7 +17,8 @@ pub struct Config {
     pub scan_interval_ms: Option<u64>,
     pub tmux_args: Vec<String>,
     /// Recipient-local tmux selectors for direct handoff. Keys are the
-    /// logical `server_name` advertised by the corresponding collector.
+    /// stable federation alias advertised by the corresponding collector
+    /// (for example a `machine`/`remote` name), never a socket path.
     pub handoff_servers: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(rename = "machine")]
     pub machines: Vec<MachineConfig>,

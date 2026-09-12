@@ -1148,9 +1148,16 @@ async fn stream_remote(
                 let Some(line) = line.context("read remote stream")? else {
                     break;
                 };
-                let snapshot: Snapshot = serde_json::from_str(&line)
+                let mut snapshot: Snapshot = serde_json::from_str(&line)
                     .with_context(|| format!("parse snapshot from {}", remote.name))?;
                 validate_remote_snapshot(&remote.name, &snapshot)?;
+                // A remote collector's `snapshot.server` is derived from its
+                // own tmux socket path.  That value is host-local and cannot
+                // be used as a handoff selector on another machine.  Replace
+                // it at the federation boundary with the stable logical
+                // collector alias; recipients map that alias to their local
+                // tmux arguments through `handoff_servers`.
+                set_remote_server_selector(&mut snapshot, &remote.name);
                 shared.publish_remote(&remote.name, snapshot).await;
             }
         }
@@ -1173,6 +1180,16 @@ fn validate_remote_snapshot(alias: &str, snapshot: &Snapshot) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Replace the host-local tmux server identity at the federation boundary
+/// with the stable logical selector used by handoff routing.  The recipient
+/// resolves this selector through its own `handoff_servers` configuration.
+fn set_remote_server_selector(snapshot: &mut Snapshot, selector: &str) {
+    snapshot.server = selector.to_string();
+    for agent in &mut snapshot.agents {
+        agent.server = selector.to_string();
+    }
 }
 
 fn concise_error(error: &anyhow::Error) -> String {
@@ -2610,5 +2627,17 @@ mod tests {
         assert!(message.contains(&format!("protocol {}", PROTOCOL_VERSION + 1)));
         assert!(message.contains(&format!("requires protocol {PROTOCOL_VERSION}")));
         assert!(message.contains("Update"));
+    }
+
+    #[test]
+    fn federated_snapshot_uses_logical_selector_instead_of_socket_path() {
+        let mut snapshot = Snapshot {
+            server: "/private/tmp/tmux-502/remote.sock".into(),
+            ..Snapshot::default()
+        };
+
+        set_remote_server_selector(&mut snapshot, "thinkcat");
+
+        assert_eq!(snapshot.server, "thinkcat");
     }
 }
