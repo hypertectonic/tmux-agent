@@ -1371,7 +1371,7 @@ mod tests {
         };
         assert_eq!(filter_agents(&snapshot, &by_cwd_and_state).len(), 1);
         let none = TargetFilters {
-            machine: Some("thinkcat".into()),
+            machine: Some("other-host".into()),
             ..TargetFilters::default()
         };
         assert!(resolve_target(&snapshot, None, &none).is_err());

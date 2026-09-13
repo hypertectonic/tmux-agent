@@ -5207,7 +5207,7 @@ exit 1
     #[test]
     fn missing_remote_tmux_binding_reports_the_exact_bind_command() {
         let missing = FocusTargetMissing {
-            alias: "thinkcat".into(),
+            alias: "remote-host".into(),
             title: "project".into(),
             session: Some("tmux-agent-res".into()),
             live_session: false,
@@ -5215,7 +5215,7 @@ exit 1
 
         assert_eq!(
             missing.to_string(),
-            "no local pane is bound to thinkcat/tmux-agent-res; run tmux-agent remote bind thinkcat tmux-agent-res --pane <local-pane-id> on this machine"
+            "no local pane is bound to remote-host/tmux-agent-res; run tmux-agent remote bind remote-host tmux-agent-res --pane <local-pane-id> on this machine"
         );
     }
 
