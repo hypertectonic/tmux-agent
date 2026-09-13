@@ -910,6 +910,7 @@ mod tests {
                 host: "localhost".into(),
                 ssh_user: "test".into(),
                 binary: "/test/tmux-agent".into(),
+                config: None,
                 auto_connect: false,
             }],
             ..Config::default()

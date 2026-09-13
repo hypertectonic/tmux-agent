@@ -193,9 +193,9 @@ pub struct DetectionDetails {
     pub transition: Option<String>,
 }
 
-/// The foreground process group that carries the agent in its pane. A
-/// restarted agent gets a new leader, so this changes even when the pane and
-/// its shell survive.
+/// The foreground process group that carries the agent in its pane, with a
+/// stable kernel start time. Custom persistent shell loops can replace a
+/// provider while retaining this group, so this is not an execution identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessIdentity {
     pub pid: u32,

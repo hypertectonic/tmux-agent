@@ -1148,16 +1148,9 @@ async fn stream_remote(
                 let Some(line) = line.context("read remote stream")? else {
                     break;
                 };
-                let mut snapshot: Snapshot = serde_json::from_str(&line)
+                let snapshot: Snapshot = serde_json::from_str(&line)
                     .with_context(|| format!("parse snapshot from {}", remote.name))?;
                 validate_remote_snapshot(&remote.name, &snapshot)?;
-                // A remote collector's `snapshot.server` is derived from its
-                // own tmux socket path.  That value is host-local and cannot
-                // be used as a handoff selector on another machine.  Replace
-                // it at the federation boundary with the stable logical
-                // collector alias; recipients map that alias to their local
-                // tmux arguments through `handoff_servers`.
-                set_remote_server_selector(&mut snapshot, &remote.name);
                 shared.publish_remote(&remote.name, snapshot).await;
             }
         }
@@ -1182,16 +1175,6 @@ fn validate_remote_snapshot(alias: &str, snapshot: &Snapshot) -> Result<()> {
     Ok(())
 }
 
-/// Replace the host-local tmux server identity at the federation boundary
-/// with the stable logical selector used by handoff routing.  The recipient
-/// resolves this selector through its own `handoff_servers` configuration.
-fn set_remote_server_selector(snapshot: &mut Snapshot, selector: &str) {
-    snapshot.server = selector.to_string();
-    for agent in &mut snapshot.agents {
-        agent.server = selector.to_string();
-    }
-}
-
 fn concise_error(error: &anyhow::Error) -> String {
     let message = format!("{error:#}").replace('\n', " ");
     message.chars().take(240).collect()
@@ -1210,8 +1193,12 @@ pub async fn ensure_running(config_path: &Path, paths: &RuntimePaths) -> Result<
         .with_context(|| format!("open daemon log {}", paths.log.display()))?;
     let stderr = log.try_clone().context("clone daemon log handle")?;
     let mut command = std::process::Command::new(executable);
+    if crate::config::should_forward_config_path(config_path, &crate::config::default_config_path())
+    {
+        command.arg("--config").arg(config_path);
+    }
     command
-        .args(["--config", &config_path.to_string_lossy(), "daemon", "run"])
+        .args(["daemon", "run"])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr));
@@ -2627,23 +2614,5 @@ mod tests {
         assert!(message.contains(&format!("protocol {}", PROTOCOL_VERSION + 1)));
         assert!(message.contains(&format!("requires protocol {PROTOCOL_VERSION}")));
         assert!(message.contains("Update"));
-    }
-
-    #[test]
-    fn federated_snapshot_uses_logical_selector_instead_of_socket_path() {
-        let mut snapshot = Snapshot {
-            server: "/private/tmp/tmux-502/remote.sock".into(),
-            agents: vec![agent(
-                "remote/default/%1",
-                AgentState::Working,
-                Attention::Working,
-            )],
-            ..Snapshot::default()
-        };
-
-        set_remote_server_selector(&mut snapshot, "thinkcat");
-
-        assert_eq!(snapshot.server, "thinkcat");
-        assert_eq!(snapshot.agents[0].server, "thinkcat");
     }
 }

@@ -16,10 +16,6 @@ pub struct Config {
     pub server_name: Option<String>,
     pub scan_interval_ms: Option<u64>,
     pub tmux_args: Vec<String>,
-    /// Recipient-local tmux selectors for direct handoff. Keys are the
-    /// stable federation alias advertised by the corresponding collector
-    /// (for example a `machine`/`remote` name), never a socket path.
-    pub handoff_servers: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(rename = "machine")]
     pub machines: Vec<MachineConfig>,
     #[serde(rename = "remote")]
@@ -32,6 +28,8 @@ pub struct MachineConfig {
     pub host: String,
     pub ssh_user: String,
     pub binary: String,
+    /// Absolute path on the recipient, shared by collection and control.
+    pub config: Option<String>,
     #[serde(default = "enabled_by_default")]
     pub auto_connect: bool,
 }
@@ -48,6 +46,9 @@ impl Config {
             .map(Path::to_path_buf)
             .unwrap_or_else(default_config_path);
         if !path.exists() {
+            if explicit.is_some() {
+                bail!("explicit config does not exist: {}", path.display());
+            }
             return Ok((Self::default(), path));
         }
         let raw =
@@ -69,6 +70,16 @@ impl Config {
             validate_ssh_user(&machine.ssh_user, &machine.name)?;
             if !Path::new(&machine.binary).is_absolute() {
                 bail!("machine {} binary must be an absolute path", machine.name);
+            }
+            if machine
+                .config
+                .as_deref()
+                .is_some_and(|path| !Path::new(path).is_absolute())
+            {
+                bail!(
+                    "machine {} config must be an absolute recipient path",
+                    machine.name
+                );
             }
         }
         for remote in &self.remotes {
@@ -102,20 +113,23 @@ impl Config {
 }
 
 impl MachineConfig {
+    fn invocation(&self) -> String {
+        let mut command = shell_quote(&self.binary);
+        if let Some(path) = &self.config {
+            command.push_str(&format!(" --config {}", shell_quote(path)));
+        }
+        command
+    }
+
     pub fn focus_command(&self) -> Vec<String> {
-        vec![
-            "ssh".into(),
-            "-T".into(),
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "ConnectTimeout=5".into(),
-            format!("{}@{}", self.ssh_user, self.host),
-            format!("{} remote-focus", shell_quote(&self.binary)),
-        ]
+        self.control_command("remote-focus")
     }
 
     pub fn handoff_command(&self) -> Vec<String> {
+        self.control_command("remote-handoff")
+    }
+
+    fn control_command(&self, operation: &str) -> Vec<String> {
         vec![
             "ssh".into(),
             "-T".into(),
@@ -124,7 +138,7 @@ impl MachineConfig {
             "-o".into(),
             "ConnectTimeout=5".into(),
             format!("{}@{}", self.ssh_user, self.host),
-            format!("{} remote-handoff", shell_quote(&self.binary)),
+            format!("{} {operation}", self.invocation()),
         ]
     }
 
@@ -144,7 +158,7 @@ impl MachineConfig {
                 "-o".into(),
                 "ServerAliveCountMax=2".into(),
                 target,
-                format!("{} watch --jsonl --local-only", shell_quote(&self.binary)),
+                format!("{} watch --jsonl --local-only", self.invocation()),
             ],
         }
     }
@@ -164,7 +178,7 @@ impl MachineConfig {
             format!("{}@{}", self.ssh_user, self.host),
             format!(
                 "{} subagent-view --local-only {}",
-                shell_quote(&self.binary),
+                self.invocation(),
                 shell_quote(target)
             ),
         ]
@@ -185,8 +199,8 @@ impl MachineConfig {
             format!("{}@{}", self.ssh_user, self.host),
             format!(
                 "{} --version && {} scan --json",
-                shell_quote(&self.binary),
-                shell_quote(&self.binary)
+                self.invocation(),
+                self.invocation()
             ),
         ]
     }
@@ -211,7 +225,7 @@ pub struct RuntimePaths {
     pub state: PathBuf,
     pub acknowledgements: PathBuf,
     pub log: PathBuf,
-    /// Sent handoff records, per-pane delivery locks, and the delivered ledger.
+    /// Account-wide handoff audit and delivery claims, shared by all servers.
     pub handoffs: PathBuf,
 }
 
@@ -236,7 +250,7 @@ impl RuntimePaths {
             state: state_root.join(format!("{slug}.json")),
             acknowledgements: state_root.join(format!("{slug}.acknowledged.json")),
             log: state_root.join(format!("{slug}.log")),
-            handoffs: state_root.join(format!("{slug}.handoffs")),
+            handoffs: state_root.join("handoffs"),
         })
     }
 
@@ -280,6 +294,12 @@ pub fn default_config_path() -> PathBuf {
         .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("tmux-agent/config.toml")
+}
+
+/// An absent implicit default must stay implicit when starting a child.
+/// Forward custom paths even if missing so the child reports the load error.
+pub fn should_forward_config_path(path: &Path, default_path: &Path) -> bool {
+    path.exists() || path != default_path
 }
 
 fn stable_slug(value: &str) -> String {
@@ -337,6 +357,17 @@ mod tests {
     }
 
     #[test]
+    fn child_config_forwarding_preserves_implicit_default_and_custom_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let default_path = directory.path().join("default.toml");
+        let custom_path = directory.path().join("custom.toml");
+        assert!(!should_forward_config_path(&default_path, &default_path));
+        assert!(should_forward_config_path(&custom_path, &default_path));
+        fs::write(&default_path, "").unwrap();
+        assert!(should_forward_config_path(&default_path, &default_path));
+    }
+
+    #[test]
     fn structured_machine_builds_hardened_ssh_collector() {
         let config: Config = toml::from_str(
             r#"
@@ -368,6 +399,66 @@ mod tests {
                 "agent@remote-mac.example.ts.net",
                 "'/Users/agent/.local/bin/tmux-agent' watch --jsonl --local-only",
             ]
+        );
+    }
+
+    #[test]
+    fn recipient_config_is_shared_and_quoted_for_every_remote_operation() {
+        let config: Config = toml::from_str(
+            r#"
+            [[machine]]
+            name = "inner"
+            host = "build-host"
+            ssh_user = "agent"
+            binary = "/opt/tmux-agent"
+            config = "/home/agent/custom server's config.toml"
+        "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let machine = &config.machines[0];
+        let expected = "'/opt/tmux-agent' --config '/home/agent/custom server'\"'\"'s config.toml'";
+        for command in [
+            machine.collector().command,
+            machine.focus_command(),
+            machine.handoff_command(),
+            machine.diagnostic_command(),
+            machine.subagent_view_command("target"),
+        ] {
+            assert!(command.last().unwrap().starts_with(expected), "{command:?}");
+        }
+        let mut machine = machine.clone();
+        for (recipient_config, expected) in [
+            (machine.config.clone(), expected),
+            (None, "'/opt/tmux-agent'"),
+        ] {
+            machine.config = recipient_config;
+            for (command, operation) in [
+                (machine.focus_command(), "remote-focus"),
+                (machine.handoff_command(), "remote-handoff"),
+            ] {
+                assert_eq!(
+                    command,
+                    [
+                        "ssh",
+                        "-T",
+                        "-o",
+                        "BatchMode=yes",
+                        "-o",
+                        "ConnectTimeout=5",
+                        "agent@build-host",
+                        &format!("{expected} {operation}"),
+                    ]
+                );
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.toml");
+        assert!(
+            Config::load(Some(&missing))
+                .unwrap_err()
+                .to_string()
+                .contains("explicit config")
         );
     }
 

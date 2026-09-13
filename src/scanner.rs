@@ -280,7 +280,7 @@ impl Scanner {
                 .unwrap_or(pane.pane_pid);
             let process_identity = crate::model::ProcessIdentity {
                 pid: process_group,
-                started_at_ms: processes.process_started_at_ms.get(&process_group).copied(),
+                started_at_ms: crate::tmux::stable_process_start_ms(process_group),
             };
             let observed_start = observed_process_start(
                 processes

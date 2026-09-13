@@ -203,9 +203,10 @@ enum HandoffCommand {
     /// Paste a scoped message into exactly one resolved agent pane and submit it.
     ///
     /// The owning machine revalidates the pane, its process, the provider, and
-    /// the agent state before pasting. Blocked and unknown targets are refused.
+    /// the agent state before pasting. Blocked, unknown, and tmux-mode targets are refused.
     Send {
-        /// Full agent ID, unambiguous ID suffix, or pane ID. Filters narrow further.
+        /// Full agent ID, unambiguous ID suffix, or pane ID.
+        /// Bare pane IDs are local unless --machine is given. Filters narrow further.
         target: Option<String>,
         #[command(flatten)]
         filters: handoff::TargetFilters,

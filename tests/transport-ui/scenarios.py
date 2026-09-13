@@ -309,11 +309,83 @@ class Scenario:
         (ROOT / "old-peer").unlink(missing_ok=True)
 
 
+def handoff_scenario():
+    """Real SSH receiver, production scanner, and two recipient configs."""
+    configs = {}
+    sockets = {}
+    outputs = {}
+    try:
+        for name in ["handoff-hub", "handoff-one", "handoff-two"]:
+            sockets[name] = str(ROOT / f"{name}.sock")
+            # A space/apostrophe exercises shell quoting of recipient data.
+            configs[name] = ROOT / f"{name}'s config.toml"
+            configs[name].write_text(
+                f'host_name = "{name}"\nserver_name = "{name}"\n'
+                f'tmux_args = ["-S", "{sockets[name]}"]\n')
+            command = "sleep 180"
+            if name != "handoff-hub":
+                outputs[name] = ROOT / f"{name}.input"
+                command = shlex.join(["bash", "-c", f"exec -a claude cat > {outputs[name]}"])
+            run(["tmux", "-S", sockets[name], "-f", "/dev/null", "new-session", "-d", "-s", "recipient", command])
+            run(["tmux", "-S", sockets[name], "select-pane", "-t", "%0", "-T", "✳ handoff-fixture"])
+        with configs["handoff-hub"].open("a") as file:
+            for name in ["handoff-one", "handoff-two"]:
+                file.write(f'\n[[machine]]\nname = "{name}"\nhost = "fixture-peer"\n'
+                           f'ssh_user = "agent"\nbinary = "{BIN}"\nconfig = "{configs[name]}"\n')
+
+        def app(*args, **kwargs):
+            return run([BIN, "--config", str(configs["handoff-hub"]), *args], **kwargs)
+
+        deadline = time.monotonic() + 15
+        while True:
+            snapshot = json.loads(app("list", "--json"))
+            records = {record.get("remote_alias"): record for record in snapshot["agents"] if record.get("pane_id")}
+            if all(name in records and records[name]["state"] == "idle" for name in outputs):
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"handoff recipients not discovered idle: {snapshot}")
+            time.sleep(0.1)
+        for name in outputs:
+            assert records[name]["server"] == name, "federation changed owning server identity"
+        message = ROOT / "handoff-message.txt"
+        message.write_text("review this isolated fixture\nsecond line\n")
+        common = ["--session", "recipient", "--kind", "review", "--repo", "fixture", "--branch", "experiment", "--message-file", str(message)]
+        first = app("handoff", "send", "--machine", "handoff-one", "--handoff-id", "ssh-first", *common)
+        assert first.startswith("delivered "), first
+        retry = app("handoff", "send", "--machine", "handoff-one", "--handoff-id", "ssh-first", *common)
+        assert retry.startswith("already delivered "), retry
+        second = app("handoff", "send", "--machine", "handoff-two", "--handoff-id", "ssh-second", *common)
+        assert second.startswith("delivered "), second
+        for name, own_id, other_id in [("handoff-one", "ssh-first", "ssh-second"), ("handoff-two", "ssh-second", "ssh-first")]:
+            text = outputs[name].read_text()
+            assert text.count(own_id) == 1 and other_id not in text, text
+            assert "review this isolated fixture\nsecond line" in text, text
+
+        # Same account ledger rejects conflicting reuse across distinct servers.
+        record = records["handoff-one"]
+        lifetime = record["session_connections"]
+        request = dict(version=1, handoff_id="wrong-server", server=record["server"],
+                       server_pid=lifetime["server_pid"], server_started_at=lifetime["server_started_at"],
+                       session_created_at=lifetime["session_created_at"], session_id=record["session_id"],
+                       window_id=record["window_id"], pane_id=record["pane_id"], pane_pid=record["pane_pid"],
+                       process_pid=record["process"]["pid"], process_started_at_ms=record["process"]["started_at_ms"],
+                       agent=record["agent"], allow_working=False, text="must never appear")
+        response = json.loads(run(["ssh", "-T", "fixture-peer", shlex.join([BIN, "--config", str(configs["handoff-two"]), "remote-handoff"])], input=json.dumps(request)))
+        assert response["result"] == "rejected" and "server" in response["message"], response
+        assert all("must never appear" not in path.read_text() for path in outputs.values())
+        print("PASS handoff SSH production scanner, two recipient configs, multiline, retry and wrong-server rejection", flush=True)
+    finally:
+        for name, config in configs.items():
+            subprocess.run([BIN, "--config", str(config), "daemon", "stop"], env=ENV, capture_output=True, timeout=10)
+            subprocess.run(["tmux", "-S", sockets[name], "kill-server"], env=ENV, capture_output=True, timeout=10)
+
+
 if __name__ == "__main__":
     if os.geteuid() == 0:
         prepare_login()
     else:
         assert sys.argv[1:] == ["--user"]
+        handoff_scenario()
         for transport in ["SSH", "Mosh"]:
             scenario = Scenario(transport)
             try:
