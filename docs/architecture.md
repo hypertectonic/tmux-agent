@@ -374,21 +374,34 @@ Federation protocol 4 rejects older peers before those records are merged.
 `handoff send` is a CLI operation over the existing snapshot and control
 shapes; the daemon and federation protocol are unchanged apart from the
 additive `handoff_v1` capability. The sender resolves one record from the
-federated snapshot, composes the header and body, and writes a sent record
-under the daemon's handoff state directory. A local record is delivered in
+federated snapshot. Bare pane IDs default to local records unless a machine
+filter is supplied; full IDs and explicit machine scope support remote targets.
+The sender composes the header and body, and writes a sent record
+under the account's handoff state directory. A local record is delivered in
 process. A record from a structured `[[machine]]` peer that advertises the
 capability is delivered through `ssh ... tmux-agent remote-handoff`, a
 one-shot process with bounded JSON on standard I/O and a ten-second deadline,
-mirroring `remote-focus`.
+mirroring `remote-focus`. An optional machine `config` path is passed to every
+remote operation; collection and control select the same recipient server and
+runtime paths. Federation preserves the owning server's identity.
 
 The receiving side never trusts the sender's view. It runs one scan, requires
 an agent in the requested pane with the same session, window, pane process,
-and provider, and applies the state gate: `blocked` and `unknown` are refused,
-`working` needs the explicit flag, `idle` is accepted. It then holds a
-per-pane file lock, loads the text into a named tmux buffer from a mode 0600
-staging file, pastes it with bracketed paste, sends Enter, and records the
-handoff ID in a seven-day ledger so a retried ID is answered as a duplicate
-without pasting.
+and provider process lifetime, and applies the state gate: `blocked` and
+`unknown` are refused, `working` needs the explicit flag, `idle` is accepted.
+It checks live tmux pane mode before claiming or staging input; copy mode,
+other tmux modes and unavailable mode metadata are refused without cancelling
+the mode. This is an on-demand delivery check, not additional scanner polling.
+Kernel process start values are stable across scans; rounded `ps etime` is
+used for activity timing only. A fixed account-wide file lock covers claims,
+validation and terminal submission across all servers. The receiver durably
+writes a pending claim bound to every recipient field and the exact text's
+hash, stages a unique buffer, pastes and sends Enter, then marks delivered.
+Pending retries are uncertain and never replayed; delivered retries answer
+duplicate. A failed paste may have partially typed, so only staging failures
+can release a claim. Compact claims are retained indefinitely; full-text sender
+audit is separately locked and bounded to 200 records. Lock order is sender
+audit then recipient delivery for local sends, with no reverse acquisition.
 
 The header line is the provenance record on both sides: the sender's JSON
 record and the recipient's transcript carry the same ID, sender, kind,

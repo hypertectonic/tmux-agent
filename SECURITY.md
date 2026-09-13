@@ -26,6 +26,7 @@ Include only the minimum evidence needed to reproduce the issue. Do not send:
 - Raw terminal transcripts or captured pane contents.
 - Private hostnames, Tailnet inventory, or complete process command lines.
 - Unredacted configuration files.
+- Unredacted handoff messages or `handoff sent` records, which contain full text.
 
 It is useful to include the affected version, operating system, architecture,
 tmux version, agent provider, local or SSH topology, and a minimal synthetic
@@ -39,6 +40,14 @@ reproduction.
 - Captured pane contents are never included in federation snapshots.
 - Remote transcript content is transmitted only through an explicitly opened
   read-only SSH viewer and is not persisted on the central machine.
+- Explicit handoffs send caller-supplied text over SSH into the recipient's
+  input; this is separate from transcript retrieval and federation snapshots.
+  The text remains in bounded sender history and can enter the provider's
+  transcript. Treat it like any prompt sent to that provider; do not include secrets.
+- A handoff header is caller-supplied context, not verified agent identity or
+  new authority. Recipients still apply their ordinary permission rules.
+  Recipient state/lifetime checks reduce accidental input but do not guarantee
+  provider execution, atomic validation-and-paste, or exactly-once task execution.
 - The project does not install aliases or replace provider executables.
 - Packaged updates discover only a validated stable semantic version from the
   canonical public repository, download assets through immutable version-pinned

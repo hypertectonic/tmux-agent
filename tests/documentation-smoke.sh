@@ -12,6 +12,9 @@ for required in \
     docs/remote-machines.md \
     docs/troubleshooting.md \
     docs/architecture.md \
+    docs/handoff.md \
+    skills/tmux-agent-handoff/SKILL.md \
+    skills/tmux-agent-workspace/SKILL.md \
     docs/release-checklist.md \
     scripts/install \
     scripts/standalone-launcher \
@@ -35,7 +38,7 @@ done
 cargo build --locked
 binary="$root/target/debug/tmux-agent"
 help=$("$binary" --help)
-for command in daemon list watch ui focus explain acknowledge scan run codex claude opencode pi paths doctor update versions rollback; do
+for command in daemon list watch ui focus explain acknowledge find handoff scan run codex claude opencode pi paths doctor update versions rollback; do
     [[ $help == *"$command"* ]] || {
         printf 'root help does not expose documented command: %s\n' "$command" >&2
         exit 1
@@ -48,6 +51,24 @@ for command in run start status stop restart; do
         exit 1
     }
 done
+
+find_help=$("$binary" find --help)
+for flag in --machine --provider --session --cwd --title --state --one --json; do
+    [[ $find_help == *"$flag"* ]] || {
+        printf 'find help is missing documented flag: %s\n' "$flag" >&2
+        exit 1
+    }
+done
+send_help=$("$binary" handoff send --help)
+for flag in --kind --repo --branch --ref --from --handoff-id --allow-working --message-file; do
+    [[ $send_help == *"$flag"* ]] || {
+        printf 'handoff help is missing documented flag: %s\n' "$flag" >&2
+        exit 1
+    }
+done
+"$binary" handoff sent --help >/dev/null
+rg -F '(docs/handoff.md)' "$root/README.md" >/dev/null
+rg -F '(../skills/tmux-agent-handoff/SKILL.md)' "$root/docs/installation.md" >/dev/null
 
 test_root=$(mktemp -d "/tmp/tmux-agent-doc-test.XXXXXX")
 cleanup() {
@@ -131,10 +152,17 @@ TMUX_AGENT_ROOT="$root" \
     XDG_RUNTIME_DIR="$test_root/runtime" \
     XDG_STATE_HOME="$test_root/state" \
     XDG_CONFIG_HOME="$test_root/config" \
-    "$binary" --config "$test_root/config/missing.toml" doctor --json \
+    "$binary" doctor --json \
     >"$test_root/doctor.json"
 grep -F "\"application_version\": \"$version\"" "$test_root/doctor.json" >/dev/null
 grep -F '"protocol": 4' "$test_root/doctor.json" >/dev/null
+
+if "$binary" --config "$test_root/config/missing.toml" scan --json \
+    >"$test_root/missing.out" 2>"$test_root/missing.err"; then
+    printf '%s\n' 'explicit missing config must not select the default server' >&2
+    exit 1
+fi
+grep -F 'explicit config does not exist' "$test_root/missing.err" >/dev/null
 
 cat >"$test_root/config/no-server.toml" <<EOF
 tmux_args = ["-L", "tmux-agent-no-server-$$"]
