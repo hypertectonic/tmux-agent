@@ -3019,7 +3019,8 @@ mod tests {
                 return;
             }
         }
-        let directory = tempdir().unwrap();
+        // macOS's default temp path can exceed tmux's Unix socket limit.
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         let status = Command::new(env::current_exe().unwrap())
             .args(["--exact", "tmux::tests::live_mosh_attachments_focus_hidden_windows_and_follow_session_switches", "--nocapture"])
             .env(SOCKET_ENV, format!("tmux-agent-live-{}", std::process::id()))

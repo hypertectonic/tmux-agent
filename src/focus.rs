@@ -519,7 +519,8 @@ mod tests {
                     return;
                 }
             }
-            let directory = tempfile::tempdir().unwrap();
+            // macOS's default temp path can exceed tmux's Unix socket limit.
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let status = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "focus::tests::real_mosh_inner_selection_validates_lifetime_session_client_and_target", "--nocapture"])
                 .env(FIXTURE, "1").env("TMUX_TMPDIR", directory.path())
@@ -1155,14 +1156,21 @@ mod tests {
         }
 
         let socket = outer.server_key().unwrap().unwrap();
-        let command = || {
-            let mut command = CommandBuilder::new("tmux");
-            command.args(["-S", &socket, "attach-session", "-t", "ui"]);
-            command.env_remove("TMUX");
-            command.env_remove("TMUX_PANE");
-            command.env("TERM", "xterm-256color");
-            command
-        };
+        let attach = shell_join(&[
+            "tmux".into(),
+            "-S".into(),
+            socket,
+            "attach-session".into(),
+            "-t".into(),
+            "ui".into(),
+        ]);
+        // Keep the terminal's session leader alive across detach, as a real
+        // shell does. macOS revokes the slave when its session leader exits.
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", &format!("{attach}; exec {attach}")]);
+        command.env_remove("TMUX");
+        command.env_remove("TMUX_PANE");
+        command.env("TERM", "xterm-256color");
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 40,
@@ -1171,15 +1179,24 @@ mod tests {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut original = pair.slave.spawn_command(command()).unwrap();
-        let original_pid = original.process_id().unwrap().to_string();
+        // Consume redraw and detach output so the client cannot block on a
+        // full PTY buffer while the fixture waits for its replacement.
+        let mut output = pair.master.try_clone_reader().unwrap();
+        let drain = std::thread::spawn(move || {
+            let _ = std::io::copy(&mut output, &mut std::io::sink());
+        });
+        let mut replacement = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        let replacement_pid = replacement.process_id().unwrap().to_string();
         wait_until_ready("original client attachment", || {
-            outer
+            !outer
                 .run(&["list-clients", "-F", "#{client_pid}"])
                 .unwrap()
                 .trim()
-                == original_pid
+                .is_empty()
         });
+        let original_pid = outer.run(&["list-clients", "-F", "#{client_pid}"]).unwrap();
+        assert_ne!(original_pid.trim(), replacement_pid);
         let name = outer
             .run(&["list-clients", "-F", "#{client_name}"])
             .unwrap()
@@ -1215,27 +1232,27 @@ mod tests {
         outer
             .run(&["set-hook", "-g", "after-list-clients", &hook])
             .unwrap();
-        let replacement_command = command();
         let replacement_tmux = outer.clone();
+        let replacement_name = name.clone();
         let replacement_task = std::thread::spawn(move || {
-            // Release the blocked query even if either readiness check panics.
+            // Release the blocked query even if the readiness check panics.
             let _release = ReleaseHandshake(replacement_tmux.clone());
-            wait_until_ready("original client exit", || {
-                original.try_wait().unwrap().is_some()
-            });
-            let replacement = pair.slave.spawn_command(replacement_command).unwrap();
-            let pid = replacement.process_id().unwrap().to_string();
             wait_until_ready("same-PTY replacement attachment", || {
+                // Do not run list-clients here: its hook must fire on the
+                // selection's validation query, after it captures the old PID.
                 replacement_tmux
-                    .run(&["list-clients", "-F", "#{client_pid}"])
-                    .unwrap()
-                    .trim()
-                    == pid
+                    .run(&[
+                        "display-message",
+                        "-p",
+                        "-c",
+                        &replacement_name,
+                        "#{client_pid}",
+                    ])
+                    .is_ok_and(|pid| pid.trim() == replacement_pid)
             });
-            replacement
         });
         let result = context.select(&target);
-        let mut replacement = replacement_task.join().unwrap();
+        replacement_task.join().unwrap();
         let after = outer
             .run(&["list-clients", "-F", "#{client_name}\t#{session_name}"])
             .unwrap();
@@ -1253,7 +1270,12 @@ mod tests {
             replacement.try_wait().unwrap().is_some()
         });
         drop(pair.master);
-        assert!(result.is_err(), "replaced initiating client was accepted");
+        drain.join().unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "initiating tmux client or server changed before selection; refresh and retry",
+            "selection must reject replacement at the guarded switch"
+        );
         assert_eq!(
             after.trim(),
             format!("{name}\tui"),

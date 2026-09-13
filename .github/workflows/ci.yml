@@ -33,7 +33,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y lsof ripgrep shellcheck tmux
       - name: Install system test tools on macOS
         if: runner.os == 'macOS'
-        run: brew install ripgrep shellcheck shfmt tmux
+        run: brew install mosh ripgrep shellcheck shfmt tmux
       - name: Install pinned shfmt on Linux
         if: runner.os == 'Linux'
         run: |
