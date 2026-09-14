@@ -1,10 +1,10 @@
 # Agent handoff
 
-Experimental, not yet released. `tmux-agent handoff send` pastes a scoped
-message into another running agent's pane, on the local tmux server or on a configured SSH machine,
-and submits it as that agent's next input. The message carries a provenance
-header, so the exact text and its origin appear in the recipient's own
-transcript. There is no mailbox, queue, or background retry.
+`tmux-agent handoff send` pastes a scoped message into another running agent's
+pane, on the local tmux server or on a configured SSH machine, and submits it
+as that agent's next input. The message carries a provenance header, so the
+exact text and its origin appear in the recipient's own transcript. There is
+no mailbox, queue, or background retry.
 
 ## What it does
 
@@ -26,7 +26,7 @@ transcript. There is no mailbox, queue, or background retry.
 
 ## Requirements
 
-- A build containing this feature; check `tmux-agent handoff --help`.
+- tmux-agent 0.10.0 or newer; check `tmux-agent handoff --help`.
   Installing a skill alone does not add commands to an older binary.
 - Compatible tmux-agent federation and handoff operation versions on every
   machine, with the recipient advertising `handoff_v1`. Package versions do

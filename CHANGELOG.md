@@ -4,7 +4,7 @@ All notable changes to `tmux-agent` will be documented in this file.
 
 The project uses semantic versioning.
 
-## Unreleased
+## [0.10.0] - 2026-09-14
 
 ### Added
 
@@ -12,7 +12,7 @@ The project uses semantic versioning.
   using native tmux windows, existing handoff delivery and caller-managed task
   monitoring. Defaults to `codex`, honors explicit launchers and normal tmux
   hooks, and keeps native subagent requests separate.
-- Experimental agent handoff: `tmux-agent find` filters the federated snapshot,
+- Agent handoff: `tmux-agent find` filters the federated snapshot,
   and `tmux-agent handoff send` pastes a scoped message with a provenance
   header into exactly one resolved agent pane, locally or through a configured
   machine's SSH control command. The owning machine revalidates the pane,
@@ -27,6 +27,14 @@ The project uses semantic versioning.
   guidance. Bare pane targets default to local agents unless a machine is
   specified. Copy-mode targets are refused before input, allowing a safe retry
   with the same ID after leaving the mode.
+
+### Changed
+
+- Keep a session's activity indicator animated while a recognized descendant
+  is working, with a working-subagent count beside its own status or goal.
+  Parent state, completion and acknowledgement behavior remain unchanged.
+- Fail on an explicitly configured missing config file instead of silently
+  loading defaults.
 
 ## [0.9.0] - 2026-09-07
 

@@ -94,9 +94,9 @@ pane contents.
 
 ## Agent handoff skill
 
-The experimental handoff commands require a build containing the feature.
-Check `tmux-agent handoff --help` on every participating machine. A normal
-release update does not install an unreleased feature.
+The handoff commands require tmux-agent 0.10.0 or newer on the sender and
+recipient. Update each participating machine and check
+`tmux-agent handoff --help`. Installing a skill does not upgrade the binary.
 
 The optional [skill](../skills/tmux-agent-handoff/SKILL.md) works with any
 harness that can read instructions and run shell commands:
@@ -135,8 +135,8 @@ See [Agent handoff](handoff.md) for a first send and its delivery limits.
 
 The optional [workspace skill](../skills/tmux-agent-workspace/SKILL.md) creates
 ordinary tmux task windows or explicitly requested sessions, launches an
-interactive worker, then uses handoff for its assignment. It is experimental
-guidance, not a new `tmux-agent` subcommand. It is independent of the initiating
+interactive worker, then uses handoff for its assignment. It is agent guidance,
+not a new `tmux-agent` subcommand. It is independent of the initiating
 harness and any personal dotfiles or worktree manager.
 
 Install `skills/tmux-agent-workspace/` alongside `skills/tmux-agent-handoff/`
