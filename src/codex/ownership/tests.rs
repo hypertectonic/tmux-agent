@@ -18,6 +18,7 @@ fn old(state: AgentState, seen: bool) -> AgentRecord {
         server: "default".into(),
         pane_id: "%1".into(),
         pane_pid: 1,
+        process: None,
         session_id: "$1".into(),
         session_name: "main".into(),
         window_id: "@1".into(),

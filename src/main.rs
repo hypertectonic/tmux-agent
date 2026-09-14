@@ -4,6 +4,7 @@ mod daemon;
 mod detect;
 mod doctor;
 mod focus;
+mod handoff;
 mod ipc;
 mod model;
 mod runner;
@@ -69,6 +70,24 @@ enum Command {
     /// Internal typed SSH operation, with request and response on standard I/O.
     #[command(name = "remote-focus", hide = true)]
     RemoteFocus,
+    /// Find agents across local and federated machines by filter.
+    Find {
+        #[command(flatten)]
+        filters: handoff::TargetFilters,
+        /// Require exactly one match and print only its ID.
+        #[arg(long)]
+        one: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send a scoped message into another agent's pane, or list sent handoffs.
+    Handoff {
+        #[command(subcommand)]
+        command: HandoffCommand,
+    },
+    /// Internal typed SSH operation, with request and response on standard I/O.
+    #[command(name = "remote-handoff", hide = true)]
+    RemoteHandoff,
     /// Explain the current evidence and state for an agent.
     Explain { target: String },
     /// Mark an agent's completion as seen.
@@ -174,6 +193,55 @@ enum DaemonCommand {
     Stop,
     /// Stop the current daemon and start it again with this binary.
     Restart,
+}
+
+// The CLI enum is built once per process; boxing the send arguments would
+// only obscure the clap derive.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Subcommand)]
+enum HandoffCommand {
+    /// Paste a scoped message into exactly one resolved agent pane and submit it.
+    ///
+    /// The owning machine revalidates the pane, its process, the provider, and
+    /// the agent state before pasting. Blocked, unknown, and tmux-mode targets are refused.
+    Send {
+        /// Full agent ID, unambiguous ID suffix, or pane ID.
+        /// Bare pane IDs are local unless --machine is given. Filters narrow further.
+        target: Option<String>,
+        #[command(flatten)]
+        filters: handoff::TargetFilters,
+        /// What the recipient is being asked to do.
+        #[arg(long, value_enum)]
+        kind: handoff::HandoffKind,
+        /// Repository the work belongs to.
+        #[arg(long)]
+        repo: String,
+        /// Branch the work belongs to.
+        #[arg(long)]
+        branch: String,
+        /// Commit, issue, or pull request the work refers to.
+        #[arg(long = "ref", value_name = "REF")]
+        reference: Option<String>,
+        /// Sender identity for the header. Defaults to the local agent in
+        /// $TMUX_PANE, or the host name.
+        #[arg(long)]
+        from: Option<String>,
+        /// Deliver while the target is working; its provider must queue input.
+        #[arg(long)]
+        allow_working: bool,
+        /// Reuse an ID when retrying after a transport failure.
+        #[arg(long, value_name = "ID")]
+        handoff_id: Option<String>,
+        /// Message body file, or - for standard input.
+        #[arg(long, value_name = "PATH")]
+        message_file: PathBuf,
+    },
+    /// List recent sent handoffs, or show one in full.
+    Sent {
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -307,6 +375,92 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::RemoteFocus => focus::serve(&tmux),
+        Command::Find { filters, one, json } => {
+            daemon::ensure_running(&config_path, &paths).await?;
+            let snapshot = ipc::snapshot(&paths.socket, false).await?;
+            if one {
+                let record = handoff::resolve_target(&snapshot, None, &filters)?;
+                println!("{}", terminal_safe(&record.id));
+                return Ok(());
+            }
+            handoff::print_agents(&handoff::filter_agents(&snapshot, &filters), json)
+        }
+        Command::Handoff {
+            command:
+                HandoffCommand::Send {
+                    target,
+                    filters,
+                    kind,
+                    repo,
+                    branch,
+                    reference,
+                    from,
+                    allow_working,
+                    handoff_id,
+                    message_file,
+                },
+        } => {
+            daemon::ensure_running(&config_path, &paths).await?;
+            let snapshot = ipc::snapshot(&paths.socket, false).await?;
+            let record = handoff::resolve_target(&snapshot, target.as_deref(), &filters)?;
+            let body = read_message(&message_file)?;
+            let from = from.unwrap_or_else(|| default_sender(&snapshot));
+            let sent = handoff::send(
+                &tmux,
+                &config,
+                &paths,
+                &snapshot,
+                record,
+                handoff::SendOptions {
+                    kind,
+                    repository: repo,
+                    branch,
+                    reference,
+                    from,
+                    allow_working,
+                    handoff_id,
+                    body,
+                },
+            )
+            .await?;
+            let target = terminal_safe(&sent.record.target_id);
+            if let Some(warning) = &sent.audit_warning {
+                eprintln!("handoff audit warning: {}", terminal_safe(warning));
+            }
+            match sent.record.status {
+                handoff::SentStatus::Delivered => {
+                    println!("delivered {} to {target}", sent.record.handoff_id);
+                    Ok(())
+                }
+                handoff::SentStatus::Duplicate => {
+                    println!("already delivered {} to {target}", sent.record.handoff_id);
+                    Ok(())
+                }
+                handoff::SentStatus::Failed
+                | handoff::SentStatus::Sending
+                | handoff::SentStatus::Unconfirmed
+                | handoff::SentStatus::Incompatible => bail!(
+                    "handoff {} to {target} failed: {}",
+                    sent.record.handoff_id,
+                    sent.record.message.as_deref().unwrap_or("no response")
+                ),
+            }
+        }
+        Command::Handoff {
+            command: HandoffCommand::Sent { id, json },
+        } => {
+            let records = handoff::load_sent(&paths)?;
+            let Some(id) = id else {
+                return handoff::print_sent(&records, json);
+            };
+            let record = records
+                .iter()
+                .find(|record| record.handoff_id == id)
+                .ok_or_else(|| anyhow::anyhow!("no sent handoff {id:?}"))?;
+            println!("{}", serde_json::to_string_pretty(record)?);
+            Ok(())
+        }
+        Command::RemoteHandoff => handoff::serve(&tmux, &config, &paths),
         Command::Explain { target } => {
             daemon::ensure_running(&config_path, &paths).await?;
             let snapshot = ipc::snapshot(&paths.socket, false).await?;
@@ -403,15 +557,44 @@ async fn main() -> Result<()> {
         Command::Omp { arguments } => run_owned_pty(provider_command("omp", arguments), &paths),
         Command::Pi { arguments } => run_owned_pty(provider_command("pi", arguments), &paths),
         Command::Paths => {
-            println!("config {}", config_path.display());
-            println!("socket {}", paths.socket.display());
-            println!("runs   {}", paths.runners.display());
-            println!("state  {}", paths.state.display());
-            println!("acks   {}", paths.acknowledgements.display());
-            println!("log    {}", paths.log.display());
+            println!("config   {}", config_path.display());
+            println!("socket   {}", paths.socket.display());
+            println!("runs     {}", paths.runners.display());
+            println!("state    {}", paths.state.display());
+            println!("acks     {}", paths.acknowledgements.display());
+            println!("log      {}", paths.log.display());
+            println!("handoffs {}", paths.handoffs.display());
             Ok(())
         }
     }
+}
+
+fn read_message(path: &std::path::Path) -> Result<String> {
+    use std::io::Read;
+    if path.as_os_str() == "-" {
+        let mut body = String::new();
+        std::io::stdin()
+            .read_to_string(&mut body)
+            .map_err(|error| anyhow::anyhow!("read handoff body from stdin: {error}"))?;
+        return Ok(body);
+    }
+    std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("read handoff body {}: {error}", path.display()))
+}
+
+/// The sending agent's own record ID when it runs in a known local pane,
+/// otherwise the host name. Either is enough to find the sender again.
+fn default_sender(snapshot: &Snapshot) -> String {
+    std::env::var("TMUX_PANE")
+        .ok()
+        .and_then(|pane| {
+            snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.remote_alias.is_none() && agent.pane_id == pane)
+                .map(|agent| agent.id.clone())
+        })
+        .unwrap_or_else(|| snapshot.host.clone())
 }
 
 fn configured_remote(config: &Config, name: &str) -> bool {

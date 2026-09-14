@@ -18,7 +18,13 @@ host = "laptop.example.ts.net"
 ssh_user = "agent"
 binary = "/home/agent/.local/bin/tmux-agent"
 
+# Optional on each [[machine]]: an absolute recipient config path, shared by
+# watch, handoff, focus, diagnostics and child views. For two servers on one
+# host, use distinct machine aliases and config paths.
+# config = "/home/agent/.config/tmux-agent/inner.toml"
+
 # Raw commands remain available for transports that need custom SSH options.
+# They are read-only collectors, with no handoff or inner-focus control channel.
 #
 # [[remote]]
 # name = "custom"

@@ -7,12 +7,14 @@ pub const LAUNCHER_PROTOCOL_VERSION: u32 = 1;
 pub const APPLICATION_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CAPABILITY_SUBAGENT_VIEW: &str = "codex_subagent_view_v1";
 pub const CAPABILITY_REMOTE_FOCUS: &str = "remote_tmux_focus_v1";
+pub const CAPABILITY_HANDOFF: &str = "handoff_v1";
 pub const SUBAGENT_VIEW_MINIMUM_VERSION: &str = "0.2.0";
 
 pub fn application_capabilities() -> Vec<String> {
     vec![
         CAPABILITY_SUBAGENT_VIEW.to_string(),
         CAPABILITY_REMOTE_FOCUS.to_string(),
+        CAPABILITY_HANDOFF.to_string(),
     ]
 }
 
@@ -191,6 +193,16 @@ pub struct DetectionDetails {
     pub transition: Option<String>,
 }
 
+/// The foreground process group that carries the agent in its pane, with a
+/// stable kernel start time. Custom persistent shell loops can replace a
+/// provider while retaining this group, so this is not an execution identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRecord {
     pub id: String,
@@ -198,6 +210,8 @@ pub struct AgentRecord {
     pub server: String,
     pub pane_id: String,
     pub pane_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessIdentity>,
     pub session_id: String,
     pub session_name: String,
     pub window_id: String,
@@ -504,6 +518,7 @@ mod tests {
             server: "default".into(),
             pane_id: format!("%{id}"),
             pane_pid: 10,
+            process: None,
             session_id: format!("${id}"),
             session_name: session_name.into(),
             window_id: format!("@{id}"),

@@ -92,6 +92,71 @@ tmux-agent daemon status
 bug report after review. It does not include terminal transcripts or captured
 pane contents.
 
+## Agent handoff skill
+
+The handoff commands require tmux-agent 0.10.0 or newer on the sender and
+recipient. Update each participating machine and check
+`tmux-agent handoff --help`. Installing a skill does not upgrade the binary.
+
+The optional [skill](../skills/tmux-agent-handoff/SKILL.md) works with any
+harness that can read instructions and run shell commands:
+
+1. Take `skills/tmux-agent-handoff/` from the same source revision as the binary.
+2. Copy or symlink that directory into your harness's supported skill location
+   on each machine where an agent will send handoffs. Inspect an existing copy
+   before replacing it. Do not link to a disposable worktree you plan to remove.
+3. Reload skills or start a new agent session as your harness requires. Confirm
+   that it can read `SKILL.md` and run `tmux-agent find --help`.
+
+Without automatic skill discovery, explicitly ask the agent to read the
+installed `SKILL.md` before using handoff. The recipient can receive ordinary
+prompt text without installing a skill; loading it also explains how to handle
+peer requests and report the handoff ID. No additional daemon or plugin is needed.
+
+Release binary installation does not install the skill. A sandboxed sender
+must be able to read its resolved skill path, reach the local daemon socket and
+handoff state directory shown by `tmux-agent paths`, and use configured SSH for
+remote sends. Pi's normal sandbox blocked those paths in private testing;
+receiving still worked. Follow your harness's permission mechanism rather
+than disabling sandboxing or adding a raw tmux fallback automatically.
+
+When testing a private build, preserve the previous binary and selections.
+Check the shell command, TPM `@tmux-agent-binary` option and every machine's
+`binary`/`config` paths; they must select the intended build and tmux server.
+Restart the affected daemons, reconnect their collectors and restart existing
+UI processes explicitly. Verify versions, peer capabilities and the actual
+running processes. A binary replacement alone does not reload them. Keep these
+private selections separate from managed release update/rollback, and restore
+the recorded selections when returning to an official build.
+
+See [Agent handoff](handoff.md) for a first send and its delivery limits.
+
+## Agent workspace skill
+
+The optional [workspace skill](../skills/tmux-agent-workspace/SKILL.md) creates
+ordinary tmux task windows or explicitly requested sessions, launches an
+interactive worker, then uses handoff for its assignment. It is agent guidance,
+not a new `tmux-agent` subcommand. It is independent of the initiating
+harness and any personal dotfiles or worktree manager.
+
+Install `skills/tmux-agent-workspace/` alongside `skills/tmux-agent-handoff/`
+using the copy/symlink and reload procedure above. Keep both from the same source
+revision and make their instructions readable to the initiating agent. Without
+skill discovery, ask it to read both `SKILL.md` files explicitly. Installing or
+updating the binary does not install these skills.
+
+The initiating agent needs shell access to the destination machine and tmux
+server, plus the existing handoff prerequisites. The worker command defaults
+to `codex` in the destination environment. Supply another command, such as
+`codex2` or `claude`, an executable path, or a `CODEX_HOME` override explicitly
+when needed. The skill does not install providers, configure authentication,
+bypass permissions, or create a separate home directory for a fresh conversation.
+
+Task monitoring uses metadata and, when needed, reads the worker's output on
+its owning machine. That output may include private task details; it is not
+part of federation snapshots. Monitoring belongs to the initiating agent, not
+to a new daemon, and does not survive that agent stopping.
+
 ## Update and rollback
 
 `prefix + U` remains TPM's checkout-update operation. Updating the checkout may

@@ -1193,8 +1193,12 @@ pub async fn ensure_running(config_path: &Path, paths: &RuntimePaths) -> Result<
         .with_context(|| format!("open daemon log {}", paths.log.display()))?;
     let stderr = log.try_clone().context("clone daemon log handle")?;
     let mut command = std::process::Command::new(executable);
+    if crate::config::should_forward_config_path(config_path, &crate::config::default_config_path())
+    {
+        command.arg("--config").arg(config_path);
+    }
     command
-        .args(["--config", &config_path.to_string_lossy(), "daemon", "run"])
+        .args(["daemon", "run"])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr));
@@ -1238,6 +1242,7 @@ mod tests {
             server: "default".into(),
             pane_id: "%1".into(),
             pane_pid: 10,
+            process: None,
             session_id: "$1".into(),
             session_name: "main".into(),
             window_id: "@1".into(),

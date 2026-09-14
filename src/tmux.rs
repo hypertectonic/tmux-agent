@@ -1709,6 +1709,67 @@ fn macos_device_name(device: libc::dev_t) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Stable kernel process identity for recipient revalidation. Elapsed `ps`
+/// time is rounded and cannot establish identity across independent scans.
+#[cfg(target_os = "macos")]
+pub(crate) fn stable_process_start_ms(pid: u32) -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // SAFETY: the kernel writes at most `size` bytes into this valid buffer.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid.try_into().ok()?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
+    };
+    if written != size as i32 {
+        return None;
+    }
+    // SAFETY: a successful complete proc_pidinfo call initialized the value.
+    let info = unsafe { info.assume_init() };
+    Some(info.pbi_start_tvsec * 1_000 + info.pbi_start_tvusec / 1_000)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn stable_process_start_ms(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let ticks = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()?;
+    let boot = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .parse::<u64>()
+        .ok()?;
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return None;
+    }
+    Some(boot * 1_000 + ticks * 1_000 / hz as u64)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn stable_process_start_ms(_pid: u32) -> Option<u64> {
+    None
+}
+
+#[test]
+fn process_lifetime_identity_is_stable_across_observations() {
+    let pid = std::process::id();
+    let first = stable_process_start_ms(pid).expect("own process lifetime available");
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(stable_process_start_ms(pid), Some(first));
+    assert!(first > 0);
+}
+
 fn parse_process_start(line: &str) -> Option<(u32, u64)> {
     let mut fields = line.split_whitespace();
     fields.next()?;
@@ -2958,7 +3019,8 @@ mod tests {
                 return;
             }
         }
-        let directory = tempdir().unwrap();
+        // macOS's default temp path can exceed tmux's Unix socket limit.
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         let status = Command::new(env::current_exe().unwrap())
             .args(["--exact", "tmux::tests::live_mosh_attachments_focus_hidden_windows_and_follow_session_switches", "--nocapture"])
             .env(SOCKET_ENV, format!("tmux-agent-live-{}", std::process::id()))
@@ -2996,6 +3058,7 @@ mod tests {
             server: "default".into(),
             pane_id: "%0".into(),
             pane_pid: 100,
+            process: None,
             session_id: "$0".into(),
             session_name: session.into(),
             window_id: "@0".into(),
@@ -5144,7 +5207,7 @@ exit 1
     #[test]
     fn missing_remote_tmux_binding_reports_the_exact_bind_command() {
         let missing = FocusTargetMissing {
-            alias: "thinkcat".into(),
+            alias: "remote-host".into(),
             title: "project".into(),
             session: Some("tmux-agent-res".into()),
             live_session: false,
@@ -5152,7 +5215,7 @@ exit 1
 
         assert_eq!(
             missing.to_string(),
-            "no local pane is bound to thinkcat/tmux-agent-res; run tmux-agent remote bind thinkcat tmux-agent-res --pane <local-pane-id> on this machine"
+            "no local pane is bound to remote-host/tmux-agent-res; run tmux-agent remote bind remote-host tmux-agent-res --pane <local-pane-id> on this machine"
         );
     }
 

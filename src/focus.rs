@@ -160,7 +160,14 @@ where
 }
 
 async fn send_control(machine: &MachineConfig, request: &FocusRequest) -> Result<()> {
-    let response = control_output(&machine.focus_command(), request, CONTROL_TIMEOUT).await?;
+    let payload = serde_json::to_vec(request)?;
+    let response = control_output(
+        &machine.focus_command(),
+        &payload,
+        CONTROL_LIMIT,
+        CONTROL_TIMEOUT,
+    )
+    .await?;
     confirm_response(&response, request)
 }
 
@@ -177,12 +184,30 @@ fn confirm_response(response: &[u8], request: &FocusRequest) -> Result<()> {
     }
 }
 
-async fn control_output(
+/// The control command exited unsuccessfully. Callers can distinguish a peer
+/// binary that lacks the operation from a transport failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ControlExit(pub(crate) Option<i32>);
+
+impl std::fmt::Display for ControlExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(code) => write!(formatter, "SSH control failed with exit status {code}"),
+            None => write!(formatter, "SSH control was terminated by a signal"),
+        }
+    }
+}
+
+impl std::error::Error for ControlExit {}
+
+/// Run one bounded SSH control command: the payload goes to stdin, the typed
+/// response comes back on stdout, and the whole exchange shares one deadline.
+pub(crate) async fn control_output(
     command: &[String],
-    request: &FocusRequest,
+    payload: &[u8],
+    limit: u64,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    let payload = serde_json::to_vec(request)?;
     let mut child = tokio::process::Command::new(&command[0])
         .args(&command[1..])
         .stdin(Stdio::piped())
@@ -191,13 +216,13 @@ async fn control_output(
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .context("start SSH focus control")?;
+        .context("start SSH control")?;
     let operation = async {
         let mut stdin = child
             .stdin
             .take()
             .context("SSH control stdin unavailable")?;
-        stdin.write_all(&payload).await?;
+        stdin.write_all(payload).await?;
         stdin.shutdown().await?;
         drop(stdin);
         let mut response = Vec::new();
@@ -205,21 +230,21 @@ async fn control_output(
             .stdout
             .take()
             .context("SSH control stdout unavailable")?
-            .take(CONTROL_LIMIT + 1)
+            .take(limit + 1)
             .read_to_end(&mut response)
             .await?;
-        if response.len() as u64 > CONTROL_LIMIT {
-            bail!("SSH focus response exceeded size limit");
+        if response.len() as u64 > limit {
+            bail!("SSH control response exceeded size limit");
         }
         let status = child.wait().await?;
         if !status.success() {
-            bail!("SSH focus control failed with {status}");
+            return Err(ControlExit(status.code()).into());
         }
         Ok(response)
     };
     tokio::time::timeout(timeout, operation)
         .await
-        .context("SSH focus control timed out")?
+        .context("SSH control timed out")?
 }
 
 impl FocusRequest {
@@ -430,10 +455,16 @@ mod tests {
     #[tokio::test]
     async fn control_handles_stdin_bounds_failure_and_full_lifetime_timeout() {
         let request = request();
+        let payload = serde_json::to_vec(&request).unwrap();
         let command = |script: &str| vec!["sh".into(), "-c".into(), script.into()];
-        let output = control_output(&command("cat"), &request, Duration::from_secs(2))
-            .await
-            .unwrap();
+        let output = control_output(
+            &command("cat"),
+            &payload,
+            CONTROL_LIMIT,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             serde_json::from_slice::<FocusRequest>(&output).unwrap(),
             request
@@ -441,7 +472,8 @@ mod tests {
         assert!(
             control_output(
                 &command("cat >/dev/null; exit 7"),
-                &request,
+                &payload,
+                CONTROL_LIMIT,
                 Duration::from_secs(2)
             )
             .await
@@ -452,7 +484,8 @@ mod tests {
         assert!(
             control_output(
                 &command("cat >/dev/null; head -c 20000 /dev/zero"),
-                &request,
+                &payload,
+                CONTROL_LIMIT,
                 Duration::from_secs(2)
             )
             .await
@@ -464,7 +497,8 @@ mod tests {
         assert!(
             control_output(
                 &command("cat >/dev/null; exec sleep 10"),
-                &request,
+                &payload,
+                CONTROL_LIMIT,
                 Duration::from_millis(100)
             )
             .await
@@ -485,7 +519,8 @@ mod tests {
                     return;
                 }
             }
-            let directory = tempfile::tempdir().unwrap();
+            // macOS's default temp path can exceed tmux's Unix socket limit.
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
             let status = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "focus::tests::real_mosh_inner_selection_validates_lifetime_session_client_and_target", "--nocapture"])
                 .env(FIXTURE, "1").env("TMUX_TMPDIR", directory.path())
@@ -843,6 +878,7 @@ mod tests {
             server: "default".into(),
             pane_id: request.pane_id.clone(),
             pane_pid: 1,
+            process: None,
             session_id: request.session_id.clone(),
             session_name: "session with spaces".into(),
             window_id: request.window_id.clone(),
@@ -875,6 +911,7 @@ mod tests {
                 host: "localhost".into(),
                 ssh_user: "test".into(),
                 binary: "/test/tmux-agent".into(),
+                config: None,
                 auto_connect: false,
             }],
             ..Config::default()
@@ -1119,14 +1156,21 @@ mod tests {
         }
 
         let socket = outer.server_key().unwrap().unwrap();
-        let command = || {
-            let mut command = CommandBuilder::new("tmux");
-            command.args(["-S", &socket, "attach-session", "-t", "ui"]);
-            command.env_remove("TMUX");
-            command.env_remove("TMUX_PANE");
-            command.env("TERM", "xterm-256color");
-            command
-        };
+        let attach = shell_join(&[
+            "tmux".into(),
+            "-S".into(),
+            socket,
+            "attach-session".into(),
+            "-t".into(),
+            "ui".into(),
+        ]);
+        // Keep the terminal's session leader alive across detach, as a real
+        // shell does. macOS revokes the slave when its session leader exits.
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", &format!("{attach}; exec {attach}")]);
+        command.env_remove("TMUX");
+        command.env_remove("TMUX_PANE");
+        command.env("TERM", "xterm-256color");
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 40,
@@ -1135,15 +1179,24 @@ mod tests {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut original = pair.slave.spawn_command(command()).unwrap();
-        let original_pid = original.process_id().unwrap().to_string();
+        // Consume redraw and detach output so the client cannot block on a
+        // full PTY buffer while the fixture waits for its replacement.
+        let mut output = pair.master.try_clone_reader().unwrap();
+        let drain = std::thread::spawn(move || {
+            let _ = std::io::copy(&mut output, &mut std::io::sink());
+        });
+        let mut replacement = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        let replacement_pid = replacement.process_id().unwrap().to_string();
         wait_until_ready("original client attachment", || {
-            outer
+            !outer
                 .run(&["list-clients", "-F", "#{client_pid}"])
                 .unwrap()
                 .trim()
-                == original_pid
+                .is_empty()
         });
+        let original_pid = outer.run(&["list-clients", "-F", "#{client_pid}"]).unwrap();
+        assert_ne!(original_pid.trim(), replacement_pid);
         let name = outer
             .run(&["list-clients", "-F", "#{client_name}"])
             .unwrap()
@@ -1179,27 +1232,27 @@ mod tests {
         outer
             .run(&["set-hook", "-g", "after-list-clients", &hook])
             .unwrap();
-        let replacement_command = command();
         let replacement_tmux = outer.clone();
+        let replacement_name = name.clone();
         let replacement_task = std::thread::spawn(move || {
-            // Release the blocked query even if either readiness check panics.
+            // Release the blocked query even if the readiness check panics.
             let _release = ReleaseHandshake(replacement_tmux.clone());
-            wait_until_ready("original client exit", || {
-                original.try_wait().unwrap().is_some()
-            });
-            let replacement = pair.slave.spawn_command(replacement_command).unwrap();
-            let pid = replacement.process_id().unwrap().to_string();
             wait_until_ready("same-PTY replacement attachment", || {
+                // Do not run list-clients here: its hook must fire on the
+                // selection's validation query, after it captures the old PID.
                 replacement_tmux
-                    .run(&["list-clients", "-F", "#{client_pid}"])
-                    .unwrap()
-                    .trim()
-                    == pid
+                    .run(&[
+                        "display-message",
+                        "-p",
+                        "-c",
+                        &replacement_name,
+                        "#{client_pid}",
+                    ])
+                    .is_ok_and(|pid| pid.trim() == replacement_pid)
             });
-            replacement
         });
         let result = context.select(&target);
-        let mut replacement = replacement_task.join().unwrap();
+        replacement_task.join().unwrap();
         let after = outer
             .run(&["list-clients", "-F", "#{client_name}\t#{session_name}"])
             .unwrap();
@@ -1217,7 +1270,12 @@ mod tests {
             replacement.try_wait().unwrap().is_some()
         });
         drop(pair.master);
-        assert!(result.is_err(), "replaced initiating client was accepted");
+        drain.join().unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "initiating tmux client or server changed before selection; refresh and retry",
+            "selection must reject replacement at the guarded switch"
+        );
         assert_eq!(
             after.trim(),
             format!("{name}\tui"),

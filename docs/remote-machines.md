@@ -23,10 +23,18 @@ name = "build-host"
 host = "build-host.example.ts.net"
 ssh_user = "agent"
 binary = "/home/agent/.local/bin/tmux-agent"
+# Optional: absolute config path on the recipient for a named/custom server.
+# config = "/home/agent/.config/tmux-agent/inner.toml"
 ```
 
 Set `auto_connect = false` when the machine should remain configured for
 interactive operations but should not start a background collector.
+
+The optional `config` path is passed to collection, focus, handoff, diagnostics
+and child views. It is resolved on the recipient, not the sending machine.
+An explicit missing file fails rather than falling back to another server.
+For two servers on one host, use distinct machine aliases and recipient configs.
+See the [named-server example](handoff.md#requirements).
 
 ## Setup order
 
@@ -72,7 +80,7 @@ ssh -T agent@build-host.example.ts.net \
 ```
 
 These are ordinary SSH commands initiated and authorized by the user. Remote
-configuration permits federation reads and explicit focus or child-view actions;
+configuration permits federation reads and explicit focus, handoff or child-view actions;
 it never grants tmux-agent authority to run lifecycle commands on another machine.
 
 ## What crosses SSH
@@ -94,6 +102,28 @@ Opening a remote Codex child starts a separate interactive SSH command for the
 read-only viewer. That explicit action can display assistant messages and tool
 output. The content does not enter the normal federation snapshot or central
 persistence.
+
+An explicit `handoff send` carries its full header and body over a separate SSH
+control command. It is pasted into the recipient's input and can appear in that
+provider's transcript. The sender retains bounded full-text history. This is
+separate from federation's metadata-only stream; review messages for sensitive
+information before sending them.
+
+## Agent handoff over SSH or Mosh
+
+[Handoff](handoff.md) requires a discovered tmux agent, a structured
+`[[machine]]` and the peer's `handoff_v1` capability. Same-protocol peers without
+that capability can still be monitored but cannot receive handoffs.
+
+Unlike focus, handoff needs no local transport-pane binding or attached remote
+client. The command reaches the owning server directly over SSH even if you
+view that server through Mosh or nested tmux. It does not switch windows or
+paste into the outer SSH/Mosh terminal. A pane move needs fresh discovery;
+stale in-flight targets are refused.
+
+Configuration is directional. To send back, the remote machine needs its own
+structured entry and working SSH route to the original sender. An existing
+Mosh connection does not provide that reverse control route.
 
 ## Remote focus
 
@@ -235,6 +265,6 @@ command = ["ssh", "-T", "build-host", "tmux-agent", "watch", "--jsonl", "--local
 ```
 
 The structured `[[machine]]` form is preferred because it also supports
-diagnostics, inner tmux focus, and remote Codex child viewing. Raw collector
-commands do not define a focus control channel; tmux-agent does not infer one
+diagnostics, inner tmux focus, handoff, and remote Codex child viewing. Raw collector
+commands do not define a focus or handoff control channel; tmux-agent does not infer one
 from their command text.
