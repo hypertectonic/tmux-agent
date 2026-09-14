@@ -29,8 +29,8 @@ cat >"$config" <<EOF
 tmux_args = ["-L", "$socket_name"]
 
 [[remote]]
-name = "thinkcat"
-command = ["ssh", "thinkcat", "tmux-agent", "watch", "--jsonl", "--local-only"]
+name = "remote-host"
+command = ["ssh", "remote-host", "tmux-agent", "watch", "--jsonl", "--local-only"]
 EOF
 
 run_isolated() {
@@ -56,13 +56,13 @@ if run_isolated remote bind unknown remote-session --pane "$transport_pane" \
 fi
 grep -F 'no configured remote named "unknown"' "$test_root/unknown.stderr" >/dev/null
 
-bound=$(run_isolated remote bind thinkcat tmux-agent-res --pane "$transport_pane")
-[[ $bound == "bound $transport_pane to thinkcat/tmux-agent-res" ]]
-[[ $("${tmux_test[@]}" show-option -pqv -t "$transport_pane" @tmux_agent_remote_host) == thinkcat ]]
+bound=$(run_isolated remote bind remote-host tmux-agent-res --pane "$transport_pane")
+[[ $bound == "bound $transport_pane to remote-host/tmux-agent-res" ]]
+[[ $("${tmux_test[@]}" show-option -pqv -t "$transport_pane" @tmux_agent_remote_host) == remote-host ]]
 [[ $("${tmux_test[@]}" show-option -pqv -t "$transport_pane" @tmux_agent_remote_session) == tmux-agent-res ]]
-[[ $(run_isolated remote bindings) == "$transport_pane thinkcat tmux-agent-res" ]]
+[[ $(run_isolated remote bindings) == "$transport_pane remote-host tmux-agent-res" ]]
 
-if run_isolated remote bind thinkcat other-session --pane "$ui_pane" \
+if run_isolated remote bind remote-host other-session --pane "$ui_pane" \
     >"$test_root/ui.stdout" 2>"$test_root/ui.stderr"; then
     printf '%s\n' 'tmux-agent UI panes must not become remote bindings' >&2
     exit 1
@@ -75,7 +75,7 @@ unbound=$(run_isolated remote unbind --pane "$transport_pane")
 [[ -z $("${tmux_test[@]}" show-option -pqv -t "$transport_pane" @tmux_agent_remote_session) ]]
 [[ $(run_isolated remote bindings) == 'No remote pane bindings.' ]]
 
-bound=$(TMUX_PANE="$transport_pane" run_isolated remote bind thinkcat default-session)
-[[ $bound == "bound $transport_pane to thinkcat/default-session" ]]
+bound=$(TMUX_PANE="$transport_pane" run_isolated remote bind remote-host default-session)
+[[ $bound == "bound $transport_pane to remote-host/default-session" ]]
 
 printf '%s\n' 'remote pane binding tests passed'

@@ -560,6 +560,7 @@ mod tests {
                 server: "default".into(),
                 pane_id: "tty:ttys001".into(),
                 pane_pid: 10,
+                process: None,
                 session_id: String::new(),
                 session_name: String::new(),
                 window_id: String::new(),

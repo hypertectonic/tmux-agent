@@ -77,6 +77,29 @@ the container UI cases against an existing native Linux binary. This mode does
 not build source or run the named Rust tests and is not the full CI gate. Both
 modes mount the current fixture files, including local untracked edits.
 
+### Handoff validation
+
+For handoff changes, run the focused tests with tmux installed:
+
+```sh
+cargo test --locked handoff::tests -- --nocapture
+tests/documentation-smoke.sh
+```
+
+The Rust tests cover recipient validation, copy-mode refusal, local/remote
+target scoping, concurrent sends, pending claims and retries. Some use real
+disposable tmux servers with synthetic scanner records; they do not replace a
+real provider/SSH round trip. Without tmux, those fixtures may skip.
+
+For manual E2E tests, use disposable servers and separate runtime/state paths,
+synthetic messages, and acknowledgement-only provider sessions. Verify the
+installed skill and binary on both ends, wait until setup dialogs are finished,
+then check the raw recipient transcript for one prompt and one expected reply.
+Include same-ID retries, remote pane moves, and Mosh attachment when relevant.
+Record provider/build versions, failures and skips without publishing private
+hosts, paths, full handoffs or transcripts. Stop fixture daemons and servers
+afterward. See [delivery semantics](docs/handoff.md) before interpreting success.
+
 ## Change scope
 
 Keep changes focused and preserve backward-compatible snapshot formats unless a

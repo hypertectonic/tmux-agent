@@ -166,6 +166,42 @@ tmux-agent acknowledge <id-or-pane>
 Acknowledgement remains effective until that agent begins another active
 turn.
 
+## Handoff delivery fails or is unconfirmed
+
+Inspect discovery and the retained result locally:
+
+```sh
+tmux-agent find --json
+tmux-agent handoff sent <handoff-id> --json
+```
+
+The second command includes full message text; redact it before sharing.
+
+- **No match or ambiguity:** narrow by machine, provider, session or `--cwd`,
+  then use the full returned ID. Bare pane IDs are local unless `--machine`
+  is given. `--repo` and `--branch` are task metadata, not target filters.
+- **Copy mode, blocked, unknown or working:** resolve the reported condition
+  first. Do not cancel someone else's copy mode or bypass a permission prompt.
+  `--allow-working` is only for intentional input queuing by a known provider.
+- **Unsupported command or capability:** verify the actual binary on both
+  machines and `handoff_v1` in `tmux-agent list --json`. An installed skill
+  cannot supply a command missing from the binary. Raw collectors lack control.
+- **Different server or stale recipient:** check the machine's recipient
+  `config` path and rediscover after pane moves or process restarts. Do not fix
+  a handoff routing error by changing an outer Mosh focus binding.
+- **SSH timeout or `unconfirmed`:** the message may have arrived. Inspect the
+  recipient and retry only with the same ID, recipient and exact header/body.
+  A pending/partial-submission result requires inspection, not another send.
+  Do not delete claims or generate a new ID to bypass uncertainty.
+- **`sending` after interruption:** no final result was recorded. Treat the
+  outcome as unknown; first check whether the original command is still running.
+- **Skill or runtime permission denied:** check the sender's sandbox can reach
+  the resolved skill path, runtime paths and SSH. Do not disable it automatically.
+
+`delivered` confirms paste and Enter, not the agent's execution or completion.
+Check its transcript/report for the actual response. Full semantics are in
+[Agent handoff](handoff.md#reading-a-result).
+
 ## Roll back
 
 ```sh

@@ -211,6 +211,65 @@ pane. Older peers and raw collector commands retain reported outer-only focus.
 See [Remote machines](docs/remote-machines.md) for setup order, privacy
 boundaries, focus behavior, and safe multi-machine updates.
 
+## Agent handoff
+
+Experimental, not yet released. Find a running agent and send it a scoped
+handoff, locally or on a configured machine. For example, ask your agent to
+send a review request to the agent working on a particular repository.
+
+```sh
+tmux-agent find --machine build-host --provider codex
+tmux-agent handoff send --machine build-host --provider codex \
+  --kind review --repo hypertectonic/tmux-agent --branch develop \
+  --message-file - <<'HANDOFF'
+Review the current change. Do not edit or deploy. Report findings and tests.
+HANDOFF
+tmux-agent handoff sent
+```
+
+The owning machine revalidates the pane, its process, the provider, and the
+agent state before pasting. Blocked, unknown and copy-mode targets are refused;
+working targets require an explicit override. Ambiguous recipients are never
+guessed. A full discovered ID is safest; bare pane IDs are local unless scoped
+with `--machine`.
+
+The message carries a provenance header into the recipient's transcript.
+`delivered` confirms submission, not that the agent read or completed the task.
+Nothing is queued. Remote delivery uses SSH even when you view the agent through
+Mosh, and does not focus or type into the outer transport pane.
+
+For a custom remote tmux server, set the machine's optional `config` to its
+recipient config path. Discovery and delivery use that same config. Interrupted
+submission is reported as uncertain and is never automatically replayed.
+
+Install the optional, harness-neutral [handoff skill](skills/tmux-agent-handoff/SKILL.md)
+on each sending machine using [these instructions](docs/installation.md#agent-handoff-skill).
+The skill is guidance for an existing agent, not another service.
+See [Agent handoff](docs/handoff.md) for setup, delivery rules and limitations.
+
+## Start another agent session
+
+The experimental [workspace skill](skills/tmux-agent-workspace/SKILL.md)
+complements handoff. Ask your coding agent to "start a fresh Codex session to
+review this change" or "start a new Codex session using codex2". It creates a
+detached task window in the caller's own tmux session and machine, starts a full
+interactive TUI in the intended checkout, and delivers the assignment through
+tmux-agent. In remote/nested tmux, the window belongs to the inner server where
+the caller runs. Requests for native subagents remain native subagent requests.
+
+The default worker command is `codex`; explicitly requested providers, commands,
+paths and home overrides are respected. Any initiating harness with shell
+access can use the skill. Native tmux creation hooks still run, with no required
+dotfiles, copied layout, or automatic sidebar. Outside tmux, the agent asks for
+a destination rather than guessing.
+
+For an assigned task, the initiating agent monitors progress and checks the
+result. This is not persistent supervision: monitoring stops if that agent
+stops. Finished windows and worktrees stay available until cleanup is requested.
+Opening an empty session does not imply ongoing monitoring. See
+[skill installation](docs/installation.md#agent-workspace-skill). No new binary
+command or service is introduced.
+
 ## Privacy and security
 
 - The daemon listens only on a mode `0600` local Unix socket.
@@ -220,6 +279,8 @@ boundaries, focus behavior, and safe multi-machine updates.
   command lines, prompts, reasoning, rollout events, and goal objectives.
 - Remote federation uses non-interactive SSH. There is no application TCP
   listener or shared application token.
+- An explicit handoff sends its full message to the recipient and retains a
+  bounded full-text sender history. It never enters federation snapshots.
 - Codex rollout content crosses SSH only while the user has explicitly opened
   a read-only child view.
 
@@ -260,6 +321,9 @@ tmux-agent acknowledge <id-or-pane>
 tmux-agent remote bind <remote> <session> [--pane <local-pane-id>]
 tmux-agent remote unbind [--pane <local-pane-id>]
 tmux-agent remote bindings
+tmux-agent find [filters] [--one] [--json]
+tmux-agent handoff send [<id-or-pane>] [filters] --kind <kind> --repo <name> --branch <name> --message-file <path|->
+tmux-agent handoff sent [<id>] [--json]
 tmux-agent codex [args...]
 tmux-agent claude [args...]
 tmux-agent opencode [args...]

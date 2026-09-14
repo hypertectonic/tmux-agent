@@ -273,6 +273,15 @@ impl Scanner {
                         .unwrap_or(pane.pane_pid)
                         .to_string())
             );
+            let process_group = processes
+                .pane_groups
+                .get(&pane.pane_id)
+                .copied()
+                .unwrap_or(pane.pane_pid);
+            let process_identity = crate::model::ProcessIdentity {
+                pid: process_group,
+                started_at_ms: crate::tmux::stable_process_start_ms(process_group),
+            };
             let observed_start = observed_process_start(
                 processes
                     .pane_pids
@@ -318,6 +327,7 @@ impl Scanner {
                 server: self.server.clone(),
                 pane_id: pane.pane_id,
                 pane_pid: pane.pane_pid,
+                process: Some(process_identity),
                 session_id: pane.session_id,
                 session_name: pane.session_name,
                 window_id: pane.window_id,
@@ -425,6 +435,7 @@ impl Scanner {
                 server: self.server.clone(),
                 pane_id: String::new(),
                 pane_pid: terminal.leader_pid,
+                process: None,
                 session_id: String::new(),
                 session_name: terminal.name.clone(),
                 window_id: String::new(),
@@ -508,6 +519,7 @@ impl Scanner {
                     server: self.server.clone(),
                     pane_id: String::new(),
                     pane_pid: wrapped.owner_pid,
+                    process: None,
                     session_id: wrapped.run_id.clone(),
                     session_name: wrapped.run_id.clone(),
                     window_id: String::new(),
@@ -1356,6 +1368,7 @@ mod tests {
             server: "default".into(),
             pane_id: "%1".into(),
             pane_pid: 1,
+            process: None,
             session_id: "$1".into(),
             session_name: "main".into(),
             window_id: "@1".into(),

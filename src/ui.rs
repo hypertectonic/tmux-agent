@@ -1200,14 +1200,20 @@ fn subagent_view_command(
     }
 
     let executable = std::env::current_exe().context("resolve tmux-agent executable")?;
-    Ok(vec![
-        executable.to_string_lossy().into_owned(),
-        "--config".to_string(),
-        config_path.to_string_lossy().into_owned(),
+    let mut command = vec![executable.to_string_lossy().into_owned()];
+    if crate::config::should_forward_config_path(config_path, &crate::config::default_config_path())
+    {
+        command.extend([
+            "--config".to_string(),
+            config_path.to_string_lossy().into_owned(),
+        ]);
+    }
+    command.extend([
         "subagent-view".to_string(),
         "--local-only".to_string(),
         record.id.clone(),
-    ])
+    ]);
+    Ok(command)
 }
 
 fn run_in_current_terminal(command: &[String]) -> Result<()> {
@@ -1963,6 +1969,7 @@ mod tests {
             server: "default".into(),
             pane_id: "%1".into(),
             pane_pid: 10,
+            process: None,
             session_id: "$1".into(),
             session_name: "project-one".into(),
             window_id: "@1".into(),
@@ -3034,6 +3041,7 @@ mod tests {
             state: directory.path().join("state.json"),
             acknowledgements: directory.path().join("acknowledged.json"),
             log: directory.path().join("daemon.log"),
+            handoffs: directory.path().join("handoffs"),
         };
         let listener = UnixListener::bind(&paths.socket).unwrap();
         let server = tokio::spawn(async move {
@@ -4054,6 +4062,7 @@ mod tests {
             state: directory.path().join("state.json"),
             acknowledgements: directory.path().join("acknowledged.json"),
             log: directory.path().join("daemon.log"),
+            handoffs: directory.path().join("handoffs"),
         };
         let listener = UnixListener::bind(&paths.socket).unwrap();
         let started = Command::new("tmux")
@@ -4260,6 +4269,7 @@ mod tests {
             state: directory.path().join("state.json"),
             acknowledgements: directory.path().join("acknowledged.json"),
             log: directory.path().join("daemon.log"),
+            handoffs: directory.path().join("handoffs"),
         };
         let listener = UnixListener::bind(&paths.socket).unwrap();
         let started = Command::new("tmux")
