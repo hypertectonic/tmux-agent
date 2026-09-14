@@ -28,7 +28,9 @@ transcript. There is no mailbox, queue, or background retry.
 
 - A build containing this feature; check `tmux-agent handoff --help`.
   Installing a skill alone does not add commands to an older binary.
-- The same tmux-agent version on every machine, advertising `handoff_v1`.
+- Compatible tmux-agent federation and handoff operation versions on every
+  machine, with the recipient advertising `handoff_v1`. Package versions do
+  not need to be identical.
   `tmux-agent list --json` shows each peer's capabilities.
 - A structured `[[machine]]` entry for every remote you send to. Raw
   `[[remote]]` collectors define no control channel and are rejected.
@@ -158,6 +160,12 @@ fails. A retry then returns `uncertain` without typing again. Inspect the
 recipient transcript before deciding to send a new ID. A transport failure is
 `unconfirmed` on the sender; retrying the same ID queries the recipient's claim.
 Failures proven to occur before terminal input release the claim.
+
+The receiver stages the text before checking the current agent process and
+state. tmux checks the pane's identity and mode again in the command sequence
+that pastes and submits it. A refusal at that check leaves input untouched and
+allows a fresh attempt with the same ID. A potentially partial submission
+retains its claim so a retry cannot automatically type the message again.
 
 The public `send --handoff-id` command resolves the target again and uses its
 current identity. If the agent exited, moved or restarted, it can refuse the

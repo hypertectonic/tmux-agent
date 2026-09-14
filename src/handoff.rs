@@ -722,7 +722,7 @@ fn deliver_with_submission(
     paths: &RuntimePaths,
     request: &HandoffRequest,
     scan: impl FnOnce() -> Result<Snapshot>,
-    submit: impl FnOnce(&Tmux, &HandoffRequest, &str) -> Result<()>,
+    submit: impl FnOnce(&Tmux, &HandoffRequest, &str) -> Result<Submission>,
 ) -> Result<HandoffResponse> {
     request.validate()?;
     let root = ensure_dir(&paths.handoffs)?;
@@ -746,30 +746,6 @@ fn deliver_with_submission(
             ),
         });
     }
-    let snapshot = scan()?;
-    validate_against_snapshot(&snapshot, request)?;
-    let live = tmux
-        .list_panes()?
-        .into_iter()
-        .find(|pane| pane.pane_id == request.pane_id && !pane.dead)
-        .context("target pane vanished before delivery")?;
-    if live.pane_pid != request.pane_pid {
-        bail!("target pane was recreated before delivery");
-    }
-    // In copy mode, paste can reach the PTY while Enter is consumed by tmux.
-    // Refuse before claiming or staging so leaving the mode permits a safe retry.
-    let mode = tmux.run(&[
-        "display-message",
-        "-p",
-        "-t",
-        &request.pane_id,
-        "#{pane_in_mode}",
-    ])?;
-    match mode.trim() {
-        "0" => {}
-        "1" => bail!("target pane is in copy mode or another tmux mode; leave it before retrying"),
-        _ => bail!("target pane mode is unavailable; refusing to paste blindly"),
-    }
     let mut claim = Claim {
         fingerprint: recipient_fingerprint(request),
         state: ClaimState::Pending,
@@ -784,13 +760,34 @@ fn deliver_with_submission(
             return Err(error);
         }
     };
-    if let Err(error) = submit(tmux, request, &buffer) {
-        return Ok(uncertain(
-            request,
-            &format!(
-                "terminal submission may be partial: {error:#}; inspect the recipient transcript"
-            ),
-        ));
+    // Loading the buffer can take time or run a user hook. Scan only after
+    // staging so an agent that exited during loading cannot leave us typing
+    // into its shell. Process validation and terminal input are still separate.
+    if let Err(error) = scan().and_then(|snapshot| validate_against_snapshot(&snapshot, request)) {
+        let _ = tmux.run(&["delete-buffer", "-b", &buffer]);
+        fs::remove_file(&marker)?;
+        return Err(error);
+    }
+    match submit(tmux, request, &buffer) {
+        Ok(Submission::Submitted) => {}
+        Ok(Submission::Refused) => {
+            // Only the synchronous guard's explicit refusal proves no input
+            // occurred. Other failures retain the pending claim conservatively.
+            let _ = tmux.run(&["delete-buffer", "-b", &buffer]);
+            fs::remove_file(&marker)?;
+            bail!(
+                "target pane identity changed or is in copy mode or another tmux mode; refresh or leave the mode before retrying"
+            );
+        }
+        Err(error) => {
+            let _ = tmux.run(&["delete-buffer", "-b", &buffer]);
+            return Ok(uncertain(
+                request,
+                &format!(
+                    "terminal submission may be partial: {error:#}; inspect the recipient transcript"
+                ),
+            ));
+        }
     }
     claim.state = ClaimState::Delivered;
     if let Err(error) = atomic_json(&marker, &claim) {
@@ -849,31 +846,61 @@ fn prepare_paste(tmux: &Tmux, root: &Path, request: &HandoffRequest) -> Result<S
     let staged_path = staged.to_string_lossy().into_owned();
     let loaded = tmux.run(&["load-buffer", "-b", &buffer, &staged_path]);
     let _ = fs::remove_file(&staged);
-    loaded?;
+    if let Err(error) = loaded {
+        let _ = tmux.run(&["delete-buffer", "-b", &buffer]);
+        return Err(error);
+    }
     Ok(buffer)
 }
 
-fn submit_paste(tmux: &Tmux, request: &HandoffRequest, buffer: &str) -> Result<()> {
-    // One tmux command sequence: the paste and Enter are queued together on
-    // the server, and the buffer is deleted by the paste itself.
-    if let Err(error) = tmux.run(&[
-        "paste-buffer",
-        "-p",
-        "-d",
-        "-b",
-        buffer,
+enum Submission {
+    Submitted,
+    Refused,
+}
+
+fn submit_paste(tmux: &Tmux, request: &HandoffRequest, buffer: &str) -> Result<Submission> {
+    let target = format!(
+        "{}:{}.{}",
+        request.session_id, request.window_id, request.pane_id
+    );
+    let guard = format!(
+        "#{{==:#{{pid}}:#{{start_time}}:#{{session_id}}:#{{session_created}}:#{{window_id}}:#{{pane_id}}:#{{pane_pid}}:#{{pane_dead}}:#{{pane_in_mode}},{server_pid}:{server_started}:{session}:{created}:{window}:{pane}:{pane_pid}:0:0}}",
+        server_pid = request.server_pid,
+        server_started = request.server_started_at,
+        session = request.session_id,
+        created = request.session_created_at,
+        window = request.window_id,
+        pane = request.pane_id,
+        pane_pid = request.pane_pid,
+    );
+    let paste = crate::config::shell_join(&[
+        "paste-buffer".into(),
+        "-p".into(),
+        "-d".into(),
+        "-b".into(),
+        buffer.into(),
+        "-t".into(),
+        target.clone(),
+    ]);
+    // if-shell -F queues its branch synchronously, with no shell or event-loop
+    // yield before paste and Enter. Mode/identity refusal never touches input.
+    let output = tmux.run(&[
+        "if-shell",
+        "-F",
         "-t",
-        &request.pane_id,
-        ";",
-        "send-keys",
-        "-t",
-        &request.pane_id,
-        "Enter",
-    ]) {
-        let _ = tmux.run(&["delete-buffer", "-b", buffer]);
-        return Err(error);
+        &target,
+        &guard,
+        &format!(
+            "{paste} ; send-keys -t {} Enter ; display-message -p tmux-agent-handoff-submitted",
+            crate::config::shell_join(std::slice::from_ref(&target))
+        ),
+        "display-message -p tmux-agent-handoff-refused",
+    ])?;
+    match output.trim() {
+        "tmux-agent-handoff-submitted" => Ok(Submission::Submitted),
+        "tmux-agent-handoff-refused" => Ok(Submission::Refused),
+        _ => bail!("tmux did not confirm whether handoff input was submitted"),
     }
-    Ok(())
 }
 
 fn scan_once(tmux: &Tmux, config: &Config, paths: &RuntimePaths) -> Result<Snapshot> {
@@ -2035,6 +2062,223 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn copy_mode_entered_during_staging_refuses_input_and_allows_same_id_retry() {
+        let Some((_server, tmux, mut request, pane)) = cat_server("staging-mode") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_paths(directory.path());
+        request.text = "staging mode guarded message".into();
+        let live = snapshot_for(&request, &pane);
+        tmux.run(&[
+            "set-hook",
+            "-g",
+            "after-load-buffer",
+            &format!("copy-mode -t {}", request.pane_id),
+        ])
+        .unwrap();
+        let result = deliver_with(&tmux, &paths, &request, || Ok(live.clone()));
+        assert!(result.is_err(), "staging race accepted: {result:?}");
+        assert!(
+            !paths
+                .handoffs
+                .join("claims")
+                .join(&request.handoff_id)
+                .exists()
+        );
+        assert!(
+            tmux.run(&["list-buffers", "-F", "#{buffer_name}"])
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+        assert_eq!(
+            tmux.run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &request.pane_id,
+                "#{pane_in_mode}"
+            ])
+            .unwrap()
+            .trim(),
+            "1"
+        );
+        tmux.run(&[
+            "set-hook",
+            "-gu",
+            "after-load-buffer",
+            ";",
+            "send-keys",
+            "-t",
+            &request.pane_id,
+            "-X",
+            "cancel",
+        ])
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!capture(&tmux, &request.pane_id).contains(&request.text));
+        assert!(matches!(
+            deliver_with(&tmux, &paths, &request, || Ok(live)),
+            Ok(HandoffResponse::Delivered {
+                duplicate: false,
+                ..
+            })
+        ));
+        let screen = wait_for(&tmux, &request.pane_id, &request.text);
+        assert_eq!(screen.matches(&request.text).count(), 1);
+    }
+
+    #[test]
+    fn provider_exit_during_staging_never_types_into_the_remaining_shell() {
+        let Some((_server, tmux, request, _pane)) = cat_server("staging-exit") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_paths(directory.path());
+        let config = Config {
+            tmux_args: vec!["-L".into(), request.server.clone()],
+            ..Config::default()
+        };
+        tmux.run(&[
+            "respawn-pane",
+            "-k",
+            "-t",
+            &request.pane_id,
+            "/bin/bash --noprofile --norc",
+        ])
+        .unwrap();
+        tmux.run(&[
+            "send-keys",
+            "-t",
+            &request.pane_id,
+            "/bin/bash -c 'exec -a claude /bin/cat'",
+            "Enter",
+        ])
+        .unwrap();
+        tmux.run(&[
+            "select-pane",
+            "-t",
+            &request.pane_id,
+            "-T",
+            "✳ review-fixture",
+        ])
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let record = loop {
+            let snapshot = scan_once(&Tmux::new(&config), &config, &paths).unwrap();
+            if let Some(record) = snapshot
+                .agents
+                .into_iter()
+                .find(|record| record.pane_id == request.pane_id && record.agent == "Claude")
+            {
+                break record;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "synthetic Claude was not detected"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let probe = directory.path().join("unsolicited-shell-input");
+        let text = format!(
+            "echo handoff_shell_execution > {}",
+            crate::config::shell_join(&[probe.to_string_lossy().into_owned()])
+        );
+        let request = HandoffRequest::for_record("staging-exit", &record, false, text).unwrap();
+        assert_ne!(
+            request.process_pid, request.pane_pid,
+            "provider must be a child of the surviving shell"
+        );
+        let process = request.process_pid;
+        let hook = format!(
+            "kill {process}; attempts=0; while kill -0 {process} 2>/dev/null; do attempts=$((attempts + 1)); [ $attempts -lt 300 ] || exit 1; sleep 0.01; done"
+        );
+        tmux.run(&[
+            "set-hook",
+            "-g",
+            "after-load-buffer",
+            &crate::config::shell_join(&["run-shell".into(), hook]),
+        ])
+        .unwrap();
+        let error = deliver(&Tmux::new(&config), &config, &paths, &request).unwrap_err();
+        assert!(
+            error.to_string().contains("no agent is detected"),
+            "{error:#}"
+        );
+        assert!(
+            !paths
+                .handoffs
+                .join("claims")
+                .join(&request.handoff_id)
+                .exists()
+        );
+        assert!(
+            tmux.run(&["list-buffers", "-F", "#{buffer_name}"])
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!probe.exists(), "handoff executed in the remaining shell");
+        assert!(!capture(&tmux, &request.pane_id).contains("handoff_shell_execution"));
+    }
+
+    #[test]
+    fn submission_guard_refuses_mode_or_pane_changes_after_the_scan() {
+        let Some((_server, tmux, mut request, pane)) = cat_server("submit-guard") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_paths(directory.path());
+        let live = snapshot_for(&request, &pane);
+        for change in ["mode", "pane"] {
+            request.handoff_id = format!("submit-{change}");
+            request.text = format!("must not receive {change} changed message");
+            let response = deliver_with_submission(
+                &tmux,
+                &paths,
+                &request,
+                || Ok(live.clone()),
+                |tmux, request, buffer| {
+                    if change == "mode" {
+                        tmux.run(&["copy-mode", "-t", &request.pane_id])?;
+                    } else {
+                        tmux.run(&[
+                            "respawn-pane",
+                            "-k",
+                            "-t",
+                            &request.pane_id,
+                            "cat >/dev/null",
+                        ])?;
+                    }
+                    submit_paste(tmux, request, buffer)
+                },
+            );
+            assert!(response.is_err(), "changed {change} accepted: {response:?}");
+            assert!(
+                !paths
+                    .handoffs
+                    .join("claims")
+                    .join(&request.handoff_id)
+                    .exists()
+            );
+            assert!(
+                tmux.run(&["list-buffers", "-F", "#{buffer_name}"])
+                    .unwrap()
+                    .trim()
+                    .is_empty()
+            );
+            if change == "mode" {
+                tmux.run(&["send-keys", "-t", &request.pane_id, "-X", "cancel"])
+                    .unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!capture(&tmux, &request.pane_id).contains(&request.text));
+        }
     }
 
     #[test]
