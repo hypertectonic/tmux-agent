@@ -4,7 +4,7 @@ All notable changes to `tmux-agent` will be documented in this file.
 
 The project uses semantic versioning.
 
-## [0.10.0] - Unreleased
+## [0.10.0] - 2026-09-14
 
 ### Added
 
