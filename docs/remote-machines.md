@@ -111,7 +111,7 @@ information before sending them.
 
 ## Agent handoff over SSH or Mosh
 
-Experimental [handoff](handoff.md) requires a discovered tmux agent, a structured
+[Handoff](handoff.md) requires a discovered tmux agent, a structured
 `[[machine]]` and the peer's `handoff_v1` capability. Same-protocol peers without
 that capability can still be monitored but cannot receive handoffs.
 

@@ -1,39 +1,52 @@
-tmux-agent v0.9.0 adds mark-all-read and quit confirmation, improves nested
-remote tmux focus over SSH and Mosh, and fixes Claude discovery and idle state.
+tmux-agent v0.10.0 adds agent discovery and direct handoffs, portable skills for
+handoffs and interactive task windows, and visible activity from working
+subagents.
 
 ## Highlights
 
-- Press `a` in normal UI mode to mark all currently unread completions as read.
-- Press `q`, then `y` or `Y`, to close the UI. Press `Esc` to cancel.
-- Claude task titles no longer include activity glyphs.
-- Remote tmux focus matches live session attachments, including agents in
-  hidden windows, then selects and verifies the requested inner window and
-  pane through configured SSH control. Mosh remains supported after its
-  bootstrap SSH connection exits.
-- Remote focus preserves the initiating local client and rejects stale or
-  ambiguous identities. Outer-only focus is reported explicitly instead of
-  being presented as a successful inner selection.
-- Completed Claude turns remain idle when persistent background shells are
-  running. Active-turn and permission-prompt signals retain their precedence.
-- Claude native versioned entrypoints are recognized even when the process
-  name is a version number.
+- Find running agents with `tmux-agent find` and send scoped assignments with
+  `tmux-agent handoff send`, locally or over configured SSH. The message and
+  its provenance header appear in the recipient's input and transcript.
+- Resolve exactly one recipient and revalidate its pane, provider, foreground
+  process lifetime and state before submission. Blocked, unknown and copy-mode
+  targets are refused; working targets require an explicit override.
+- Inspect bounded sender history with `tmux-agent handoff sent`. Confirmed
+  same-ID retries report duplicates; potentially partial submissions are not
+  automatically replayed.
+- Use the optional, harness-neutral handoff and workspace skills. The workspace
+  skill creates native tmux task windows, starts an interactive agent in the
+  intended checkout, and guides assignment delivery, monitoring and cleanup.
+  It respects existing tmux hooks and needs no particular dotfiles or worktree
+  manager. Requests for native subagents remain separate.
+- See activity while a recognized subagent is working, even when its parent
+  is idle. A working-subagent count stays visible beside status or goal
+  information without changing the parent's completion or acknowledgement.
 
-## Compatibility and remote setup
+## Compatibility and delivery limits
 
-Federation changes from protocol 3 to protocol 4. Update every connected
-machine together; older protocol peers cannot federate with this version.
-The managed launcher protocol remains unchanged.
+Federation remains on protocol 4, with the additive `handoff_v1` capability.
+Existing protocol-4 peers can still be monitored, but both sender and recipient
+need handoff support to exchange messages. Package versions need not be
+identical. The managed launcher protocol is unchanged.
 
-Use structured `[[machine]]` configuration and install `lsof` on both machines
-for live transport discovery and inner selection. The remote `watch` and
-`remote-focus` commands must use the same updated binary and tmux-server
-configuration. Restart existing collectors and UI processes after updating,
-as well as the daemons. A new binary on disk does not replace a running process.
+Remote handoffs require structured `[[machine]]` configuration and working SSH
+control access. A machine's optional `config` path selects the same recipient
+tmux configuration for collection and control, including named or custom
+servers. Explicit missing config files now fail instead of using defaults.
+Handoffs use SSH even when the visible attachment uses Mosh; no outer-pane
+binding or window switch is required. Sending back needs its own configured
+SSH route.
 
-Raw collectors and uninspectable explicit bindings retain reported outer-only
-focus. Ambiguous transports fail closed. Exact focus does not support tmux
-clients using the `active-pane` flag. Shared tmux sessions still share window
-selection; this release does not change tmux's sharing rules.
+`delivered` confirms terminal submission, not task acceptance or completion.
+There is no queue or background retry. Provider state can change between
+validation and input, and custom persistent shell loops can replace a provider
+without changing its recorded process-group lifetime. Inspect uncertain
+outcomes before retrying. Full messages are retained in bounded sender history
+and may appear in provider transcripts; they are not part of federation
+snapshots.
+
+Workspace monitoring belongs to the initiating agent and stops if it stops.
+Finished windows and worktrees remain until cleanup is requested.
 
 ## Updating
 
@@ -45,11 +58,15 @@ tmux-agent versions
 tmux-agent --version
 ```
 
-Update each remote explicitly, then update the central machine and restart its
-daemon and existing UIs so new collectors run the updated remote command.
-Verify peer connectivity and test selection of the intended inner window and
-pane. Updates on SSH machines remain ordinary commands initiated by the user;
-tmux-agent does not orchestrate remote lifecycle changes.
+Update each participating remote explicitly, then the central machine.
+Restart existing daemons, collectors and UI processes, and verify peer
+capabilities with `tmux-agent list --json`. A new binary on disk does not
+replace running processes. tmux-agent does not orchestrate remote updates.
+
+Install the optional skills separately from `skills/tmux-agent-handoff/` and
+`skills/tmux-agent-workspace/` in the matching source version. Binary updates
+do not install skills. See the installation guide for copy/symlink and reload
+instructions for your harness.
 
 TPM's `prefix + U` updates the plugin checkout, not the packaged binary.
 
@@ -62,6 +79,7 @@ signed build provenance.
 ## Documentation
 
 See the
-[installation guide](https://github.com/hypertectonic/tmux-agent/blob/v0.9.0/docs/installation.md),
-[remote-machine guide](https://github.com/hypertectonic/tmux-agent/blob/v0.9.0/docs/remote-machines.md),
-and [security policy](https://github.com/hypertectonic/tmux-agent/blob/v0.9.0/SECURITY.md).
+[handoff guide](https://github.com/hypertectonic/tmux-agent/blob/v0.10.0/docs/handoff.md),
+[installation guide](https://github.com/hypertectonic/tmux-agent/blob/v0.10.0/docs/installation.md),
+[remote-machine guide](https://github.com/hypertectonic/tmux-agent/blob/v0.10.0/docs/remote-machines.md),
+and [security policy](https://github.com/hypertectonic/tmux-agent/blob/v0.10.0/SECURITY.md).

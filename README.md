@@ -213,8 +213,8 @@ boundaries, focus behavior, and safe multi-machine updates.
 
 ## Agent handoff
 
-Experimental, not yet released. Find a running agent and send it a scoped
-handoff, locally or on a configured machine. For example, ask your agent to
+Find a running agent and send it a scoped handoff, locally or on a configured
+machine. Available in tmux-agent 0.10.0 and newer. For example, ask your agent to
 send a review request to the agent working on a particular repository.
 
 ```sh
@@ -249,7 +249,7 @@ See [Agent handoff](docs/handoff.md) for setup, delivery rules and limitations.
 
 ## Start another agent session
 
-The experimental [workspace skill](skills/tmux-agent-workspace/SKILL.md)
+The optional [workspace skill](skills/tmux-agent-workspace/SKILL.md)
 complements handoff. Ask your coding agent to "start a fresh Codex session to
 review this change" or "start a new Codex session using codex2". It creates a
 detached task window in the caller's own tmux session and machine, starts a full
