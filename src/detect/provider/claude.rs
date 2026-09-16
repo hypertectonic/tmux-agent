@@ -89,7 +89,7 @@ fn has_live_turn_activity(content: &str) -> bool {
     // Check that final UI marker, not the user's model/project/usage format.
     // New output below an old prompt must not resurrect that turn's activity.
     if !has_lower_border
-        || footer_end.is_some_and(|line| {
+        || footer_end.is_none_or(|line| {
             !line.starts_with("⏵⏵ ")
                 && !line.contains("shift+tab")
                 && !matches!(line, "? shortcuts" | "? for shortcuts")
@@ -114,7 +114,7 @@ fn has_live_turn_activity(content: &str) -> bool {
     // can mistake a previous turn's activity for work that is still running.
     let Some(activity) = lines.map(str::trim).find(|line| {
         !line.is_empty()
-            && !line.starts_with("⎿ Tip:")
+            && !line.starts_with("⎿ ")
             && *line != "✔ Update installed · Restart to update"
     }) else {
         return false;
@@ -247,6 +247,28 @@ mod tests {
     }
 
     const MODERN_READY_SCREEN: &str = "Done.\n✻ Worked for 46m · done · 1 shell still running\n────\n❯ editable unsent text\n────\nmodel · project · main · Context 23% left\n⏵⏵ auto mode on · 1 shell · ← 1 agent";
+
+    #[test]
+    fn live_turn_requires_a_footer_marker() {
+        for footer in ["", "\n   \n", "custom status without a footer marker"] {
+            let screen = format!("· Simmering… (55s · ↓ 3.8k tokens)\n────\n❯\n────\n{footer}");
+            assert_eq!(detect("✳ task", &screen).state, AgentState::Idle);
+        }
+    }
+
+    #[test]
+    fn live_turn_with_auxiliary_status_lines_is_working() {
+        let screen = "· Simmering… (55s · ↓ 3.8k tokens)\n  ⎿  Comparing alternatives…\n  ⎿ Tip: Use /btw to ask a side question\n────\n❯\n────\n? shortcuts";
+        let result = detect("✳ task", screen);
+        assert_eq!(result.state, AgentState::Working);
+        assert_eq!(result.signal, "live_turn_activity");
+
+        let completed = screen.replace(
+            "· Simmering… (55s · ↓ 3.8k tokens)",
+            "✻ Worked for 55s · done · 2 shells still running",
+        );
+        assert_eq!(detect("✳ task", &completed).state, AgentState::Idle);
+    }
 
     #[test]
     fn live_turn_with_custom_status_line_is_working() {

@@ -49,7 +49,8 @@ model/project/branch/context row followed by the auto-mode row; shell and agent
 counts in that footer do not signal foreground activity. Activity titles,
 current interrupt hints, and permission prompts retain their existing precedence.
 Claude's live spinner/elapsed-time/token line immediately above the input box
-also signals an active turn, including when a tip or update notice follows it.
+also signals an active turn, including when auxiliary status lines, tips, or an
+update notice follow it.
 This check uses the bordered prompt and built-in footer marker, not the format
 of a custom status line. Completed turn summaries do not signal activity.
 
