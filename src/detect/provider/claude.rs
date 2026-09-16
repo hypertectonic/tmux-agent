@@ -1,5 +1,9 @@
+use std::sync::OnceLock;
+
+use regex::Regex;
+
 use super::ProviderDetection;
-use super::screen::{Lines, VisibleScreen, title_has_braille_activity};
+use super::screen::{Lines, VisibleScreen, is_divider, title_has_braille_activity};
 use crate::model::AgentState;
 
 pub(super) fn detect(title: &str, content: &str) -> ProviderDetection {
@@ -45,6 +49,14 @@ pub(super) fn detect(title: &str, content: &str) -> ProviderDetection {
         );
     }
 
+    if has_live_turn_activity(content) {
+        return ProviderDetection::from_screen(
+            AgentState::Working,
+            "live_turn_activity",
+            "before_prompt",
+        );
+    }
+
     if has_ready_prompt(&screen) {
         return ProviderDetection::from_screen(AgentState::Idle, "input_prompt", "prompt_box");
     }
@@ -58,6 +70,64 @@ pub(super) fn detect(title: &str, content: &str) -> ProviderDetection {
 
 fn title_has_half_circle_activity(title: &str) -> bool {
     matches!(title.trim_start().chars().next(), Some('◐' | '◑'))
+}
+
+fn has_live_turn_activity(content: &str) -> bool {
+    let mut lines = content.lines().rev();
+    let mut footer_end = None;
+    let mut has_lower_border = false;
+    for line in lines.by_ref() {
+        if is_divider(line) {
+            has_lower_border = true;
+            break;
+        }
+        if !line.trim().is_empty() && footer_end.is_none() {
+            footer_end = Some(line.trim());
+        }
+    }
+    // Custom status lines can contain arbitrary text above the built-in footer.
+    // Check that final UI marker, not the user's model/project/usage format.
+    // New output below an old prompt must not resurrect that turn's activity.
+    if !has_lower_border
+        || footer_end.is_some_and(|line| {
+            !line.starts_with("⏵⏵ ")
+                && !line.contains("shift+tab")
+                && !matches!(line, "? shortcuts" | "? for shortcuts")
+        })
+    {
+        return false;
+    }
+    let mut has_prompt = false;
+    let mut has_upper_border = false;
+    for line in lines.by_ref() {
+        if is_divider(line) {
+            has_upper_border = true;
+            break;
+        }
+        has_prompt |= line.trim_start().starts_with('❯');
+    }
+    if !has_prompt || !has_upper_border {
+        return false;
+    }
+
+    // Only inspect the live block adjoining the prompt. Looking farther back
+    // can mistake a previous turn's activity for work that is still running.
+    let Some(activity) = lines.map(str::trim).find(|line| {
+        !line.is_empty()
+            && !line.starts_with("⎿ Tip:")
+            && *line != "✔ Update installed · Restart to update"
+    }) else {
+        return false;
+    };
+    static LIVE_TURN: OnceLock<Regex> = OnceLock::new();
+    LIVE_TURN
+        .get_or_init(|| {
+            Regex::new(
+                r"^[·✢✳✶✻✽] [\p{L}][\p{L} -]*(?:…|\.{3}) \([0-9]+[hms](?: [0-9]+[hms])* · [↓↑] [0-9]+(?:\.[0-9]+)?[kKmM]? tokens\)$",
+            )
+            .expect("valid Claude live turn pattern")
+        })
+        .is_match(activity)
 }
 
 fn alternate_view(screen: &VisibleScreen<'_>, recent: Lines<'_>) -> Option<&'static str> {
@@ -177,6 +247,65 @@ mod tests {
     }
 
     const MODERN_READY_SCREEN: &str = "Done.\n✻ Worked for 46m · done · 1 shell still running\n────\n❯ editable unsent text\n────\nmodel · project · main · Context 23% left\n⏵⏵ auto mode on · 1 shell · ← 1 agent";
+
+    #[test]
+    fn live_turn_with_custom_status_line_is_working() {
+        for status in ["project · branch", "custom model\ncustom cost and usage"] {
+            let screen = format!(
+                "· Simmering… (55s · ↓ 3.8k tokens)\n────\n❯\n────\n{status}\n⏵⏵ auto mode on · 2 shells · ← 1 agent"
+            );
+            let result = detect("✳ task", &screen);
+            assert_eq!(result.state, AgentState::Working, "{status}");
+            assert_eq!(result.signal, "live_turn_activity");
+            let completed = screen.replace(
+                "· Simmering… (55s · ↓ 3.8k tokens)",
+                "✻ Worked for 55s · done · 2 shells still running",
+            );
+            assert_eq!(detect("✳ task", &completed).state, AgentState::Idle);
+        }
+    }
+
+    #[test]
+    fn live_turn_does_not_depend_on_the_activity_verb_or_title() {
+        for activity in [
+            "· Simmering… (55s · ↓ 3.8k tokens)",
+            "✻ Pondering… (1m 14s · ↑ 120 tokens)",
+        ] {
+            let screen = format!("{activity}\n────\n❯ draft\n────\n? shortcuts");
+            let result = detect("", &screen);
+            assert_eq!(result.state, AgentState::Working, "{activity}");
+            assert_eq!(result.signal, "live_turn_activity");
+        }
+    }
+
+    #[test]
+    fn historical_or_quoted_live_turn_lines_do_not_mark_working() {
+        let activity = "· Simmering… (55s · ↓ 3.8k tokens)";
+        for screen in [
+            format!("{activity}\n{MODERN_READY_SCREEN}"),
+            format!("> {activity}\n────\n❯\n────\n? shortcuts"),
+            format!("────\n❯ explain this\n{activity}\n────\n? shortcuts"),
+            format!("{activity}\n────\n❯ previous\n────\nThe task is finished."),
+        ] {
+            assert_eq!(
+                detect("✳ task", &screen).state,
+                AgentState::Idle,
+                "{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn permissions_and_alternate_views_override_live_turn_lines() {
+        let screen = "· Simmering… (55s · ↓ 3.8k tokens)\n────\n❯\n────\n";
+        let permission = detect("✳ task", &format!("{screen}Allow this command?"));
+        assert_eq!(permission.state, AgentState::Blocked);
+        let transcript = detect(
+            "✳ task",
+            &format!("{screen}Showing detailed transcript\nctrl+o to toggle"),
+        );
+        assert!(transcript.preserve_previous);
+    }
 
     #[test]
     fn modern_prompt_without_title_is_direct_idle_evidence() {

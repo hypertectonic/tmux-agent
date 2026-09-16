@@ -48,6 +48,10 @@ while background shells remain running. The modern ready footer requires its
 model/project/branch/context row followed by the auto-mode row; shell and agent
 counts in that footer do not signal foreground activity. Activity titles,
 current interrupt hints, and permission prompts retain their existing precedence.
+Claude's live spinner/elapsed-time/token line immediately above the input box
+also signals an active turn, including when a tip or update notice follows it.
+This check uses the bordered prompt and built-in footer marker, not the format
+of a custom status line. Completed turn summaries do not signal activity.
 
 OMP v17.3.4 enables state titles by default. Its exact `π <separator>
 <label>` title is the primary state signal. The scanner stores only `<label>`,
