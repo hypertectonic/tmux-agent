@@ -379,6 +379,7 @@ pub fn run(command: Vec<OsString>, paths: &RuntimePaths) -> Result<i32> {
     let runner_file = RunnerFile::new(&paths.runners, &run_id);
     let termination_signal = termination_signal()?;
     let mut last_state = None::<RunnerState>;
+    let mut claude_progress = detect::ChildProgress::default();
     let mut last_publish = Instant::now()
         .checked_sub(HEARTBEAT_INTERVAL)
         .unwrap_or_else(Instant::now);
@@ -459,6 +460,8 @@ pub fn run(command: Vec<OsString>, paths: &RuntimePaths) -> Result<i32> {
                 inner_terminal: inner_terminal.as_deref(),
                 codex_thread_id: codex_thread_id.as_deref(),
             },
+            &mut claude_progress,
+            Instant::now(),
         )?;
         let changed = last_state
             .as_ref()
@@ -496,12 +499,15 @@ struct RunnerIdentity<'a> {
 fn observed_state(
     buffer: &Arc<Mutex<TerminalBuffer>>,
     identity: RunnerIdentity<'_>,
+    claude_progress: &mut detect::ChildProgress,
+    observed_at: Instant,
 ) -> Result<RunnerState> {
     let (screen, title) = buffer
         .lock()
         .map_err(|_| anyhow::anyhow!("agent terminal buffer lock is poisoned"))?
         .evidence();
-    let detection = detect::detect_agent(identity.agent.to_string(), &title, &screen);
+    let mut detection = detect::detect_agent(identity.agent.to_string(), &title, &screen);
+    claude_progress.apply(&mut detection, Some(&screen), true, observed_at);
     let title = detect::stable_title(&detection.agent, &title).unwrap_or(title);
     Ok(RunnerState {
         protocol: RUNNER_PROTOCOL,
@@ -901,6 +907,8 @@ mod tests {
                 inner_terminal: Some("ttys002"),
                 codex_thread_id: None,
             },
+            &mut detect::ChildProgress::default(),
+            Instant::now(),
         )
         .unwrap();
 
@@ -932,6 +940,8 @@ mod tests {
                     inner_terminal: Some("ttys002"),
                     codex_thread_id: None,
                 },
+                &mut detect::ChildProgress::default(),
+                Instant::now(),
             )
             .unwrap()
         };
@@ -941,6 +951,47 @@ mod tests {
         assert_eq!(first.title, "local-bench");
         assert_eq!(second.title, "local-bench");
         assert!(first.same_observation(&second));
+    }
+
+    #[test]
+    fn claude_owned_pty_tracks_child_progress_without_publishing_panel_text() {
+        let buffer = Arc::new(Mutex::new(TerminalBuffer::new(24, 120)));
+        let now = Instant::now();
+        let mut progress = detect::ChildProgress::default();
+        for (millis, suffix, expected) in [
+            (0, "5s · ↓ 12 tokens", AgentState::Idle),
+            (1000, "6s · ↓ 12 tokens", AgentState::Working),
+            (2000, "6s · ↓ 12 tokens", AgentState::Working),
+            (3000, "6s · ↓ 12 tokens", AgentState::Idle),
+            (4000, "7s · ↓ 12 tokens", AgentState::Working),
+            (4300, "waiting", AgentState::Idle),
+        ] {
+            let screen = format!(
+                "\x1b[2J\x1b[H\x1b]2;✳ task\x07Done.\r\n────\r\n❯\r\n────\r\n⏵⏵ auto mode on · 2 shells · 1 agent\r\n● main\r\n◯ general-purpose Synthetic private description {suffix}"
+            );
+            buffer.lock().unwrap().process(screen.as_bytes());
+            let state = observed_state(
+                &buffer,
+                RunnerIdentity {
+                    run_id: "run-claude",
+                    owner_pid: 10,
+                    child_pid: 11,
+                    process_group: 11,
+                    agent: "Claude",
+                    cwd: "/work",
+                    outer_terminal: Some("ttys001"),
+                    inner_terminal: Some("ttys002"),
+                    codex_thread_id: None,
+                },
+                &mut progress,
+                now + Duration::from_millis(millis),
+            )
+            .unwrap();
+            assert_eq!(state.state, expected, "at {millis}");
+            let serialized = serde_json::to_string(&state).unwrap();
+            assert!(!serialized.contains("Synthetic private description"));
+            assert!(!serialized.contains("tokens"));
+        }
     }
 
     #[test]

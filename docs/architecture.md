@@ -43,16 +43,44 @@ Claude discovery recognizes `claude`, `claude-code`, and absolute native
 entrypoints ending in `claude/versions/<major>.<minor>.<patch>`. A version
 basename or a Claude title alone is not enough to identify a process.
 
-Claude state follows the foreground turn. A ready bordered prompt can be idle
-while background shells remain running. The modern ready footer requires its
-model/project/branch/context row followed by the auto-mode row; shell and agent
-counts in that footer do not signal foreground activity. Activity titles,
+Claude state follows the foreground turn. A ready bordered prompt with a
+recognized built-in footer and visible child panel is direct idle evidence,
+even with a custom status line. Without the panel, existing ready-footer checks
+apply. Background shell and agent counts do not signal foreground activity. Activity titles,
 current interrupt hints, and permission prompts retain their existing precedence.
 Claude's live spinner/elapsed-time/token line immediately above the input box
 also signals an active turn, including when auxiliary status lines, tips, or an
 update notice follow it.
+Activity labels are opaque text, so punctuation, Unicode and custom wording
+do not change detection; the spinner, elapsed time and token counter are required.
 This check uses the bordered prompt and built-in footer marker, not the format
-of a custom status line. Completed turn summaries do not signal activity.
+of a custom status line. Recognized IDE and default child-panel rows may follow
+the footer. Unrecognized trailing output rejects the candidate. Completed turn
+summaries do not signal activity.
+
+Claude's default visible child panel can keep the parent row working when a
+matching child's elapsed time or token count advances across captures. Selection
+circles and static counters are not enough: stopped children can retain both.
+Confirmation needs two observations, normally about one second apart. Progress
+expires after two seconds without an advancing counter, allowing rounded values
+to remain unchanged between captures. Waiting, idle, missing and ambiguous rows
+clear their progress immediately. Foreground permission and alternate-view
+handling retain precedence.
+Confirmed child-panel descriptions are excluded from foreground permission,
+activity and alternate-view checks; their task wording does not set the parent
+state. Once child progress expires or changes to waiting, the validated prompt
+provides direct idle evidence without depending on the terminal title.
+
+The scanner keeps this bounded tracking with each pane's existing capture cache;
+process replacement or pane removal drops it. The owned PTY runner uses the same
+tracker for its run. Cached frames do not renew progress. No additional capture,
+process or filesystem polling is added, and child descriptions and counters are
+not serialized into runner state or federation snapshots. This is visible-panel
+detection, not Claude child discovery or separate child rows. Hidden, customized,
+truncated or coarse counters, including day-long minute-resolution timers, may
+not establish continuous activity. Expiry applies while captures succeed;
+capture failures keep the existing state-preservation policy rather than imply
+that a child has stopped.
 
 OMP v17.3.4 enables state titles by default. Its exact `π <separator>
 <label>` title is the primary state signal. The scanner stores only `<label>`,
