@@ -160,15 +160,24 @@ fn live_prompt(content: &str) -> Option<LivePrompt<'_>> {
 }
 
 fn parse_live_footer(footer: &[&str]) -> Option<(Vec<ChildRow>, usize)> {
+    const NAVIGATION_HINT: &str = "↑/↓ to select · Enter to view";
     let marker = footer.iter().rposition(|line| {
         line.starts_with("⏵⏵ ")
             || line.starts_with("⏸ plan mode on")
             || line.starts_with("⏸ manual mode on")
-            || matches!(*line, "? shortcuts" | "? for shortcuts")
+            || matches!(*line, "? shortcuts" | "? for shortcuts" | NAVIGATION_HINT)
     })?;
+    let navigating = footer[marker] == NAVIGATION_HINT;
     let mut main_seen = false;
     let mut children = Vec::new();
     for line in &footer[marker + 1..] {
+        // Navigation mode replaces the normal footer and decorates panel rows.
+        // The cursor is presentation, not part of a child's identity.
+        let line = if navigating {
+            line.strip_prefix("❯ ").unwrap_or(line)
+        } else {
+            line
+        };
         if line.is_empty() {
             continue;
         }
@@ -198,7 +207,7 @@ fn parse_live_footer(footer: &[&str]) -> Option<(Vec<ChildRow>, usize)> {
         }
         children.push(parse_child_panel_row(line)?);
     }
-    (!main_seen || !children.is_empty()).then_some((children, marker))
+    ((!main_seen && !navigating) || !children.is_empty()).then_some((children, marker))
 }
 
 #[derive(Debug)]
@@ -447,6 +456,75 @@ mod tests {
             crate::detect::detect("claude", "✳ task", screen.unwrap_or_default()).unwrap();
         tracker.apply(&mut detection, screen, fresh, now);
         detection.state
+    }
+
+    #[test]
+    fn child_progress_survives_navigation_mode_and_expires_when_frozen() {
+        let now = Instant::now();
+        let normal = child_screen("◯ general-purpose Synthetic task 5s · ↓ 12 tokens");
+        let navigation = "Done.\n────\n❯\n────\nmodel · project · Context 60% left\n↑/↓ to select · Enter to view\n\n❯ ● main\n❯ ◯ general-purpose Synthetic task 6s · ↓ 12 tokens\n⧉ editor";
+        let resumed = normal.replace("5s", "8s");
+        for title in ["", "✳ task"] {
+            let mut tracker = ChildProgress::default();
+            for (screen, seconds, expected) in [
+                (normal.as_str(), 0, AgentState::Idle),
+                (navigation, 1, AgentState::Working),
+                (navigation, 3, AgentState::Idle),
+                (resumed.as_str(), 4, AgentState::Working),
+            ] {
+                let mut detection = crate::detect::detect("claude", title, screen).unwrap();
+                tracker.apply(
+                    &mut detection,
+                    Some(screen),
+                    true,
+                    now + Duration::from_secs(seconds),
+                );
+                assert_eq!(
+                    detection.state, expected,
+                    "title={title:?}, seconds={seconds}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn navigation_panel_preserves_foreground_permission_precedence() {
+        let screen = "Done.\n────\n❯\n────\n↑/↓ to select · Enter to view\n❯ ● main\n❯ ◯ general-purpose Review running command and waiting for permission handling 5s";
+        let progressed = screen.replace("5s", "6s");
+        let now = Instant::now();
+        let mut tracker = ChildProgress::default();
+        assert_eq!(
+            observe_child(&mut tracker, Some(screen), true, now),
+            AgentState::Idle
+        );
+        assert_eq!(
+            observe_child(
+                &mut tracker,
+                Some(&progressed),
+                true,
+                now + Duration::from_secs(1)
+            ),
+            AgentState::Working
+        );
+        let blocked = progressed.replace("↑/↓", "Allow this command?\n↑/↓");
+        assert_eq!(
+            observe_child(
+                &mut tracker,
+                Some(&blocked),
+                true,
+                now + Duration::from_secs(2)
+            ),
+            AgentState::Blocked
+        );
+        // A navigation hint without the structured panel cannot validate a turn.
+        let hint_only =
+            "✻ Thinking… (5s · ↓ 12 tokens)\n────\n❯\n────\n↑/↓ to select · Enter to view";
+        assert_eq!(
+            crate::detect::detect("claude", "✳ task", hint_only)
+                .unwrap()
+                .state,
+            AgentState::Idle
+        );
     }
 
     #[test]
