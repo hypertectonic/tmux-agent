@@ -1,5 +1,6 @@
 mod provider;
 pub(crate) mod stabilize;
+pub(crate) use provider::ChildProgress;
 
 use crate::model::{AgentState, DetectionDetails, EvidenceSource, GoalInfo, GoalState};
 use regex::Regex;
@@ -122,7 +123,7 @@ fn detect_codex_goal(screen: &str) -> Option<GoalInfo> {
                 "Goal achieved" => GoalState::Achieved,
                 _ => return None,
             };
-            let elapsed_seconds = parse_goal_duration(captures.get(2)?.as_str())?;
+            let elapsed_seconds = parse_duration_seconds(captures.get(2)?.as_str())?;
             Some(GoalInfo {
                 state,
                 elapsed_seconds,
@@ -132,7 +133,7 @@ fn detect_codex_goal(screen: &str) -> Option<GoalInfo> {
         })
 }
 
-fn parse_goal_duration(value: &str) -> Option<u64> {
+fn parse_duration_seconds(value: &str) -> Option<u64> {
     let mut total = 0_u64;
     let mut parsed = false;
     for component in value.split_whitespace() {
@@ -431,9 +432,9 @@ mod tests {
 
     #[test]
     fn goal_duration_parser_rejects_non_duration_text() {
-        assert_eq!(parse_goal_duration("1d 2h 3m 4s"), Some(93_784));
-        assert_eq!(parse_goal_duration("/goal resume"), None);
-        assert_eq!(parse_goal_duration("forever"), None);
+        assert_eq!(parse_duration_seconds("1d 2h 3m 4s"), Some(93_784));
+        assert_eq!(parse_duration_seconds("/goal resume"), None);
+        assert_eq!(parse_duration_seconds("forever"), None);
     }
 
     #[test]

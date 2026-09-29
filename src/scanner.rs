@@ -36,6 +36,7 @@ struct CaptureEntry {
     identity: CaptureIdentity,
     attempted_at: Instant,
     screen: Option<String>,
+    claude_progress: detect::ChildProgress,
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +69,7 @@ impl CaptureCache {
                             identity: candidate.identity,
                             attempted_at: now,
                             screen: None,
+                            claude_progress: detect::ChildProgress::default(),
                         };
                     }
                 } else {
@@ -77,6 +79,7 @@ impl CaptureCache {
                             identity: candidate.identity,
                             attempted_at: now,
                             screen: None,
+                            claude_progress: detect::ChildProgress::default(),
                         },
                     );
                 }
@@ -102,6 +105,20 @@ impl CaptureCache {
         self.entries
             .get(pane_id)
             .and_then(|entry| entry.screen.as_deref())
+    }
+
+    fn apply_claude_progress(
+        &mut self,
+        pane_id: &str,
+        detection: &mut detect::Detection,
+        fresh: bool,
+        now: Instant,
+    ) {
+        if let Some(entry) = self.entries.get_mut(pane_id) {
+            entry
+                .claude_progress
+                .apply(detection, entry.screen.as_deref(), fresh, now);
+        }
     }
 }
 
@@ -182,6 +199,9 @@ impl Scanner {
         let processes = self.tmux.process_snapshot(&panes)?;
         let session_connections = self.tmux.session_connections(&processes)?;
         let runner_states = runner::load_states(&self.runner_directory, &processes.live_pids);
+        // Reuse the record's exact kernel identity for captures. The ps elapsed
+        // estimate drifts on refresh and would discard child-progress history.
+        let mut exact_process_starts = HashMap::new();
         let capture_candidates = panes
             .iter()
             .filter(|pane| !pane.is_agent_ui && !pane.dead)
@@ -205,10 +225,9 @@ impl Scanner {
                     identity: CaptureIdentity {
                         pane_pid: pane.pane_pid,
                         process_group,
-                        process_started_at_ms: processes
-                            .process_started_at_ms
-                            .get(&process_group)
-                            .copied(),
+                        process_started_at_ms: *exact_process_starts
+                            .entry(process_group)
+                            .or_insert_with(|| crate::tmux::stable_process_start_ms(process_group)),
                     },
                     foreground: pane.visible,
                 }
@@ -257,6 +276,12 @@ impl Scanner {
                 } else {
                     ObservationFreshness::Replayed
                 };
+                self.captures.apply_claude_progress(
+                    &pane.pane_id,
+                    &mut detection,
+                    freshness == ObservationFreshness::Fresh,
+                    Instant::now(),
+                );
                 (detection, freshness)
             };
             let id = format!("{}/{}/{}", self.host, self.server, pane.pane_id);
@@ -280,7 +305,9 @@ impl Scanner {
                 .unwrap_or(pane.pane_pid);
             let process_identity = crate::model::ProcessIdentity {
                 pid: process_group,
-                started_at_ms: crate::tmux::stable_process_start_ms(process_group),
+                started_at_ms: *exact_process_starts
+                    .entry(process_group)
+                    .or_insert_with(|| crate::tmux::stable_process_start_ms(process_group)),
             };
             let observed_start = observed_process_start(
                 processes
@@ -1301,6 +1328,76 @@ mod tests {
             ObservationFreshness::Fresh,
         );
         assert_eq!(second.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn claude_capture_progress_expires_and_resets_with_process_identity() {
+        let now = Instant::now();
+        let mut captures = CaptureCache::default();
+        let mut candidate = capture_candidate("%1", 20, false);
+        for (millis, suffix, replace, expected) in [
+            (0, "5s", false, AgentState::Idle),
+            (1000, "6s", false, AgentState::Working),
+            (2000, "6s", false, AgentState::Working),
+            (3000, "6s", false, AgentState::Idle),
+            (4000, "7s", false, AgentState::Working),
+            (5000, "8s", true, AgentState::Idle),
+            (6000, "9s", false, AgentState::Working),
+            (7000, "idle", false, AgentState::Idle),
+        ] {
+            let observed = now + Duration::from_millis(millis);
+            if replace {
+                candidate.identity.process_started_at_ms = Some(2000);
+            }
+            let due = captures.due_panes([candidate], observed);
+            let screen = format!(
+                "Done.\n────\n❯\n────\n⏵⏵ auto mode on · 2 shells · 1 agent\n● main\n◯ general-purpose Synthetic task {suffix}"
+            );
+            captures.apply_results(&due, &HashMap::from([("%1".into(), Ok(screen.clone()))]));
+            let mut detection = detect::detect("claude", "✳ task", &screen).unwrap();
+            captures.apply_claude_progress("%1", &mut detection, true, observed);
+            assert_eq!(detection.state, expected, "at {millis}");
+        }
+    }
+
+    #[test]
+    fn claude_child_wait_and_frozen_deadline_are_definitive_without_title() {
+        let started = Instant::now();
+        let mut progress = detect::ChildProgress::default();
+        let mut tracker = StateTracker::default();
+        let mut previous = old(AgentState::Idle, true);
+        previous.agent = "Claude".into();
+        for (millis, suffix, expected) in [
+            (0, "5s", AgentState::Idle),
+            (1000, "6s", AgentState::Working),
+            (2000, "6s", AgentState::Working),
+            (3000, "6s", AgentState::Idle),
+            (4000, "7s", AgentState::Working),
+            (4300, "waiting", AgentState::Idle),
+        ] {
+            let screen = format!(
+                "Done.\n────\n❯\n────\n⏵⏵ auto mode on · 1 agent\n● main\n◯ general-purpose Synthetic task {suffix}"
+            );
+            let mut detection = detect::detect("claude", "", &screen).unwrap();
+            progress.apply(
+                &mut detection,
+                Some(&screen),
+                true,
+                started + Duration::from_millis(millis),
+            );
+            let detection = tracker.stabilize_observation(
+                &previous.id,
+                "Claude:20",
+                detection,
+                Some(&previous),
+                millis,
+                ObservationFreshness::Fresh,
+            );
+            assert_eq!(detection.state, expected, "at {millis}");
+            previous.state = detection.state;
+            previous.source = detection.source;
+            previous.detection = detection.details;
+        }
     }
 
     #[test]
