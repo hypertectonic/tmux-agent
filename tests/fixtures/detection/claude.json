@@ -1,5 +1,18 @@
 [
   {
+    "name": "live turn above expanded footer overrides static ready title",
+    "basis": "synthetic live turn regression with tip and update notices",
+    "title": "✳ Example task",
+    "screen": "· Simmering… (55s · ↓ 3.8k tokens)\n  ⎿ Tip: Use /btw to ask a side question\n  ✔ Update installed · Restart to update\n────────\n❯\n────────\nmodel · project · branch · Context 64% left · weekly 93% left\n⏵⏵ auto mode on · 2 shells · ← 1 agent",
+    "state": "working",
+    "source": "screen",
+    "signal": "live_turn_activity",
+    "scope": "before_prompt",
+    "definitive": true,
+    "inferred": false,
+    "preserve_previous": false
+  },
+  {
     "name": "current permission overrides old activity",
     "basis": "synthetic precedence regression",
     "title": "",
