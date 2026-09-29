@@ -122,7 +122,7 @@ Current selection paths are independent:
   `current` and lifecycle `manager` have distinct purposes; the checkout
   launcher's `TMUX_AGENT_BINARY` override is not a universal selector.
 - `[[machine]].binary` constructs remote `watch --jsonl --local-only`,
-  `remote-focus`, `subagent-view --local-only`, and diagnostic commands.
+  `remote-focus`, `remote-handoff`, `subagent-view --local-only`, and diagnostic commands.
   Raw `[[remote]].command` collectors have their own command vectors.
 - Commands that ensure a daemon exists can start their own executable when
   its socket is absent. Local child viewers also launch from the UI's own
@@ -151,7 +151,7 @@ SSH, or Mosh sessions. Preserve layouts and user work.
   affected UI pane, recording expected, restarted, and verified counts.
 - Verify each command through its actual launch route and environment,
   including remote non-interactive SSH. Observe the executable/version used
-  by short-lived `remote-focus`, diagnostics, and child-view commands during
+  by short-lived `remote-focus`, `remote-handoff`, diagnostics, and child-view commands during
   an isolated exercise, not merely a different shell's `command -v`. Account
   for the tmux/SSH/Mosh helpers and sockets those commands actually use.
 - Check the local-only daemon snapshot and the consuming host's merged

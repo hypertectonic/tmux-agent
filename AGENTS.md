@@ -19,6 +19,8 @@ Read [README.md](README.md) for supported behavior and
   `src/ui.rs`.
 - Owned PTY sessions: `src/runner.rs`. Codex metadata and child ownership:
   `src/codex.rs` and `src/codex/`. Explicit child viewing: `src/transcript.rs`.
+- Agent discovery filters and delivery: `src/handoff.rs` and `src/handoff/`.
+  Harness-neutral handoff and workspace guidance lives in `skills/`.
 - Installation and lifecycle: `src/update.rs`, `tmux-agent.tmux`,
   `bin/tmux-agent`, and `scripts/`. Shell integration tests are in `tests/*.sh`.
   `.github/workflows/` defines CI and release gates.
