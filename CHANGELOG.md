@@ -4,6 +4,24 @@ All notable changes to `tmux-agent` will be documented in this file.
 
 The project uses semantic versioning.
 
+## [0.10.1] - 2026-09-30
+
+### Fixed
+
+- Detect Claude live turns above the input prompt when activity is missing
+  from the pane title, including auxiliary status lines.
+- Confirm Claude child activity across successive screen captures, including
+  the child navigation view. Frozen counters expire instead of keeping an
+  idle session marked as working, and foreground permission prompts retain
+  precedence.
+- Preserve process-start identity across inventory refreshes so confirmed
+  child activity is not discarded on each refresh.
+
+### Documentation
+
+- Add shared repository guidance for coding agents and explicit checks for
+  experimental activation and return to official builds.
+
 ## [0.10.0] - 2026-09-14
 
 ### Added
