@@ -63,6 +63,9 @@ matching child's elapsed time or token count advances across captures. Selection
 circles and static counters are not enough: stopped children can retain both.
 The panel is recognized in its normal and keyboard-navigation layouts. The
 navigation hint and row cursors do not change a child's tracked identity.
+Default navigation hints cover the main row and viewed or selected children,
+including collapse and stop-all hints. Rebound keys and custom panel layouts
+remain unsupported.
 Confirmation needs two observations, normally about one second apart. Progress
 expires after two seconds without an advancing counter, allowing rounded values
 to remain unchanged between captures. Waiting, idle, missing and ambiguous rows
