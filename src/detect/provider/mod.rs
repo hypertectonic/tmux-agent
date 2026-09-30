@@ -7,6 +7,7 @@ mod omp;
 mod opencode;
 mod pi;
 mod screen;
+pub(crate) use claude::ChildProgress;
 
 use crate::model::{AgentState, DetectionDetails, EvidenceSource};
 

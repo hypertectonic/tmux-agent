@@ -71,6 +71,13 @@ See the [named-server example](handoff.md#requirements).
 Federation protocol changes require all machines to be updated together.
 Protocol mismatches are rejected with both the received and required version.
 
+For experiments or mixed-version troubleshooting, verify the actual remote
+watcher and control executables as well as the daemon. The daemon's advertised
+version can pass through an older watcher that drops newer snapshot fields.
+Follow [experimental activation and return](installation.md#experimental-activation-and-return)
+for command selection, loaded-process checks, end-to-end focus verification,
+and restoring official builds. Restarting only the daemon is insufficient.
+
 If a remote update needs to be reversed, choose a version from that host's
 `versions` output and explicitly run:
 
