@@ -107,6 +107,13 @@ blocked > done > working > idle > unknown
 `done` is derived when an active agent becomes idle while its tmux window is
 not visible. Activating the row or using `acknowledge` marks the completion
 seen. Codex goal achievements use the same explicit acknowledgement boundary.
+Codex goal state and elapsed time come from its visible status footer. Detection
+supports the single-line footer and a status row immediately above known default
+shortcut, agent-navigation, queue, or warning hints. Warning notices may appear
+alone or beside a hint, including compact counts. Unrecognized hint text is not
+skipped, and detection never searches past the adjacent row into conversation
+history.
+
 Within the idle bucket, top-level agents sort by the newer of their state-change
 time and their last successful focus through tmux-agent. The daemon keeps focus
 times in memory for its own tmux server and discards them when agents disappear
