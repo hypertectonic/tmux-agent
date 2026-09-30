@@ -2,7 +2,9 @@ mod provider;
 pub(crate) mod stabilize;
 pub(crate) use provider::ChildProgress;
 
-use crate::model::{AgentState, DetectionDetails, EvidenceSource, GoalInfo, GoalState};
+use crate::model::{
+    AgentState, DetectionDetails, EvidenceSource, GoalInfo, GoalProgress, GoalState,
+};
 use regex::Regex;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
@@ -109,28 +111,95 @@ pub fn stable_title(agent: &str, title: &str) -> Option<String> {
 fn detect_codex_goal(screen: &str) -> Option<GoalInfo> {
     static GOAL: OnceLock<Regex> = OnceLock::new();
     let pattern = GOAL.get_or_init(|| {
-        Regex::new(r"(Pursuing goal|Goal achieved) \(([0-9]+[dhms](?:\s+[0-9]+[dhms])*)\)\s*$")
+        Regex::new(r"(Pursuing goal|Goal achieved) \(([^()]*)\)\s*$")
             .expect("Codex goal footer regex is valid")
     });
-    screen
+    let mut lines = screen
         .lines()
         .rev()
-        .find(|line| !line.trim().is_empty())
-        .and_then(|line| {
-            let captures = pattern.captures(line)?;
-            let state = match captures.get(1)?.as_str() {
-                "Pursuing goal" => GoalState::Pursuing,
-                "Goal achieved" => GoalState::Achieved,
-                _ => return None,
-            };
-            let elapsed_seconds = parse_duration_seconds(captures.get(2)?.as_str())?;
-            Some(GoalInfo {
-                state,
-                elapsed_seconds,
-                achievement_pending: false,
-                achievement_observed_at_ms: 0,
-            })
-        })
+        .map(str::trim)
+        .skip_while(|line| line.is_empty());
+    let last = lines.next()?;
+    // Newer Codex adds a hints/warnings row below the status row. Only
+    // skip that known footer row, not arbitrary text that could hide a stale goal.
+    let status = if is_codex_footer_hint(last) {
+        lines.next()?
+    } else {
+        last
+    };
+    let captures = pattern.captures(status)?;
+    let state = match captures.get(1)?.as_str() {
+        "Pursuing goal" => GoalState::Pursuing,
+        "Goal achieved" => GoalState::Achieved,
+        _ => return None,
+    };
+    let usage = captures.get(2)?.as_str();
+    let progress = match state {
+        GoalState::Pursuing if usage.contains(" / ") => {
+            let (used, budget) = usage.split_once(" / ")?;
+            GoalProgress::Tokens {
+                used: parse_goal_tokens(used)?,
+                budget: Some(parse_goal_tokens(budget)?),
+            }
+        }
+        GoalState::Achieved if usage.ends_with(" tokens") => GoalProgress::Tokens {
+            used: parse_goal_tokens(usage.strip_suffix(" tokens")?)?,
+            budget: None,
+        },
+        _ => GoalProgress::Elapsed {
+            seconds: parse_duration_seconds(usage)?,
+        },
+    };
+    Some(GoalInfo {
+        state,
+        progress,
+        achievement_pending: false,
+        achievement_observed_at_ms: 0,
+    })
+}
+
+fn parse_goal_tokens(value: &str) -> Option<u64> {
+    // Codex displays integers or rounded K/M/B/T counts with up to two decimals.
+    let (number, scale) = match value.as_bytes().last()? {
+        b'K' => (&value[..value.len() - 1], 1_000_u64),
+        b'M' => (&value[..value.len() - 1], 1_000_000),
+        b'B' => (&value[..value.len() - 1], 1_000_000_000),
+        b'T' => (&value[..value.len() - 1], 1_000_000_000_000),
+        _ => (value, 1),
+    };
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty() || !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let whole = whole.parse::<u64>().ok()?.checked_mul(scale)?;
+    if number.contains('.') {
+        if scale == 1
+            || fraction.is_empty()
+            || fraction.len() > 2
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        let divisor = if fraction.len() == 1 { 10 } else { 100 };
+        whole.checked_add(fraction.parse::<u64>().ok()?.checked_mul(scale / divisor)?)
+    } else {
+        Some(whole)
+    }
+}
+
+fn is_codex_footer_hint(line: &str) -> bool {
+    static HINT: OnceLock<Regex> = OnceLock::new();
+    HINT.get_or_init(|| {
+        // Codex's default shortcuts and full/compact warning notices. Custom
+        // hints must not turn arbitrary trailing conversation text into a footer.
+        let warning =
+            r"⚠ [1-9][0-9]*(?: warnings? · (?:f2|/warnings) to view| · (?:f2|/warnings))?";
+        Regex::new(&format!(
+            r"^(?:(?:\? for shortcuts|← for agents(?: · \? for shortcuts)?|tab to queue(?: message)?)(?:\s+{warning})?|{warning})$"
+        ))
+        .expect("Codex footer hint regex is valid")
+    })
+    .is_match(line)
 }
 
 fn parse_duration_seconds(value: &str) -> Option<u64> {
@@ -144,6 +213,9 @@ fn parse_duration_seconds(value: &str) -> Option<u64> {
             b's' => (&component[..component.len() - 1], 1_u64),
             _ => return None,
         };
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
         let number = number.parse::<u64>().ok()?;
         total = total.checked_add(number.checked_mul(multiplier)?)?;
         parsed = true;
@@ -376,6 +448,76 @@ mod tests {
     }
 
     #[test]
+    fn codex_goal_footer_reports_token_progress() {
+        for (status, state, used, budget) in [
+            (
+                "Pursuing goal (40K / 50K)",
+                GoalState::Pursuing,
+                40_000,
+                Some(50_000),
+            ),
+            (
+                "Pursuing goal (1.25M / 12.5M)",
+                GoalState::Pursuing,
+                1_250_000,
+                Some(12_500_000),
+            ),
+            ("Pursuing goal (0 / 999)", GoalState::Pursuing, 0, Some(999)),
+            (
+                "Pursuing goal (1.01B / 2T)",
+                GoalState::Pursuing,
+                1_010_000_000,
+                Some(2_000_000_000_000),
+            ),
+            (
+                "Goal achieved (40K tokens)",
+                GoalState::Achieved,
+                40_000,
+                None,
+            ),
+            ("Goal achieved (999 tokens)", GoalState::Achieved, 999, None),
+        ] {
+            let screen = format!("model · {status}\n? for shortcuts");
+            assert_eq!(
+                detect("codex", "project", &screen).unwrap().goal,
+                Some(GoalInfo {
+                    state,
+                    progress: GoalProgress::Tokens { used, budget },
+                    achievement_pending: false,
+                    achievement_observed_at_ms: 0,
+                }),
+                "{status}"
+            );
+            let stale = format!("{screen}\n› Another request\nmodel · Ready\n? for shortcuts");
+            assert!(detect("codex", "project", &stale).unwrap().goal.is_none());
+        }
+    }
+
+    #[test]
+    fn codex_goal_rejects_malformed_progress() {
+        for status in [
+            "Pursuing goal (40K tokens)",
+            "Goal achieved (40K / 50K)",
+            "Pursuing goal (40k / 50K)",
+            "Pursuing goal (1.234K / 50K)",
+            "Pursuing goal (1.5 / 50K)",
+            "Pursuing goal (+1 / 50K)",
+            "Pursuing goal (-1 / 50K)",
+            "Pursuing goal (1. / 50K)",
+            "Pursuing goal (18446744073709552K / 50K)",
+            "Goal achieved (18446744073709551616 tokens)",
+            "Pursuing goal (+1s)",
+            "Goal achieved (18446744073709551615d)",
+        ] {
+            let screen = format!("model · {status}\n? for shortcuts");
+            assert!(
+                detect("codex", "project", &screen).unwrap().goal.is_none(),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
     fn codex_goal_footer_reports_pursuing_elapsed_time() {
         let result = detect(
             "codex",
@@ -387,7 +529,7 @@ mod tests {
             result.goal,
             Some(GoalInfo {
                 state: GoalState::Pursuing,
-                elapsed_seconds: 1_122,
+                progress: crate::model::GoalProgress::Elapsed { seconds: 1_122 },
                 achievement_pending: false,
                 achievement_observed_at_ms: 0,
             })
@@ -406,7 +548,7 @@ mod tests {
             result.goal,
             Some(GoalInfo {
                 state: GoalState::Achieved,
-                elapsed_seconds: 7_920,
+                progress: crate::model::GoalProgress::Elapsed { seconds: 7_920 },
                 achievement_pending: false,
                 achievement_observed_at_ms: 0,
             })
@@ -414,14 +556,90 @@ mod tests {
     }
 
     #[test]
+    fn codex_goal_footer_accepts_known_trailing_hint_lines() {
+        for (status, state, elapsed_seconds) in [
+            ("Pursuing goal (18m 42s)", GoalState::Pursuing, 1_122),
+            ("Goal achieved (2h 12m)", GoalState::Achieved, 7_920),
+        ] {
+            for hint in [
+                "  ? for shortcuts",
+                "  ? for shortcuts                   ⚠ 1 warning · f2 to view\n\n",
+                "  ⚠ 1 warning · f2 to view",
+                "  tab to queue message",
+                "  tab to queue",
+                "  ← for agents · ? for shortcuts",
+                "  ← for agents",
+                "  tab to queue message               ⚠ 2 warnings · f2 to view",
+                "  ← for agents · ? for shortcuts     ⚠ 2 · f2",
+                "  ⚠ 2",
+                "  ? for shortcuts                   ⚠ 1 warning · /warnings to view",
+            ] {
+                let screen = format!("› Keep working\n\nmodel · Main [default] · {status}\n{hint}");
+                let result = detect("codex", "sample-project", &screen).unwrap();
+                assert_eq!(
+                    result.goal,
+                    Some(GoalInfo {
+                        state,
+                        progress: crate::model::GoalProgress::Elapsed {
+                            seconds: elapsed_seconds
+                        },
+                        achievement_pending: false,
+                        achievement_observed_at_ms: 0,
+                    }),
+                    "{screen}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stale_goal_text_outside_the_footer_is_ignored() {
-        let result = detect(
-            "codex",
-            "sample-project",
-            "Goal achieved (2h 12m)\nold transcript\n\n› New request\n\ngpt-5.6-sol · Ready",
-        )
-        .unwrap();
-        assert_eq!(result.goal, None);
+        for suffix in [
+            "",
+            "\n? for shortcuts",
+            "\n⚠ 1 warning · f2 to view",
+            "\ntab to queue message",
+            "\n← for agents · ? for shortcuts",
+        ] {
+            let screen = format!(
+                "Goal achieved (2h 12m)\nold transcript\n\n› New request\n\ngpt-5.6-sol · Ready{suffix}"
+            );
+            let result = detect("codex", "sample-project", &screen).unwrap();
+            assert_eq!(result.goal, None, "{screen}");
+        }
+    }
+
+    #[test]
+    fn codex_goal_does_not_skip_arbitrary_trailing_text() {
+        for suffix in [
+            "Conversation interrupted",
+            "› New request",
+            "? for shortcuts plus arbitrary text",
+            "? for shortcuts                   unrelated text",
+            "⚠ 1 warning · f2 to view and more",
+            "tab to queue message later",
+            "← for agents · ? for shortcuts extra",
+            "? for shortcuts\n? for shortcuts",
+        ] {
+            let screen = format!("model · Pursuing goal (18m 42s)\n{suffix}");
+            assert_eq!(
+                detect("codex", "sample-project", &screen).unwrap().goal,
+                None,
+                "{screen}",
+            );
+        }
+    }
+
+    #[test]
+    fn codex_goal_status_must_immediately_precede_the_hint() {
+        for status in ["Pursuing goal (18m 42s)", "Goal achieved (2h 12m)"] {
+            let screen = format!("model · {status}\n\n? for shortcuts\n\n");
+            assert_eq!(
+                detect("codex", "sample-project", &screen).unwrap().goal,
+                None,
+                "{screen}",
+            );
+        }
     }
 
     #[test]

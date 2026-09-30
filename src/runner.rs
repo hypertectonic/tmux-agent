@@ -39,7 +39,7 @@ pub struct RunnerState {
     pub updated_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_thread_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(flatten, with = "crate::model::goal_wire")]
     pub goal: Option<GoalInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detection: Option<DetectionDetails>,
@@ -995,13 +995,88 @@ mod tests {
     }
 
     #[test]
+    fn token_goal_wire_preserves_legacy_runner_readers() {
+        #[derive(Deserialize)]
+        struct LegacyGoal {
+            elapsed_seconds: u64,
+        }
+        #[derive(Deserialize)]
+        struct LegacyRunner {
+            protocol: u32,
+            run_id: String,
+            owner_pid: u32,
+            child_pid: u32,
+            state: AgentState,
+            goal: Option<LegacyGoal>,
+        }
+        let mut state = state(123);
+        state.goal = Some(GoalInfo {
+            state: crate::model::GoalState::Pursuing,
+            progress: crate::model::GoalProgress::Tokens {
+                used: 40_000,
+                budget: Some(50_000),
+            },
+            achievement_pending: false,
+            achievement_observed_at_ms: 0,
+        });
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert!(encoded.get("goal").is_none());
+        assert_eq!(
+            encoded["token_goal"],
+            serde_json::json!({
+                "state": "pursuing", "used_tokens": 40_000, "budget_tokens": 50_000
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RunnerState>(encoded.clone()).unwrap(),
+            state
+        );
+        let old: LegacyRunner = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(old.protocol, 2);
+        assert_eq!(old.run_id, state.run_id);
+        assert_eq!(old.owner_pid, state.owner_pid);
+        assert_eq!(old.child_pid, state.child_pid);
+        assert_eq!(old.state, state.state);
+        assert!(old.goal.is_none());
+
+        let duration = serde_json::json!({"state": "pursuing", "elapsed_seconds": 42});
+        for (goal, token_goal) in [
+            (duration.clone(), encoded["token_goal"].clone()),
+            (encoded["token_goal"].clone(), serde_json::Value::Null),
+            (serde_json::Value::Null, duration.clone()),
+        ] {
+            let mut invalid = encoded.clone();
+            invalid["goal"] = goal;
+            invalid["token_goal"] = token_goal;
+            assert!(serde_json::from_value::<RunnerState>(invalid).is_err());
+        }
+        let mut legacy = encoded;
+        legacy.as_object_mut().unwrap().remove("token_goal");
+        legacy["goal"] = duration;
+        let restored = serde_json::from_value::<RunnerState>(legacy.clone()).unwrap();
+        assert_eq!(
+            restored.goal.unwrap().progress,
+            crate::model::GoalProgress::Elapsed { seconds: 42 }
+        );
+        assert_eq!(serde_json::to_value(restored).unwrap(), legacy);
+        assert_eq!(
+            serde_json::from_value::<LegacyRunner>(legacy)
+                .unwrap()
+                .goal
+                .unwrap()
+                .elapsed_seconds,
+            42
+        );
+    }
+
+    #[test]
     fn state_file_contains_derived_state_but_no_screen() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("run-1.json");
         let mut state = state(now_ms());
         state.goal = Some(GoalInfo {
             state: crate::model::GoalState::Pursuing,
-            elapsed_seconds: 1_122,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 1_122 },
             achievement_pending: false,
             achievement_observed_at_ms: 0,
         });

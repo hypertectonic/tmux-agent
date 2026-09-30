@@ -87,13 +87,81 @@ pub enum GoalState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GoalProgress {
+    Elapsed {
+        #[serde(rename = "elapsed_seconds")]
+        seconds: u64,
+    },
+    Tokens {
+        #[serde(rename = "used_tokens")]
+        used: u64,
+        #[serde(
+            rename = "budget_tokens",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        budget: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalInfo {
     pub state: GoalState,
-    pub elapsed_seconds: u64,
+    #[serde(flatten)]
+    pub progress: GoalProgress,
     #[serde(default, skip_serializing_if = "is_false")]
     pub achievement_pending: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub achievement_observed_at_ms: u64,
+}
+
+// Old readers require elapsed_seconds in `goal`. Keep token progress in an
+// additive sibling so they retain the agent or runner and ignore only its goal.
+pub(crate) mod goal_wire {
+    use super::{GoalInfo, GoalProgress};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+
+    #[derive(Default, Serialize, Deserialize)]
+    struct GoalWire {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<GoalInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_goal: Option<GoalInfo>,
+    }
+
+    pub fn serialize<S: Serializer>(
+        goal: &Option<GoalInfo>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut wire = GoalWire::default();
+        if let Some(goal) = goal {
+            match goal.progress {
+                GoalProgress::Elapsed { .. } => wire.goal = Some(*goal),
+                GoalProgress::Tokens { .. } => wire.token_goal = Some(*goal),
+            }
+        }
+        wire.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<GoalInfo>, D::Error> {
+        let wire = GoalWire::deserialize(deserializer)?;
+        match (wire.goal, wire.token_goal) {
+            (None, None) => Ok(None),
+            (Some(goal), None) if matches!(goal.progress, GoalProgress::Elapsed { .. }) => {
+                Ok(Some(goal))
+            }
+            (None, Some(goal)) if matches!(goal.progress, GoalProgress::Tokens { .. }) => {
+                Ok(Some(goal))
+            }
+            (Some(_), Some(_)) => Err(D::Error::custom("conflicting goal and token_goal")),
+            _ => Err(D::Error::custom(
+                "goal progress does not match its wire field",
+            )),
+        }
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -241,7 +309,7 @@ pub struct AgentRecord {
     pub session_connections: Option<SessionConnections>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus_target: Option<TmuxTarget>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(flatten, with = "goal_wire")]
     pub goal: Option<GoalInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<SubagentInfo>,
@@ -652,6 +720,118 @@ mod tests {
     }
 
     #[test]
+    fn token_goal_wire_preserves_legacy_snapshot_readers() {
+        // These readers freeze the old required elapsed field and goal boundary.
+        #[derive(Deserialize)]
+        struct LegacyGoal {
+            state: GoalState,
+            elapsed_seconds: u64,
+        }
+        #[derive(Deserialize)]
+        struct LegacyAgent {
+            id: String,
+            state: AgentState,
+            goal: Option<LegacyGoal>,
+        }
+        #[derive(Deserialize)]
+        struct LegacySnapshot {
+            protocol: u32,
+            agents: Vec<LegacyAgent>,
+        }
+
+        let mut agent = sortable_agent("1", "work", Attention::Idle, 1);
+        let mut goal = GoalInfo {
+            state: GoalState::Achieved,
+            progress: GoalProgress::Tokens {
+                used: 40_000,
+                budget: None,
+            },
+            achievement_pending: true,
+            achievement_observed_at_ms: 123,
+        };
+        agent.goal = Some(goal);
+        let mut snapshot = Snapshot {
+            protocol: PROTOCOL_VERSION,
+            application_version: None,
+            capabilities: vec![],
+            revision: 1,
+            host: "host".into(),
+            server: "default".into(),
+            generated_at_ms: 1,
+            agents: vec![agent],
+            peers: vec![],
+            ssh_transports: vec![],
+        };
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert!(encoded["agents"][0].get("goal").is_none());
+        assert_eq!(
+            encoded["agents"][0]["token_goal"],
+            serde_json::json!({
+                "state": "achieved", "used_tokens": 40_000,
+                "achievement_pending": true, "achievement_observed_at_ms": 123
+            })
+        );
+        let old: LegacySnapshot = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(old.protocol, 4);
+        assert_eq!(old.agents.len(), 1);
+        assert_eq!(old.agents[0].id, "1");
+        assert_eq!(old.agents[0].state, AgentState::Idle);
+        assert!(old.agents[0].goal.is_none());
+        assert_eq!(
+            serde_json::from_value::<Snapshot>(encoded).unwrap().agents[0].goal,
+            Some(goal)
+        );
+
+        goal.progress = GoalProgress::Elapsed { seconds: 42 };
+        snapshot.agents[0].goal = Some(goal);
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert!(encoded["agents"][0].get("token_goal").is_none());
+        assert_eq!(
+            encoded["agents"][0]["goal"],
+            serde_json::json!({
+                "state": "achieved", "elapsed_seconds": 42,
+                "achievement_pending": true, "achievement_observed_at_ms": 123
+            })
+        );
+        let old: LegacySnapshot = serde_json::from_value(encoded.clone()).unwrap();
+        let old_goal = old.agents[0].goal.as_ref().unwrap();
+        assert_eq!(old_goal.state, GoalState::Achieved);
+        assert_eq!(old_goal.elapsed_seconds, 42);
+        assert_eq!(
+            serde_json::from_value::<Snapshot>(encoded).unwrap().agents[0].goal,
+            Some(goal)
+        );
+    }
+
+    #[test]
+    fn goal_wire_rejects_conflicting_or_misnamed_progress() {
+        let agent = sortable_agent("1", "work", Attention::Idle, 1);
+        let elapsed = serde_json::json!({"state": "pursuing", "elapsed_seconds": 42});
+        let tokens = serde_json::json!({"state": "pursuing", "used_tokens": 40_000, "budget_tokens": 50_000});
+        for (goal, token_goal) in [
+            (elapsed.clone(), tokens.clone()),
+            (tokens.clone(), serde_json::Value::Null),
+            (serde_json::Value::Null, elapsed),
+        ] {
+            let mut encoded = serde_json::to_value(&agent).unwrap();
+            encoded["goal"] = goal;
+            encoded["token_goal"] = token_goal;
+            assert!(serde_json::from_value::<AgentRecord>(encoded).is_err());
+        }
+        let mut encoded = serde_json::to_value(&agent).unwrap();
+        encoded["goal"] = serde_json::Value::Null;
+        encoded["token_goal"] = tokens;
+        let restored = serde_json::from_value::<AgentRecord>(encoded).unwrap();
+        assert_eq!(
+            restored.goal.unwrap().progress,
+            GoalProgress::Tokens {
+                used: 40_000,
+                budget: Some(50_000)
+            }
+        );
+    }
+
+    #[test]
     fn old_goal_records_default_to_no_pending_achievement() {
         let goal: GoalInfo = serde_json::from_value(serde_json::json!({
             "state": "achieved",
@@ -670,7 +850,7 @@ mod tests {
     fn pending_goal_achievement_survives_serialization() {
         let goal = GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 7_920,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 7_920 },
             achievement_pending: true,
             achievement_observed_at_ms: 123_000,
         };

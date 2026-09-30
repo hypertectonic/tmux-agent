@@ -98,7 +98,8 @@ Linux release archives require glibc 2.35 or newer. Windows is not supported.
 - Provider badges, working animation, task titles, pane labels, and host-first
   location breadcrumbs.
 - Idle sessions ordered by their most recent successful focus or state change.
-- Codex goal state and elapsed time without the goal objective.
+- Codex goal state with elapsed time or displayed token usage and budget, without
+  the goal objective.
 - Process-backed and in-process Codex children beneath their actual parent.
 - Local and SSH-federated machines in one view.
 
