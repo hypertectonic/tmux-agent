@@ -292,7 +292,7 @@ mod tests {
         let mut old = record(AgentState::Blocked);
         old.goal = Some(GoalInfo {
             state: GoalState::Pursuing,
-            elapsed_seconds: 120,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 120 },
             achievement_pending: false,
             achievement_observed_at_ms: 0,
         });

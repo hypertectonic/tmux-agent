@@ -110,12 +110,24 @@ blocked > done > working > idle > unknown
 `done` is derived when an active agent becomes idle while its tmux window is
 not visible. Activating the row or using `acknowledge` marks the completion
 seen. Codex goal achievements use the same explicit acknowledgement boundary.
-Codex goal state and elapsed time come from its visible status footer. Detection
+Codex goal state and progress come from its visible status footer. Unbudgeted
+goals show elapsed time; budgeted goals show token usage and budget while pursuing,
+then token usage when achieved. Token counts reflect Codex's rounded display,
+not exact accounting. No objective text is collected. Detection
 supports the single-line footer and a status row immediately above known default
 shortcut, agent-navigation, queue, or warning hints. Warning notices may appear
 alone or beside a hint, including compact counts. Unrecognized hint text is not
 skipped, and detection never searches past the adjacent row into conversation
 history.
+
+Internally, goal progress is either elapsed seconds or token usage with an optional
+budget. Agent snapshots and owned-PTY runner state preserve the existing `goal`
+object for elapsed progress. Token progress uses the additive `token_goal` sibling
+with `used_tokens` and optional `budget_tokens`, never a fabricated elapsed time.
+Both forms carry the same goal state and achievement acknowledgement metadata.
+Older protocol-4 snapshot readers and protocol-2 runner readers ignore token goals
+without losing the agent or runner. New readers accept either form and reject
+conflicting non-null siblings. Neither protocol version changes.
 
 Within the idle bucket, top-level agents sort by the newer of their state-change
 time and their last successful focus through tmux-agent. The daemon keeps focus
