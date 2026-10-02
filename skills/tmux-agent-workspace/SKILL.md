@@ -121,8 +121,14 @@ Poll discovery briefly with a bounded startup wait, for example up to one
 minute, then report a startup blocker instead of creating duplicate workers.
 Match the new pane's exact endpoint to its full discovered agent ID, provider
 and checkout. Inspect the new pane's output for the normal input prompt: an
-`idle` record alone does not prove readiness past login or trust dialogs. Do not
-accept those dialogs or cancel tmux copy mode automatically.
+`idle` record alone does not prove readiness past login or trust dialogs.
+An explicit user request to launch an agent in the verified checkout also
+authorizes accepting that checkout's folder-trust confirmation. Check that the
+dialog names the intended checkout, accept it, and continue to the normal input
+prompt without asking the user again. This does not authorize trusting a
+different directory, disabling trust checks, changing authentication, or
+granting broader permissions. Stop for an unexpected path or an unresolved
+login/permission prompt. Do not cancel tmux copy mode automatically.
 
 Check the discovered `label` in `tmux-agent find --json` or `list --json`.
 The current CLI has no `--label` filter, and `--title` does not search labels;
@@ -154,8 +160,9 @@ progress, questions and results. Remote output inspection requires authorized
 access on the owning machine; federation snapshots do not contain transcripts.
 Keep the user informed without repeatedly reading the entire conversation.
 
-Respond to in-scope questions through handoff. Do not answer permission prompts,
-expand scope, or automatically restart a stalled worker. A `done`/`idle` state
+Respond to in-scope questions through handoff. Folder trust follows the startup
+rule above; other permission prompts require their own authorization. Do not
+expand scope or automatically restart a stalled worker. A `done`/`idle` state
 or a delivered handoff is not proof of completion. Read the worker's final
 report and check the requested evidence before reporting success. If the worker
 disappears or progress cannot be established, report the uncertainty.
