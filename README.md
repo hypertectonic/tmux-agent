@@ -111,11 +111,12 @@ activity and parent relationships for any provider, locally or over SSH.
 Unfinished idle or blocked children do not count. This does not add new provider
 discovery or improve the evidence used to detect activity.
 
-Claude's parent row also shows working when elapsed time or token counters
-advance in its default visible child panel. Confirmation usually takes about
-one second; frozen counters stop contributing after two seconds. This does not
-add separate Claude child rows, and hidden or custom child panels may not be
-recognized.
+Claude's parent row also shows working when its live status says it is waiting
+for background agents to finish, even with the child panel hidden. Otherwise,
+elapsed time or token counters advancing in its default visible child panel can
+signal work. Confirmation usually takes about one second; frozen counters stop
+contributing after two seconds. This does not add separate Claude child rows,
+and hidden or custom child panels may not be recognized.
 
 tmux-agent derives state from foreground process metadata and the visible
 terminal surface. Ordinary terminal sessions are detected from their TTY but
