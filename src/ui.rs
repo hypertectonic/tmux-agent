@@ -461,7 +461,7 @@ fn agent_matches_query(agent: &AgentRecord, query: &str) -> bool {
                 .name
                 .as_deref()
                 .is_some_and(|name| name.to_lowercase().contains(query))
-                || subagent_state_label(subagent.finished_at_ms).contains(query)
+                || child_state_label(agent).contains(query)
         })
 }
 
@@ -470,6 +470,19 @@ fn subagent_state_label(finished_at_ms: Option<u64>) -> &'static str {
         "done"
     } else {
         "running"
+    }
+}
+
+fn child_state_label(agent: &AgentRecord) -> &'static str {
+    if crate::claude::is_metadata_child(agent) && agent.state == AgentState::Unknown {
+        "unknown"
+    } else {
+        subagent_state_label(
+            agent
+                .subagent
+                .as_ref()
+                .and_then(|child| child.finished_at_ms),
+        )
     }
 }
 
@@ -1054,7 +1067,8 @@ async fn activate_record(
     let Some(record) = snapshot.agents.get(selected).cloned() else {
         return Ok(Activation::Failed);
     };
-    if record.subagent.is_some() {
+    let claude_child = crate::claude::is_metadata_child(&record);
+    if record.subagent.is_some() && !claude_child {
         let command =
             match subagent_view_command(context.config, context.config_path, snapshot, &record) {
                 Ok(command) => command,
@@ -1078,7 +1092,14 @@ async fn activate_record(
             }
         };
     }
-    let focus_record = &record;
+    let focused_parent = match crate::focus::parent_focus_record(snapshot, &record) {
+        Ok(record) => record.clone(),
+        Err(error) => {
+            message.set_transient(format!("{error:#}"), Instant::now());
+            return Ok(Activation::Failed);
+        }
+    };
+    let focus_record = &focused_parent;
     if focus_record.is_tmux() || focus_record.remote_alias.is_some() {
         return match crate::focus::activate(context.tmux, context.config, snapshot, focus_record)
             .await
@@ -1089,15 +1110,19 @@ async fn activate_record(
             }) => {
                 // Usage ordering is optional metadata. A successful focus must
                 // remain successful when an older daemon cannot record it.
-                let _ = ipc::mark_used(&context.paths.socket, &record.id).await;
+                let _ = ipc::mark_used(&context.paths.socket, &focus_record.id).await;
                 if activation_requires_acknowledgement(focus_record) {
-                    acknowledge_record(context.paths, snapshot, &record.id).await?;
+                    acknowledge_record(context.paths, snapshot, &focus_record.id).await?;
                 }
                 if context.exit_after_focus {
                     return Ok(Activation::Close);
                 }
                 message.set_transient(
-                    format!("focused {}", focus_record.location()),
+                    format!(
+                        "focused {}{}",
+                        if claude_child { "Claude parent " } else { "" },
+                        focus_record.location()
+                    ),
                     Instant::now(),
                 );
                 Ok(Activation::Completed)
@@ -1107,7 +1132,7 @@ async fn activate_record(
                 notice,
             }) => {
                 if activation_requires_acknowledgement(focus_record) {
-                    acknowledge_record(context.paths, snapshot, &record.id).await?;
+                    acknowledge_record(context.paths, snapshot, &focus_record.id).await?;
                 }
                 message.set_transient(
                     format!("{notice} ({})", focus_record.location()),
@@ -1117,15 +1142,15 @@ async fn activate_record(
             }
             Err(focus_error)
                 if focus_record.remote_alias.is_some()
-                    && (record.attention == Attention::Done
+                    && (focus_record.attention == Attention::Done
                         || has_pending_goal_achievement(focus_record))
                     && is_focus_target_missing(&focus_error) =>
             {
-                acknowledge_record(context.paths, snapshot, &record.id).await?;
+                acknowledge_record(context.paths, snapshot, &focus_record.id).await?;
                 message.set_transient(
                     format!(
                         "acknowledged {}; focus unavailable: {focus_error:#}",
-                        record.location()
+                        focus_record.location()
                     ),
                     Instant::now(),
                 );
@@ -1136,6 +1161,13 @@ async fn activate_record(
                 Ok(Activation::Failed)
             }
         };
+    }
+    if claude_child {
+        message.set_transient(
+            "Claude child has no independent pane; its parent is outside tmux",
+            Instant::now(),
+        );
+        return Ok(Activation::Failed);
     }
     match acknowledge_record(context.paths, snapshot, &record.id).await {
         Ok(()) => {
@@ -1390,8 +1422,16 @@ fn render_agent_list(
             let agent = &snapshot.agents[*snapshot_index];
             if let Some(subagent) = &agent.subagent {
                 let finished = subagent.finished_at_ms.is_some();
-                let state_color = if finished { Color::Green } else { Color::Cyan };
-                let state_label = subagent_state_label(subagent.finished_at_ms);
+                let state_color = if finished {
+                    Color::Green
+                } else if crate::claude::is_metadata_child(agent)
+                    && agent.state == AgentState::Unknown
+                {
+                    Color::DarkGray
+                } else {
+                    Color::Cyan
+                };
+                let state_label = child_state_label(agent);
                 let end = subagent
                     .finished_at_ms
                     .unwrap_or(rendered_at_ms.max(subagent.started_at_ms));
@@ -3778,6 +3818,47 @@ mod tests {
     }
 
     #[test]
+    fn claude_child_unknown_does_not_count_as_working_or_search_as_running() {
+        let mut parent = test_agent("Claude", Attention::Idle, AgentOrigin::Tmux);
+        parent.id = "host/default/%1".into();
+        parent.state = AgentState::Idle;
+        let mut child = parent.clone();
+        child.id = format!("{}/claude/session/100/child", parent.id);
+        child.title = "reviewer".into();
+        child.state = AgentState::Unknown;
+        child.attention = Attention::Unknown;
+        child.subagent = Some(SubagentInfo {
+            parent_id: parent.id.clone(),
+            started_at_ms: 100,
+            finished_at_ms: None,
+            name: Some("reviewer".into()),
+            thread_id: None,
+        });
+        assert_eq!(child_state_label(&child), "unknown");
+        assert!(!agent_matches_query(&child, "running"));
+        assert!(agent_matches_query(&child, "unknown"));
+        let mut snapshot = Snapshot {
+            agents: vec![parent, child],
+            ..Snapshot::default()
+        };
+        assert!(working_descendant_counts(&snapshot.agents).is_empty());
+        snapshot.agents[1].state = AgentState::Working;
+        snapshot.agents[1].attention = Attention::Working;
+        assert_eq!(
+            working_descendant_counts(&snapshot.agents)["host/default/%1"],
+            1
+        );
+        // Counts use the full snapshot, including children hidden by a title filter.
+        assert_eq!(child_state_label(&snapshot.agents[1]), "running");
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &snapshot, 0, "", 0))
+            .unwrap();
+        assert!(row_text(&terminal, 4).contains("1 subagent working"));
+        assert!(row_text(&terminal, 6).contains("reviewer"));
+    }
+
+    #[test]
     fn process_child_follows_and_indents_below_its_thread_parent() {
         let mut root = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
         root.id = "local/default/root".into();
@@ -4521,6 +4602,40 @@ mod tests {
         assert!(command.iter().any(|argument| argument == "subagent-view"));
         assert_eq!(command.last(), Some(&snapshot.agents[0].id));
         assert!(message.text().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_claude_child_parent_reports_failure_without_closing_ui() {
+        let config = Config::default();
+        let paths = RuntimePaths::discover("ui-claude-child-test").unwrap();
+        let tmux = Tmux::new(&config);
+        let mut child = test_agent("Claude", Attention::Working, AgentOrigin::Tmux);
+        child.id = "host/default/%1/claude/session/100/child".into();
+        child.subagent = Some(SubagentInfo {
+            parent_id: "host/default/%1".into(),
+            started_at_ms: 1,
+            finished_at_ms: None,
+            name: Some("reviewer".into()),
+            thread_id: None,
+        });
+        let mut snapshot = Snapshot {
+            agents: vec![child],
+            ..Snapshot::default()
+        };
+        let context = ActivationContext {
+            paths: &paths,
+            tmux: &tmux,
+            config: &config,
+            config_path: Path::new("/tmp/fixture-config.toml"),
+            exit_after_focus: false,
+        };
+        let mut message = UiMessage::default();
+        assert_eq!(
+            activate_record(&context, &mut snapshot, 0, &mut message)
+                .await
+                .unwrap(),
+            Activation::Failed
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ set -eu
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 "$root/tests/popup-launcher.sh"
 "$root/tests/daemon-server-lifecycle.sh"
+python3 "$root/tests/claude-children.py" "$root/target/debug/tmux-agent"
 "$root/tests/remote-pane-binding.sh"
 "$root/tests/event-driven-ui.sh"
 "$root/tests/installer-integration.sh"

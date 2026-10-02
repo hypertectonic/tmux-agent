@@ -1756,6 +1756,40 @@ mod tests {
     }
 
     #[test]
+    fn claude_child_federation_keeps_parent_focus_and_metadata_only() {
+        let mut parent = agent("host/default/%1", AgentState::Idle, Attention::Idle);
+        parent.agent = "Claude".into();
+        let mut child = parent.clone();
+        child.id = format!("{}/claude/session/100/child", parent.id);
+        child.state = AgentState::Working;
+        child.attention = Attention::Working;
+        child.subagent = Some(crate::model::SubagentInfo {
+            parent_id: parent.id.clone(),
+            started_at_ms: 100,
+            finished_at_ms: None,
+            name: Some("reviewer".into()),
+            thread_id: None,
+        });
+        let mut snapshot = Snapshot {
+            agents: vec![parent, child],
+            ..Snapshot::default()
+        };
+        namespace_remote("build-host", &mut snapshot);
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        let restored: Snapshot = serde_json::from_str(&wire).unwrap();
+        let child = &restored.agents[1];
+        assert!(crate::claude::is_metadata_child(child));
+        assert_eq!(
+            crate::focus::parent_focus_record(&restored, child)
+                .unwrap()
+                .id,
+            restored.agents[0].id
+        );
+        assert_eq!(child.remote_alias.as_deref(), Some("build-host"));
+        assert!(child.subagent.as_ref().unwrap().thread_id.is_none());
+    }
+
+    #[test]
     fn acknowledgement_is_applied_until_the_next_active_turn() {
         let id = "remote/remote-mac/session";
         let mut agents = vec![agent(id, AgentState::Idle, Attention::Done)];

@@ -100,7 +100,8 @@ Linux release archives require glibc 2.35 or newer. Windows is not supported.
 - Idle sessions ordered by their most recent successful focus or state change.
 - Codex goal state with elapsed time or displayed token usage and budget, without
   the goal objective.
-- Process-backed and in-process Codex children beneath their actual parent.
+- Process-backed and in-process Codex children, and recognized Claude children,
+  beneath their actual parent.
 - Local and SSH-federated machines in one view.
 
 A session's activity indicator animates while the parent or any recognized
@@ -115,8 +116,19 @@ Claude's parent row also shows working when its live status says it is waiting
 for background agents to finish, even with the child panel hidden. Otherwise,
 elapsed time or token counters advancing in its default visible child panel can
 signal work. Confirmation usually takes about one second; frozen counters stop
-contributing after two seconds. This does not add separate Claude child rows,
-and hidden or custom child panels may not be recognized.
+contributing after two seconds. Hidden or custom child panels may not be
+recognized by this fallback.
+
+Claude child rows use local session identity and lifecycle metadata when
+available, independently of the visible panel. Duplicate names remain separate
+children. Selecting one focuses its parent; it does not open a child transcript
+or deliver input independently. Recent transcript events indicate activity;
+after 30 seconds without events a child becomes `unknown`, not completed. This
+includes quiet long-running tools and cancellations without a terminal event.
+Confirmed completed children remain for 30 seconds, and unknown children expire
+after 30 minutes. Missing or unsupported metadata leaves parent-only detection
+in place. See [Claude discovery](docs/architecture.md#claude-child-discovery)
+for supported formats and bounded polling costs.
 
 tmux-agent derives state from foreground process metadata and the visible
 terminal surface. Ordinary terminal sessions are detected from their TTY but
@@ -137,7 +149,7 @@ tmux-agent ui
 | Up, Down | Move selection in normal or search mode |
 | `/` | Start filtering sessions as you type |
 | `Backspace` | Edit the active search |
-| `Enter` | Focus, acknowledge, or open a Codex child |
+| `Enter` | Focus, acknowledge, open a Codex child, or focus a Claude child's parent |
 | Left click | Activate a row |
 | `a` | Mark all currently unread completions as read in normal mode |
 | `r` | Refresh |

@@ -132,6 +132,7 @@ pub struct Scanner {
     runner_directory: PathBuf,
     codex_threads: ThreadTracker,
     codex_ownership: CodexOwnership,
+    claude_children: crate::claude::ChildTracker,
     record_starts: HashMap<String, (String, u64)>,
     captures: CaptureCache,
     revision: u64,
@@ -178,6 +179,7 @@ impl Scanner {
             runner_directory,
             codex_threads: ThreadTracker::from_environment(),
             codex_ownership,
+            claude_children: crate::claude::ChildTracker::from_environment(),
             record_starts: HashMap::new(),
             captures: CaptureCache::default(),
             revision: 0,
@@ -624,6 +626,8 @@ impl Scanner {
                 root_rollouts: &root_rollouts,
                 recovered_root_threads: &recovered_root_threads,
             });
+        self.claude_children
+            .reconcile(&mut next, &record_pids, &processes.process_args, now);
         retain_finished_subagents(&mut next, &self.previous, now);
         for record in next.values_mut().filter(|record| record.is_tmux()) {
             // Retained children may outlive their session. Absence is authoritative
@@ -1061,6 +1065,10 @@ fn retain_finished_subagents(
         })
         .collect::<HashSet<_>>();
     for (id, old) in previous {
+        // Claude metadata owns its expiry. Missing evidence is not completion.
+        if crate::claude::is_metadata_child(old) {
+            continue;
+        }
         if next.contains_key(id) {
             continue;
         }
@@ -2223,5 +2231,22 @@ mod tests {
             derived_subagent_name("/opt/bin/claude --print prompt", "Claude").as_deref(),
             Some("print")
         );
+    }
+    #[test]
+    fn expired_claude_metadata_is_not_recreated_as_successful_completion() {
+        let mut child = old(AgentState::Unknown, true);
+        child.agent = "Claude".into();
+        child.id = "host/default/%1/claude/session/100/child".into();
+        child.subagent = Some(SubagentInfo {
+            parent_id: "host/default/%1".into(),
+            started_at_ms: 1,
+            finished_at_ms: None,
+            name: Some("reviewer".into()),
+            thread_id: None,
+        });
+        let previous = HashMap::from([(child.id.clone(), child)]);
+        let mut next = HashMap::new();
+        retain_finished_subagents(&mut next, &previous, 40_000);
+        assert!(next.is_empty());
     }
 }
