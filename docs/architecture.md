@@ -208,9 +208,11 @@ bodies and tool arguments. `toolEndsTurn: true`, or an explicit assistant
 reopen the same row. The supported name is the agent type, not the task
 description. Child metadata never supplies a separate input target or a Codex
 thread ID. UI and CLI selection resolve the current owning parent, locally or
-through existing remote focus; handoff continues to exclude children. Older
-protocol-4 readers can display the existing child record shape but do not gain
-the new parent-selection behavior.
+through existing remote focus; handoff continues to exclude children. UI
+activation acknowledges the selected child's completion and any pending parent
+completion, without marking sibling children read. Older protocol-4 readers can
+display the existing child record shape but do not gain the new parent-selection
+behavior.
 
 Activity is evidence-limited: events within 30 seconds mean `working`. A quiet
 child becomes `unknown`, including a tool waiting longer than that or a
