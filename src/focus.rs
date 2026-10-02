@@ -45,6 +45,7 @@ pub async fn activate(
     snapshot: &Snapshot,
     record: &AgentRecord,
 ) -> Result<FocusReport> {
+    let record = parent_focus_record(snapshot, record)?;
     activate_with_control(
         tmux,
         config,
@@ -53,6 +54,34 @@ pub async fn activate(
         |machine, request| async move { send_control(&machine, &request).await },
     )
     .await
+}
+
+/// Claude's in-process children have no independent terminal input target.
+pub(crate) fn parent_focus_record<'a>(
+    snapshot: &'a Snapshot,
+    record: &'a AgentRecord,
+) -> Result<&'a AgentRecord> {
+    if !crate::claude::is_metadata_child(record) {
+        return Ok(record);
+    }
+    let parent_id = &record
+        .subagent
+        .as_ref()
+        .context("missing Claude child ownership")?
+        .parent_id;
+    snapshot
+        .agents
+        .iter()
+        .find(|parent| {
+            parent.id == *parent_id
+                && parent.agent == "Claude"
+                && parent.subagent.is_none()
+                && parent.process == record.process
+                && parent.host == record.host
+                && parent.server == record.server
+                && parent.remote_alias == record.remote_alias
+        })
+        .context("Claude child parent is no longer available")
 }
 
 async fn activate_with_control<F, Fut>(

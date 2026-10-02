@@ -1,3 +1,4 @@
+mod claude;
 mod codex;
 mod config;
 mod daemon;

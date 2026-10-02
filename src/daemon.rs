@@ -975,7 +975,7 @@ fn apply_acknowledgements(
         let current_goal = agent
             .goal
             .as_ref()
-            .filter(|goal| goal.state == GoalState::Achieved)
+            .filter(|goal| goal.state.is_terminal())
             .filter(|goal| goal.achievement_observed_at_ms > 0)
             .map(|goal| (goal.achievement_observed_at_ms, goal.achievement_pending));
         let acknowledged_goal = acknowledgements.goal_achievements.get(&agent.id).copied();
@@ -1073,7 +1073,7 @@ fn acknowledgement_targets(agents: &[AgentRecord]) -> Vec<String> {
         .filter(|agent| {
             let pending_goal = agent
                 .goal
-                .is_some_and(|goal| goal.state == GoalState::Achieved && goal.achievement_pending);
+                .is_some_and(|goal| goal.state.is_terminal() && goal.achievement_pending);
             (agent.state == AgentState::Idle && agent.attention == Attention::Done)
                 || (!matches!(agent.state, AgentState::Working | AgentState::Blocked)
                     && pending_goal)
@@ -1756,6 +1756,40 @@ mod tests {
     }
 
     #[test]
+    fn claude_child_federation_keeps_parent_focus_and_metadata_only() {
+        let mut parent = agent("host/default/%1", AgentState::Idle, Attention::Idle);
+        parent.agent = "Claude".into();
+        let mut child = parent.clone();
+        child.id = format!("{}/claude/session/100/child", parent.id);
+        child.state = AgentState::Working;
+        child.attention = Attention::Working;
+        child.subagent = Some(crate::model::SubagentInfo {
+            parent_id: parent.id.clone(),
+            started_at_ms: 100,
+            finished_at_ms: None,
+            name: Some("reviewer".into()),
+            thread_id: None,
+        });
+        let mut snapshot = Snapshot {
+            agents: vec![parent, child],
+            ..Snapshot::default()
+        };
+        namespace_remote("build-host", &mut snapshot);
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        let restored: Snapshot = serde_json::from_str(&wire).unwrap();
+        let child = &restored.agents[1];
+        assert!(crate::claude::is_metadata_child(child));
+        assert_eq!(
+            crate::focus::parent_focus_record(&restored, child)
+                .unwrap()
+                .id,
+            restored.agents[0].id
+        );
+        assert_eq!(child.remote_alias.as_deref(), Some("build-host"));
+        assert!(child.subagent.as_ref().unwrap().thread_id.is_none());
+    }
+
+    #[test]
     fn acknowledgement_is_applied_until_the_next_active_turn() {
         let id = "remote/remote-mac/session";
         let mut agents = vec![agent(id, AgentState::Idle, Attention::Done)];
@@ -2068,6 +2102,66 @@ mod tests {
         assert!(restored.visible);
         assert!(restored.seen);
         assert_eq!(restored.attention, Attention::Idle);
+    }
+
+    #[test]
+    fn unmet_goal_acknowledgement_survives_reload_and_cached_observations() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("acknowledged.json");
+        let id = "host/default/%1";
+        let mut record = agent(id, AgentState::Idle, Attention::Idle);
+        record.goal = Some(GoalInfo {
+            state: GoalState::Unmet,
+            progress: crate::model::GoalProgress::Tokens {
+                used: 50_000,
+                budget: Some(50_000),
+            },
+            achievement_pending: true,
+            achievement_observed_at_ms: 123_000,
+        });
+        for mark_all in [false, true] {
+            let mut agents = vec![record.clone()];
+            let result = if mark_all {
+                let results = acknowledge_all_records(&mut agents);
+                assert_eq!(results.len(), 1);
+                results[0].1
+            } else {
+                acknowledge_records(&mut agents, id)
+            };
+            assert!(result.persist_completion);
+            assert_eq!(result.goal_achievement, Some(123_000));
+            assert!(!agents[0].goal.unwrap().achievement_pending);
+            let acknowledgements = Acknowledgements {
+                completions: HashSet::from([id.to_string()]),
+                goal_achievements: HashMap::from([(
+                    id.to_string(),
+                    result.goal_achievement.unwrap(),
+                )]),
+            };
+            store::save_acknowledged(&path, &acknowledgements.state()).unwrap();
+            let mut restored =
+                Acknowledgements::from_state(store::load_acknowledged(&path).unwrap());
+            for state in [
+                AgentState::Idle,
+                AgentState::Unknown,
+                AgentState::Working,
+                AgentState::Blocked,
+                AgentState::Idle,
+            ] {
+                agents[0] = record.clone();
+                agents[0].state = state;
+                apply_acknowledgements(&mut agents, &mut restored);
+                assert!(!agents[0].goal.unwrap().achievement_pending, "{state:?}");
+            }
+            agents[0] = record.clone();
+            agents[0].goal.as_mut().unwrap().achievement_observed_at_ms = 456_000;
+            apply_acknowledgements(&mut agents, &mut restored);
+            assert!(agents[0].goal.unwrap().achievement_pending);
+        }
+        for state in [AgentState::Working, AgentState::Blocked] {
+            record.state = state;
+            assert!(acknowledgement_targets(&[record.clone()]).is_empty());
+        }
     }
 
     #[test]

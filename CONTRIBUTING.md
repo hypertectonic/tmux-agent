@@ -40,6 +40,13 @@ Behavior changes to detection or state transitions should include focused
 tests. Remote behavior must preserve SSH as the transport and must not add pane
 contents to federation snapshots.
 
+Claude child metadata changes have focused Rust tests (`cargo test --locked
+claude`) and a disposable scanner/focus contract (`python3
+tests/claude-children.py target/debug/tmux-agent`), also run by the shell suite.
+That fixture uses a synthetic provider process and metadata, not an
+authenticated Claude model. Keep real-provider acceptance separate and report
+the exact version exercised without copying private transcripts into fixtures.
+
 ### SSH and Mosh UI gate
 
 On Linux, run the mandatory CI transport gate with:
@@ -59,6 +66,8 @@ The gate runs the production scanner and persistent UI with two real PTY
 clients through SSH and Mosh. It checks a hidden, non-first remote pane,
 initiating-client selection, spectator preservation, reconnect with stale
 binding, rejected control without acknowledgement, and old-peer partial focus.
+Doctor assertions distinguish healthy federation and snapshot transport bindings
+from verified inner focus across attachment, disconnection, and reconnection.
 The old-peer adapter removes only the remote-focus capability from production
 watch output; it does not invent agent records. Named existing Rust tests also
 check stale lifetime/target identities, client replacement, and missing-target

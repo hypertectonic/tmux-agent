@@ -1,8 +1,8 @@
 use crate::config::{Config, RuntimePaths, default_config_path};
 use crate::ipc;
 use crate::model::{
-    APPLICATION_VERSION, CAPABILITY_SUBAGENT_VIEW, LAUNCHER_PROTOCOL_VERSION, PROTOCOL_VERSION,
-    Snapshot, terminal_safe,
+    APPLICATION_VERSION, CAPABILITY_REMOTE_FOCUS, CAPABILITY_SUBAGENT_VIEW,
+    LAUNCHER_PROTOCOL_VERSION, PROTOCOL_VERSION, Snapshot, terminal_safe,
 };
 use crate::tmux::Tmux;
 use anyhow::Result;
@@ -224,7 +224,7 @@ pub async fn run(explicit_config: Option<&Path>, json: bool) -> Result<()> {
         report.check(
             format!("remote:{}", remote.name),
             CheckStatus::Warning,
-            "raw collector configured; version and capability checks are unavailable",
+            "raw collector configured; version and capability checks are unavailable; inner tmux focus requires a structured [[machine]] configuration",
         );
     }
 
@@ -409,11 +409,20 @@ fn check_peer_health(report: &mut DoctorReport, snapshot: &Snapshot) {
         } else {
             "subagent view unavailable; update the remote binary"
         };
+        let focus_capability = if peer
+            .capabilities
+            .iter()
+            .any(|value| value == CAPABILITY_REMOTE_FOCUS)
+        {
+            "remote tmux control advertised"
+        } else {
+            "remote tmux control unavailable; outer-only focus"
+        };
         report.check(
             name,
             CheckStatus::Ok,
             format!(
-                "version {version}, protocol {}; {capability}",
+                "version {version}, protocol {}; {capability}; {focus_capability}",
                 peer.protocol
             ),
         );
@@ -429,32 +438,57 @@ fn check_peer_health(report: &mut DoctorReport, snapshot: &Snapshot) {
             .iter()
             .filter(|agent| agent.remote_alias.as_deref() == Some(alias))
             .collect::<Vec<_>>();
-        let transport_records = remote_agents
+        let bound = remote_agents
             .iter()
-            .filter(|agent| agent.ssh_connection.is_some())
-            .collect::<Vec<_>>();
-        if transport_records.is_empty() {
-            report.check(
-                format!("focus:{alias}"),
+            .filter(|agent| agent.focus_target.is_some())
+            .count();
+        let has_attachment = remote_agents.iter().any(|agent| {
+            agent.ssh_connection.is_some()
+                || agent
+                    .session_connections
+                    .as_ref()
+                    .is_some_and(|session| !session.clients.is_empty())
+        });
+        let (status, message) = if snapshot.peers.iter().any(|peer| {
+            peer.name == alias && (!peer.connected || peer.protocol != PROTOCOL_VERSION)
+        }) {
+            (
                 CheckStatus::Warning,
-                "no remote record currently exposes an SSH connection tuple",
-            );
-        } else if transport_records
-            .iter()
-            .any(|agent| agent.focus_target.is_some())
-        {
-            report.check(
-                format!("focus:{alias}"),
+                "peer disconnected or incompatible; snapshot transport bindings may be stale"
+                    .into(),
+            )
+        } else if bound == remote_agents.len() {
+            (
                 CheckStatus::Ok,
-                "a remote record resolves to a local SSH pane",
-            );
-        } else {
-            report.check(
-                format!("focus:{alias}"),
+                format!(
+                    "{bound} of {} remote records have a cached local SSH/Mosh transport binding in the current snapshot",
+                    remote_agents.len()
+                ),
+            )
+        } else if bound > 0 {
+            (
                 CheckStatus::Warning,
-                "remote records do not resolve to a unique local SSH pane",
-            );
-        }
+                format!(
+                    "{bound} of {} remote records have a cached local SSH/Mosh transport binding in the current snapshot; inspect unbound records with tmux-agent explain",
+                    remote_agents.len()
+                ),
+            )
+        } else if has_attachment {
+            (
+                CheckStatus::Warning,
+                "attachment evidence is present but no local transport binding is cached in the current snapshot; local SSH/Mosh matches may be missing or ambiguous".into(),
+            )
+        } else {
+            (
+                CheckStatus::Warning,
+                "no cached local transport binding and no reported SSH tuple or live session attachment in the current snapshot; attach the remote session and refresh, or inspect legacy outer-only bindings".into(),
+            )
+        };
+        report.check(
+            format!("focus:{alias}"),
+            status,
+            format!("{message}; inner focus is not verified by doctor"),
+        );
     }
 }
 
@@ -664,7 +698,223 @@ fn private_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{
+        AgentRecord, ClientConnection, SessionConnections, SshTransport, TmuxTarget,
+    };
     use tempfile::tempdir;
+
+    fn remote_record() -> AgentRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": "remote/fixture-peer/agent", "host": "fixture-peer", "server": "default",
+            "pane_id": "%3", "pane_pid": 42, "session_id": "$1", "session_name": "source",
+            "window_id": "@2", "window_index": 1, "window_name": "hidden", "pane_index": 1,
+            "agent": "Claude", "state": "idle", "attention": "idle", "source": "screen",
+            "title": "fixture", "cwd": "/tmp", "visible": false, "seen": true,
+            "changed_at_ms": 1, "remote_alias": "fixture-peer"
+        }))
+        .unwrap()
+    }
+
+    fn peer_report(agents: Vec<AgentRecord>) -> DoctorReport {
+        let mut report = DoctorReport {
+            application_version: APPLICATION_VERSION.into(),
+            protocol: PROTOCOL_VERSION,
+            operating_system: "linux".into(),
+            architecture: "x86_64".into(),
+            config_path: "fixture.toml".into(),
+            checks: Vec::new(),
+        };
+        check_peer_health(
+            &mut report,
+            &Snapshot {
+                agents,
+                ..Snapshot::default()
+            },
+        );
+        report
+    }
+
+    #[test]
+    fn doctor_recognizes_current_ssh_and_mosh_session_bindings_without_legacy_tuple() {
+        let connection = crate::model::SshConnection {
+            client_address: "192.0.2.1".into(),
+            client_port: 40000,
+            server_address: "192.0.2.2".into(),
+            server_port: 22,
+        };
+        let endpoint = crate::model::MoshEndpoint {
+            address: "192.0.2.2".into(),
+            port: 60001,
+        };
+        for client in [
+            ClientConnection::Ssh { connection },
+            ClientConnection::Mosh { endpoint },
+        ] {
+            let mut record = remote_record();
+            record.session_connections = Some(SessionConnections {
+                server_pid: 40,
+                server_started_at: 10,
+                session_created_at: 11,
+                complete: true,
+                clients: vec![client.clone()],
+            });
+            let transport = SshTransport {
+                connection: match &client {
+                    ClientConnection::Ssh { connection } => Some(connection.clone()),
+                    _ => None,
+                },
+                mosh_endpoint: match &client {
+                    ClientConnection::Mosh { endpoint } => Some(endpoint.clone()),
+                    _ => None,
+                },
+                remote_host: "fixture-peer".into(),
+                remote_host_explicit: false,
+                remote_session: None,
+                title: "shell".into(),
+                label: None,
+                visible: true,
+                target: TmuxTarget {
+                    session_name: "transport".into(),
+                    window_id: "@1".into(),
+                    window_index: 1,
+                    pane_id: "%1".into(),
+                    pane_index: 0,
+                },
+            };
+            let mut agents = vec![record.clone()];
+            crate::daemon::reconcile_transports(&mut agents, std::slice::from_ref(&transport));
+            assert!(agents[0].ssh_connection.is_none());
+            assert!(agents[0].focus_target.is_some());
+            let report = peer_report(agents);
+            assert_eq!(
+                report.checks[0].status,
+                CheckStatus::Ok,
+                "{}",
+                report.checks[0].message
+            );
+            assert!(report.checks[0].message.contains("snapshot"));
+            assert!(report.checks[0].message.contains("not verified"));
+
+            // A second local pane carrying the same attachment is ambiguous.
+            let mut duplicate = transport.clone();
+            duplicate.target.pane_id = "%2".into();
+            let mut agents = vec![record.clone()];
+            crate::daemon::reconcile_transports(&mut agents, &[transport.clone(), duplicate]);
+            assert!(agents[0].focus_target.is_none());
+            let report = peer_report(agents);
+            assert_eq!(report.checks[0].status, CheckStatus::Warning);
+            assert!(report.checks[0].message.contains("missing or ambiguous"));
+
+            let mut detached = record.clone();
+            detached
+                .session_connections
+                .as_mut()
+                .unwrap()
+                .clients
+                .clear();
+            let mut agents = vec![detached.clone()];
+            crate::daemon::reconcile_transports(&mut agents, std::slice::from_ref(&transport));
+            let report = peer_report(agents);
+            assert_eq!(report.checks[0].status, CheckStatus::Warning);
+            assert!(
+                report.checks[0]
+                    .message
+                    .contains("no reported SSH tuple or live session attachment")
+            );
+
+            let mut replacement = transport;
+            replacement.target.pane_id = "%4".into();
+            let mut agents = vec![record];
+            crate::daemon::reconcile_transports(&mut agents, &[replacement]);
+            assert_eq!(agents[0].focus_target.as_ref().unwrap().pane_id, "%4");
+            assert_eq!(
+                peer_report(agents.clone()).checks[0].status,
+                CheckStatus::Ok
+            );
+            agents.push(detached);
+            let report = peer_report(agents);
+            assert_eq!(report.checks[0].status, CheckStatus::Warning);
+            assert!(report.checks[0].message.contains("1 of 2"));
+        }
+    }
+
+    #[test]
+    fn doctor_keeps_peer_health_and_control_capability_separate_from_focus_evidence() {
+        let mut peer = crate::model::PeerStatus {
+            name: "fixture-peer".into(),
+            connected: true,
+            application_version: Some(APPLICATION_VERSION.into()),
+            protocol: PROTOCOL_VERSION,
+            ..Default::default()
+        };
+        let mut record = remote_record();
+        record.focus_target = Some(TmuxTarget {
+            session_name: "transport".into(),
+            window_id: "@1".into(),
+            window_index: 1,
+            pane_id: "%1".into(),
+            pane_index: 0,
+        });
+        for advertised in [false, true] {
+            if advertised {
+                peer.capabilities.push(CAPABILITY_REMOTE_FOCUS.into());
+            }
+            let mut report = peer_report(Vec::new());
+            check_peer_health(
+                &mut report,
+                &Snapshot {
+                    agents: vec![record.clone()],
+                    peers: vec![peer.clone()],
+                    ..Snapshot::default()
+                },
+            );
+            assert_eq!(report.checks[0].status, CheckStatus::Ok);
+            assert!(report.checks[0].message.contains(if advertised {
+                "remote tmux control advertised"
+            } else {
+                "remote tmux control unavailable; outer-only focus"
+            }));
+            assert_eq!(report.checks[1].status, CheckStatus::Ok);
+            assert!(report.checks[1].message.contains("not verified"));
+        }
+        peer.connected = false;
+        let mut report = peer_report(Vec::new());
+        check_peer_health(
+            &mut report,
+            &Snapshot {
+                agents: vec![record],
+                peers: vec![peer],
+                ..Snapshot::default()
+            },
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| check.status == CheckStatus::Warning)
+        );
+        assert!(report.checks[1].message.contains("may be stale"));
+    }
+
+    #[test]
+    fn doctor_retains_legacy_ssh_evidence_without_claiming_a_binding() {
+        let mut record = remote_record();
+        record.origin = crate::model::AgentOrigin::Terminal;
+        record.ssh_connection = Some(crate::model::SshConnection {
+            client_address: "192.0.2.1".into(),
+            client_port: 40000,
+            server_address: "192.0.2.2".into(),
+            server_port: 22,
+        });
+        let report = peer_report(vec![record]);
+        assert_eq!(report.checks[0].status, CheckStatus::Warning);
+        assert!(
+            report.checks[0]
+                .message
+                .contains("attachment evidence is present")
+        );
+        assert!(report.checks[0].message.contains("not verified"));
+    }
 
     #[test]
     fn supported_platforms_map_to_release_targets() {

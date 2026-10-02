@@ -86,8 +86,8 @@ The scanner keeps this bounded tracking with each pane's existing capture cache;
 process replacement or pane removal drops it. The owned PTY runner uses the same
 tracker for its run. Cached frames do not renew progress. No additional capture,
 process or filesystem polling is added, and child descriptions and counters are
-not serialized into runner state or federation snapshots. This is visible-panel
-detection, not Claude child discovery or separate child rows. Hidden, customized,
+not serialized into runner state or federation snapshots. This visible-panel
+detection remains independent of the metadata child discovery below. Hidden, customized,
 truncated or coarse counters, including day-long minute-resolution timers, may
 not establish continuous activity. Expiry applies while captures succeed;
 capture failures keep the existing state-preservation policy rather than imply
@@ -115,10 +115,12 @@ blocked > done > working > idle > unknown
 
 `done` is derived when an active agent becomes idle while its tmux window is
 not visible. Activating the row or using `acknowledge` marks the completion
-seen. Codex goal achievements use the same explicit acknowledgement boundary.
+seen. Codex terminal goal outcomes use the same explicit acknowledgement boundary.
 Codex goal state and progress come from its visible status footer. Unbudgeted
 goals show elapsed time; budgeted goals show token usage and budget while pursuing,
-then token usage when achieved. Token counts reflect Codex's rounded display,
+then token usage when achieved. Budget exhaustion is a separate `unmet` outcome
+with both usage and budget, displayed as `Goal unmet` or compact `goal!`, never
+`Goal achieved` or `goal✓`. Token counts reflect Codex's rounded display,
 not exact accounting. No objective text is collected. Detection
 supports the single-line footer and a status row immediately above known default
 shortcut, agent-navigation, queue, or warning hints. Warning notices may appear
@@ -130,10 +132,22 @@ Internally, goal progress is either elapsed seconds or token usage with an optio
 budget. Agent snapshots and owned-PTY runner state preserve the existing `goal`
 object for elapsed progress. Token progress uses the additive `token_goal` sibling
 with `used_tokens` and optional `budget_tokens`, never a fabricated elapsed time.
-Both forms carry the same goal state and achievement acknowledgement metadata.
-Older protocol-4 snapshot readers and protocol-2 runner readers ignore token goals
-without losing the agent or runner. New readers accept either form and reject
-conflicting non-null siblings. Neither protocol version changes.
+Unmet goals use a separate additive `unmet_goal` sibling with state `unmet` and
+required `used_tokens` and `budget_tokens`. The existing `goal` and `token_goal`
+forms retain only pursuing/achieved states. Older protocol-4 snapshot readers and
+protocol-2 runner readers ignore unsupported goal details without losing the
+agent or runner. New readers reject conflicting non-null siblings and mismatched
+states or progress. Neither protocol version changes.
+
+All forms share acknowledgement metadata. The existing `achievement_pending`,
+`achievement_observed_at_ms`, and persisted `goal_achievements` names cover both
+achieved and unmet outcomes. A transition from pursuing, an active turn, or a
+different outcome/progress creates a pending notice; a historical outcome first
+seen while idle does not. Working and blocked activity take precedence, deferring
+the goal notice until inactive. Focus/activation, `acknowledge`, and mark-all-read
+clear the notice. Repeated cached footers cannot restore an acknowledged notice;
+a new pursuit or changed outcome/progress can create a new one. Ordinary `done`
+attention means the turn finished, not that the goal succeeded.
 
 Within the idle bucket, top-level agents sort by the newer of their state-change
 time and their last successful focus through tmux-agent. The daemon keeps focus
@@ -160,6 +174,66 @@ process-table, `lsof`, or filesystem I/O.
 
 Nested parent identity is retained while visible children are active. Finished
 children remain visible for 30 seconds.
+
+### Claude child discovery
+
+Claude's owning-machine adapter reads the local `sessions/<pid>.json` registry
+under `CLAUDE_CONFIG_DIR`, or `~/.claude` by default. It joins an actual discovered
+Claude PID to its session ID and checks the registry's UTC `procStart` against
+the kernel process start, at the registry's one-second precision. Ambiguous
+owners, including two live processes resuming the same session, are rejected.
+Working-directory similarity and display labels never establish ownership.
+The record ID includes the parent, Claude session and child IDs, and the
+provider's full kernel start value. A replacement process cannot inherit cached
+children. Provider lifetime is tracked separately from the optional tmux
+foreground-group identity, so ordinary terminals and unmatched owned PTYs also
+support metadata discovery. Old events predating that process are not treated
+as current work.
+
+Only that registry working directory's project/session `subagents` directory is
+examined. Claude documents the stable `agent-{agentId}.jsonl` path and reuses the
+agent ID on resume in its [subagent reference](https://code.claude.com/docs/en/sub-agents#resume-subagents).
+The registry and sidecar format was inspected in Claude Code 2.1.285 through
+2.1.287; a disposable Claude Code 2.1.287 run verified two concurrent children
+moving from working to completed through `toolEndsTurn`. These
+on-disk formats are provider-owned, not a stable tmux-agent API. Unavailable or
+changed formats fail back to existing parent-only detection. No hooks or Claude
+settings changes are required. Other Claude config directories are supported
+only when the collector uses their `CLAUDE_CONFIG_DIR`.
+
+The parser retains only matching session/child IDs, timestamps, the sidecar's
+`agentType`, and terminal markers. It ignores descriptions, prompts, message
+bodies and tool arguments. `toolEndsTurn: true`, or an explicit assistant
+`stop_reason: end_turn`, is completion evidence; later conversation events
+reopen the same row. The supported name is the agent type, not the task
+description. Child metadata never supplies a separate input target or a Codex
+thread ID. UI and CLI selection resolve the current owning parent, locally or
+through existing remote focus; handoff continues to exclude children. UI
+activation acknowledges the selected child's completion and any pending parent
+completion, without marking sibling children read. Older protocol-4 readers can
+display the existing child record shape but do not gain the new parent-selection
+behavior.
+
+Activity is evidence-limited: events within 30 seconds mean `working`. A quiet
+child becomes `unknown`, including a tool waiting longer than that or a
+cancellation that supplies no supported terminal marker. Unknown is not success.
+Unknown rows expire after 30 minutes without events; confirmed finished rows
+expire after 30 seconds. Missing metadata or an absent owner removes the row
+without synthesizing completion. Parent screen detection remains unchanged and
+can still animate a parent whose child has no fresh metadata.
+
+Filesystem discovery runs at most once per second and adds no subprocesses or
+pane captures. Each session examines at most 4,096 directory entries and keeps
+the newest 128 child transcript files among them. Unchanged transcripts reuse
+cached lifecycle metadata; bounded name sidecars refresh on each poll. Changed
+transcripts read at most 256 KiB from their unread suffix or tail, plus one
+preceding byte when needed to distinguish a partial line from a complete event.
+Partial lines wait for completion and oversized lines are skipped. Events newer
+than the scan's timestamp remain unread until a normal later poll, even if the
+file does not change again. Registry and
+name files are limited to 16 KiB. This bounded adapter does not replay parent
+transcripts or recursively search projects. Federation carries only ordinary
+derived child records, never local transcript content.
 
 ## Local IPC and protocol
 

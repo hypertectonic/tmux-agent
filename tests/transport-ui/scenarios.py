@@ -126,6 +126,17 @@ class Scenario:
                    and record.get("pane_id") == self.target]
         return records[0] if len(records) == 1 else {}
 
+    def check_doctor(self, bound, old_peer=False):
+        checks = {check["name"]: check for check in json.loads(self.app("doctor", "--json"))["checks"]}
+        assert checks["peer:fixture-peer"]["status"] == "ok", "federation must stay healthy"
+        focus = checks["focus:fixture-peer"]
+        assert focus["status"] == ("ok" if bound else "warning"), focus
+        assert ("1 of 1" if bound else "no reported SSH tuple or live session attachment") in focus["message"], focus
+        assert "not verified" in focus["message"], focus
+        if old_peer:
+            assert "remote tmux control unavailable" in checks["peer:fixture-peer"]["message"], checks
+        print(f"PASS {self.transport} doctor snapshot binding={bound}, inner focus not verified", flush=True)
+
     def locations(self):
         rows = self.tmux("outer", "list-clients", "-F",
                          "#{client_pid}|#{session_name}|#{window_id}|#{pane_id}")
@@ -183,6 +194,8 @@ class Scenario:
         assert self.current_inner() != [record["window_id"], self.target]
         if self.transport == "SSH":
             self.check_permission_boundary()
+        assert not record.get("ssh_connection"), "modern tmux fixture must not use legacy SSH tuple"
+        self.check_doctor(True)
         self.complete_turn()
 
     def check_permission_boundary(self):
@@ -265,11 +278,15 @@ class Scenario:
         stale_pane = self.transport_target
         remote_client = self.tmux("inner", "list-clients", "-F", "#{client_name}")
         self.tmux("inner", "detach-client", "-t", remote_client)
-        self.wait("transport disconnected", lambda: not self.record().get("session_connections", {}).get("clients"))
+        self.wait("transport disconnected", lambda: self.record()
+                  and not self.record().get("session_connections", {}).get("clients")
+                  and not self.record().get("focus_target"))
+        self.check_doctor(False)
         assert self.tmux("outer", "show-option", "-pqv", "-t", stale_pane,
                          "@tmux_agent_remote_session") == "source", "stale marker must survive disconnect"
         self.transport_target = self.transport_pane()
         self.wait("replacement transport resolved", lambda: self.record().get("focus_target", {}).get("pane_id") == self.transport_target)
+        self.check_doctor(True)
         self.complete_turn()
         self.activate("focused transport:2.0/fixture-peer", True, True)
         print(f"PASS {self.transport} reconnect ignores stale binding", flush=True)
@@ -286,6 +303,7 @@ class Scenario:
         self.wait("old-peer capability omission", lambda: all(
             "remote_tmux_focus_v1" not in peer.get("capabilities", [])
             for peer in json.loads(self.app("list", "--json"))["peers"]))
+        self.check_doctor(True, old_peer=True)
         self.activate("peer does not advertise remote_tmux_focus_v1", True, False)
 
     def close(self):
