@@ -66,6 +66,8 @@ The gate runs the production scanner and persistent UI with two real PTY
 clients through SSH and Mosh. It checks a hidden, non-first remote pane,
 initiating-client selection, spectator preservation, reconnect with stale
 binding, rejected control without acknowledgement, and old-peer partial focus.
+Doctor assertions distinguish healthy federation and snapshot transport bindings
+from verified inner focus across attachment, disconnection, and reconnection.
 The old-peer adapter removes only the remote-focus capability from production
 watch output; it does not invent agent records. Named existing Rust tests also
 check stale lifetime/target identities, client replacement, and missing-target
