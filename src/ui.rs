@@ -1796,7 +1796,45 @@ fn goal_label(goal: &GoalInfo, compact: bool) -> String {
         (GoalState::Pursuing, true) => "goal",
         (GoalState::Achieved, true) => "goal✓",
     };
-    format!("{state} ({})", format_goal_duration(goal.elapsed_seconds))
+    let progress = match goal.progress {
+        crate::model::GoalProgress::Elapsed { seconds } => format_goal_duration(seconds),
+        crate::model::GoalProgress::Tokens { used, budget } => match budget {
+            Some(budget) => format!(
+                "{} / {}",
+                format_goal_tokens(used),
+                format_goal_tokens(budget)
+            ),
+            None => format!("{} tokens", format_goal_tokens(used)),
+        },
+    };
+    format!("{state} ({progress})")
+}
+
+fn format_goal_tokens(value: u64) -> String {
+    let (scale, suffix) = match value {
+        0..1_000 => return value.to_string(),
+        1_000..1_000_000 => (1_000_u64, "K"),
+        1_000_000..1_000_000_000 => (1_000_000, "M"),
+        1_000_000_000..1_000_000_000_000 => (1_000_000_000, "B"),
+        _ => (1_000_000_000_000, "T"),
+    };
+    let precision = if value / scale < 10 {
+        100
+    } else if value / scale < 100 {
+        10
+    } else {
+        1
+    };
+    let rounded = (u128::from(value) * precision + u128::from(scale) / 2) / u128::from(scale);
+    let whole = rounded / precision;
+    let fraction = rounded % precision;
+    if fraction == 0 {
+        format!("{whole}{suffix}")
+    } else {
+        let width = if precision == 100 { 2 } else { 1 };
+        let fraction = format!("{fraction:0width$}");
+        format!("{whole}.{}{suffix}", fraction.trim_end_matches('0'))
+    }
 }
 
 fn format_duration(elapsed_seconds: u64) -> String {
@@ -2443,7 +2481,7 @@ mod tests {
         let mut parent = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
         parent.goal = Some(GoalInfo {
             state: GoalState::Pursuing,
-            elapsed_seconds: 1_122,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 1_122 },
             achievement_pending: false,
             achievement_observed_at_ms: 0,
         });
@@ -2620,7 +2658,7 @@ mod tests {
     fn goal_labels_have_full_and_compact_forms() {
         let goal = GoalInfo {
             state: GoalState::Pursuing,
-            elapsed_seconds: 1_122,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 1_122 },
             achievement_pending: false,
             achievement_observed_at_ms: 0,
         };
@@ -2633,7 +2671,7 @@ mod tests {
         let mut agent = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
         agent.goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 7_920,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 7_920 },
             achievement_pending: true,
             achievement_observed_at_ms: 123_000,
         });
@@ -2648,7 +2686,7 @@ mod tests {
 
         agent.goal = Some(GoalInfo {
             state: GoalState::Pursuing,
-            elapsed_seconds: 5,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 5 },
             achievement_pending: false,
             achievement_observed_at_ms: 0,
         });
@@ -3560,13 +3598,80 @@ mod tests {
     }
 
     #[test]
+    fn token_goals_render_full_and_compact_labels() {
+        for (width, pursuing_label, achieved_label) in [
+            (
+                100,
+                "Pursuing goal (40K / 50K)",
+                "Goal achieved (40K tokens)",
+            ),
+            (55, "goal (40K / 50K)", "goal✓ (40K tokens)"),
+        ] {
+            let mut agent = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
+            agent.state = AgentState::Working;
+            agent.title = "task".into();
+            agent.goal = Some(GoalInfo {
+                state: GoalState::Pursuing,
+                progress: crate::model::GoalProgress::Tokens {
+                    used: 40_000,
+                    budget: Some(50_000),
+                },
+                achievement_pending: false,
+                achievement_observed_at_ms: 0,
+            });
+            let mut snapshot = Snapshot {
+                agents: vec![agent],
+                ..Snapshot::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &snapshot, 0, "", 5))
+                .unwrap();
+            assert!(
+                row_text(&terminal, 4).contains(pursuing_label),
+                "{}",
+                row_text(&terminal, 4)
+            );
+            snapshot.agents[0].state = AgentState::Idle;
+            snapshot.agents[0].attention = Attention::Idle;
+            snapshot.agents[0].goal = Some(GoalInfo {
+                state: GoalState::Achieved,
+                progress: crate::model::GoalProgress::Tokens {
+                    used: 40_000,
+                    budget: None,
+                },
+                achievement_pending: true,
+                achievement_observed_at_ms: 123,
+            });
+            terminal
+                .draw(|frame| render(frame, &snapshot, 0, "", 5))
+                .unwrap();
+            assert!(
+                row_text(&terminal, 4).contains(achieved_label),
+                "{}",
+                row_text(&terminal, 4)
+            );
+        }
+        for (value, expected) in [
+            (999, "999"),
+            (1_250, "1.25K"),
+            (12_500_000, "12.5M"),
+            (1_010_000_000, "1.01B"),
+            (2_000_000_000_000, "2T"),
+            (u64::MAX, "18446744T"),
+        ] {
+            assert_eq!(format_goal_tokens(value), expected);
+        }
+    }
+
+    #[test]
     fn rendered_goal_follows_activity_in_codex_magenta() {
         let mut working = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
         working.state = AgentState::Working;
         working.title = "sample-project".into();
         working.goal = Some(GoalInfo {
             state: GoalState::Pursuing,
-            elapsed_seconds: 1_122,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 1_122 },
             achievement_pending: false,
             achievement_observed_at_ms: 0,
         });
@@ -3593,7 +3698,7 @@ mod tests {
         achieved.title = "overnight-task".into();
         achieved.goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 7_920,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 7_920 },
             achievement_pending: true,
             achievement_observed_at_ms: 123_000,
         });
@@ -3892,7 +3997,7 @@ mod tests {
         remote.title = "completed-task".into();
         remote.goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 7_920,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 7_920 },
             achievement_pending: true,
             achievement_observed_at_ms: 123_000,
         });
@@ -4123,7 +4228,7 @@ mod tests {
         remote.pane_id = "%99999".into();
         remote.goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 10,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 10 },
             achievement_pending: true,
             achievement_observed_at_ms: 123_000,
         });

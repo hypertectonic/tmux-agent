@@ -4,6 +4,18 @@ All notable changes to `tmux-agent` will be documented in this file.
 
 The project uses semantic versioning.
 
+## [0.10.2] - 2026-10-02
+
+### Fixed
+
+- Recognize both single-line and two-line Codex goal footers, including
+  token-budget progress, without collecting the goal objective.
+- Recognize current Claude child navigation hints and main-row headers.
+- Keep Claude marked as working while its validated status says it is waiting
+  for background agents, even when child progress counters are hidden or frozen.
+  Permission prompts, stale-content rejection and ordinary child progress
+  expiry retain their existing behavior.
+
 ## [0.10.1] - 2026-09-30
 
 ### Fixed

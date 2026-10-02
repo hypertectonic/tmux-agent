@@ -1,21 +1,20 @@
-tmux-agent v0.10.1 improves Claude activity detection when pane titles do not
-reflect a live turn or a working child.
+tmux-agent v0.10.2 restores goal and activity detection for current Codex and
+Claude terminal interfaces.
 
 ## Fixes
 
-- Recognize live-turn progress above Claude's input prompt, including screens
-  with auxiliary status lines. Missing or unrecognized footers do not imply
-  activity.
-- Confirm child progress across successive captures, including Claude's child
-  navigation view. Frozen counters expire after a short grace period;
-  foreground permission prompts still take precedence.
-- Preserve process-start identity across inventory refreshes so confirmed
-  child progress survives a refresh.
+- Recognize both single-line and two-line Codex goal footers and display
+  token-budget progress without forwarding goal objectives.
+- Recognize current Claude child navigation hints and main-row headers.
+- Keep Claude's working indicator active while its validated status says it is
+  waiting for background agents. This also works when child counters are hidden
+  or frozen. Permission prompts and stale-content rejection remain in effect.
 
-Child activity remains a screen-based estimate. Replacing a child between
-captures with the same rendered label and larger counters can briefly imply
-activity. Without further advances, it expires after two seconds of successful
-captures. This release does not add child session IDs or transcript collection.
+Outside that explicit waiting status, Claude child activity still requires
+advancing counters and expires after two seconds without progress. This release
+does not add separate Claude child rows or transcript collection.
+
+Codex's budget-exhausted `Goal unmet` status is not yet supported.
 
 ## Compatibility
 
@@ -45,5 +44,5 @@ Archives are available for macOS Apple Silicon, macOS Intel, Linux x86-64 and
 Linux ARM64. Verify archives with `SHA256SUMS`; release assets have signed build
 provenance.
 
-See the [installation guide](https://github.com/hypertectonic/tmux-agent/blob/v0.10.1/docs/installation.md)
-and [remote-machine guide](https://github.com/hypertectonic/tmux-agent/blob/v0.10.1/docs/remote-machines.md).
+See the [installation guide](https://github.com/hypertectonic/tmux-agent/blob/v0.10.2/docs/installation.md)
+and [remote-machine guide](https://github.com/hypertectonic/tmux-agent/blob/v0.10.2/docs/remote-machines.md).

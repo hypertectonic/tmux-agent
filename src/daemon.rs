@@ -1481,7 +1481,7 @@ mod tests {
         );
         local_goal.goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 42,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 42 },
             achievement_pending: true,
             achievement_observed_at_ms: 100,
         });
@@ -1492,7 +1492,7 @@ mod tests {
         );
         working.goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 42,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 42 },
             achievement_pending: true,
             achievement_observed_at_ms: 200,
         });
@@ -1503,7 +1503,7 @@ mod tests {
         );
         blocked.goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 42,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 42 },
             achievement_pending: true,
             achievement_observed_at_ms: 250,
         });
@@ -1514,7 +1514,7 @@ mod tests {
         );
         unknown.goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 42,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 42 },
             achievement_pending: true,
             achievement_observed_at_ms: 300,
         });
@@ -1562,7 +1562,7 @@ mod tests {
         );
         remote_goal.goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 84,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 84 },
             achievement_pending: true,
             achievement_observed_at_ms: 400,
         });
@@ -1792,7 +1792,7 @@ mod tests {
         let mut completed = agent(id, AgentState::Idle, Attention::Done);
         completed.goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 7_920,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 7_920 },
             achievement_pending: true,
             achievement_observed_at_ms: 123_000,
         });
@@ -2071,12 +2071,42 @@ mod tests {
     }
 
     #[test]
+    fn token_goal_acknowledgement_suppresses_only_the_same_completion() {
+        let id = "host/default/%1";
+        let mut agents = vec![agent(id, AgentState::Idle, Attention::Idle)];
+        agents[0].goal = Some(GoalInfo {
+            state: GoalState::Achieved,
+            progress: crate::model::GoalProgress::Tokens {
+                used: 40_000,
+                budget: None,
+            },
+            achievement_pending: true,
+            achievement_observed_at_ms: 123_000,
+        });
+        let result = acknowledge_records(&mut agents, id);
+        assert!(result.found);
+        assert_eq!(result.goal_achievement, Some(123_000));
+        assert!(!agents[0].goal.unwrap().achievement_pending);
+        let mut acknowledgements = Acknowledgements {
+            completions: HashSet::new(),
+            goal_achievements: HashMap::from([(id.to_string(), result.goal_achievement.unwrap())]),
+        };
+        agents[0].goal.as_mut().unwrap().achievement_pending = true;
+        apply_acknowledgements(&mut agents, &mut acknowledgements);
+        assert!(!agents[0].goal.unwrap().achievement_pending);
+        agents[0].goal.as_mut().unwrap().achievement_pending = true;
+        agents[0].goal.as_mut().unwrap().achievement_observed_at_ms = 456_000;
+        apply_acknowledgements(&mut agents, &mut acknowledgements);
+        assert!(agents[0].goal.unwrap().achievement_pending);
+    }
+
+    #[test]
     fn acknowledgement_survives_unknown_evidence() {
         let id = "remote/remote-mac/session";
         let mut agents = vec![agent(id, AgentState::Unknown, Attention::Unknown)];
         agents[0].goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 7_920,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 7_920 },
             achievement_pending: true,
             achievement_observed_at_ms: 123_000,
         });
@@ -2103,7 +2133,7 @@ mod tests {
         )];
         agents[0].goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 7_920,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 7_920 },
             achievement_pending: true,
             achievement_observed_at_ms: 123_000,
         });
@@ -2122,7 +2152,7 @@ mod tests {
         let mut agents = vec![agent(id, AgentState::Working, Attention::Working)];
         agents[0].goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 7_920,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 7_920 },
             achievement_pending: true,
             achievement_observed_at_ms: 123_000,
         });
@@ -2154,7 +2184,7 @@ mod tests {
         let mut agents = vec![agent(id, AgentState::Working, Attention::Working)];
         agents[0].goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 7_920,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 7_920 },
             achievement_pending: false,
             achievement_observed_at_ms: 123_000,
         });
@@ -2178,7 +2208,7 @@ mod tests {
         )];
         agents[0].goal = Some(GoalInfo {
             state: GoalState::Pursuing,
-            elapsed_seconds: 5,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 5 },
             achievement_pending: false,
             achievement_observed_at_ms: 0,
         });
@@ -2199,7 +2229,7 @@ mod tests {
         let mut agents = vec![agent(id, AgentState::Idle, Attention::Done)];
         agents[0].goal = Some(GoalInfo {
             state: GoalState::Achieved,
-            elapsed_seconds: 42,
+            progress: crate::model::GoalProgress::Elapsed { seconds: 42 },
             achievement_pending: true,
             achievement_observed_at_ms: 456_000,
         });

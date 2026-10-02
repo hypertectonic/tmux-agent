@@ -51,8 +51,12 @@ current interrupt hints, and permission prompts retain their existing precedence
 Claude's live spinner/elapsed-time/token line immediately above the input box
 also signals an active turn, including when auxiliary status lines, tips, or an
 update notice follow it.
-Activity labels are opaque text, so punctuation, Unicode and custom wording
-do not change detection; the spinner, elapsed time and token counter are required.
+For timed activity, labels are opaque text, so punctuation, Unicode and custom
+wording do not change detection; the spinner, elapsed time and token counter are
+required. The exact live `Waiting for 1 background agent to finish` status, or
+its plural form with a positive count, also signals work with any recognized
+spinner frame. It needs no child-panel counters, even with the panel hidden or
+frozen. Generic waiting text does not signal activity.
 This check uses the bordered prompt and built-in footer marker, not the format
 of a custom status line. Recognized IDE and default child-panel rows may follow
 the footer. Unrecognized trailing output rejects the candidate. Completed turn
@@ -61,8 +65,12 @@ summaries do not signal activity.
 Claude's default visible child panel can keep the parent row working when a
 matching child's elapsed time or token count advances across captures. Selection
 circles and static counters are not enough: stopped children can retain both.
-The panel is recognized in its normal and keyboard-navigation layouts. The
+The panel is recognized in its normal and keyboard-navigation layouts, with
+`● main`, `◯ main`, or `⏺ main` as its main row. The
 navigation hint and row cursors do not change a child's tracked identity.
+Default navigation hints cover the main row and viewed or selected children,
+including collapse and stop-all hints. Rebound keys and custom panel layouts
+remain unsupported.
 Confirmation needs two observations, normally about one second apart. Progress
 expires after two seconds without an advancing counter, allowing rounded values
 to remain unchanged between captures. Waiting, idle, missing and ambiguous rows
@@ -70,8 +78,9 @@ clear their progress immediately. Foreground permission and alternate-view
 handling retain precedence.
 Confirmed child-panel descriptions are excluded from foreground permission,
 activity and alternate-view checks; their task wording does not set the parent
-state. Once child progress expires or changes to waiting, the validated prompt
-provides direct idle evidence without depending on the terminal title.
+state. Once child progress expires or changes to waiting, and no live foreground
+signal remains, the validated prompt provides direct idle evidence without
+depending on the terminal title.
 
 The scanner keeps this bounded tracking with each pane's existing capture cache;
 process replacement or pane removal drops it. The owned PTY runner uses the same
@@ -107,6 +116,25 @@ blocked > done > working > idle > unknown
 `done` is derived when an active agent becomes idle while its tmux window is
 not visible. Activating the row or using `acknowledge` marks the completion
 seen. Codex goal achievements use the same explicit acknowledgement boundary.
+Codex goal state and progress come from its visible status footer. Unbudgeted
+goals show elapsed time; budgeted goals show token usage and budget while pursuing,
+then token usage when achieved. Token counts reflect Codex's rounded display,
+not exact accounting. No objective text is collected. Detection
+supports the single-line footer and a status row immediately above known default
+shortcut, agent-navigation, queue, or warning hints. Warning notices may appear
+alone or beside a hint, including compact counts. Unrecognized hint text is not
+skipped, and detection never searches past the adjacent row into conversation
+history.
+
+Internally, goal progress is either elapsed seconds or token usage with an optional
+budget. Agent snapshots and owned-PTY runner state preserve the existing `goal`
+object for elapsed progress. Token progress uses the additive `token_goal` sibling
+with `used_tokens` and optional `budget_tokens`, never a fabricated elapsed time.
+Both forms carry the same goal state and achievement acknowledgement metadata.
+Older protocol-4 snapshot readers and protocol-2 runner readers ignore token goals
+without losing the agent or runner. New readers accept either form and reject
+conflicting non-null siblings. Neither protocol version changes.
+
 Within the idle bucket, top-level agents sort by the newer of their state-change
 time and their last successful focus through tmux-agent. The daemon keeps focus
 times in memory for its own tmux server and discards them when agents disappear
