@@ -15,6 +15,8 @@ The project uses semantic versioning.
 
 ### Fixed
 
+- Acknowledge a completed Claude child when selecting its parent pane, without
+  clearing sibling completions.
 - Report current cached SSH and Mosh focus bindings in diagnostics rather
   than relying only on inherited SSH connection metadata. Diagnostics distinguish
   binding evidence from verified inner-pane selection.

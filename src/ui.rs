@@ -1111,9 +1111,7 @@ async fn activate_record(
                 // Usage ordering is optional metadata. A successful focus must
                 // remain successful when an older daemon cannot record it.
                 let _ = ipc::mark_used(&context.paths.socket, &focus_record.id).await;
-                if activation_requires_acknowledgement(focus_record) {
-                    acknowledge_record(context.paths, snapshot, &focus_record.id).await?;
-                }
+                acknowledge_activation(context.paths, snapshot, &record, focus_record).await?;
                 if context.exit_after_focus {
                     return Ok(Activation::Close);
                 }
@@ -1131,9 +1129,7 @@ async fn activate_record(
                 outcome: FocusOutcome::TransportOnly,
                 notice,
             }) => {
-                if activation_requires_acknowledgement(focus_record) {
-                    acknowledge_record(context.paths, snapshot, &focus_record.id).await?;
-                }
+                acknowledge_activation(context.paths, snapshot, &record, focus_record).await?;
                 message.set_transient(
                     format!("{notice} ({})", focus_record.location()),
                     Instant::now(),
@@ -1142,11 +1138,11 @@ async fn activate_record(
             }
             Err(focus_error)
                 if focus_record.remote_alias.is_some()
-                    && (focus_record.attention == Attention::Done
-                        || has_pending_goal_outcome(focus_record))
+                    && (activation_requires_acknowledgement(&record)
+                        || activation_requires_acknowledgement(focus_record))
                     && is_focus_target_missing(&focus_error) =>
             {
-                acknowledge_record(context.paths, snapshot, &focus_record.id).await?;
+                acknowledge_activation(context.paths, snapshot, &record, focus_record).await?;
                 message.set_transient(
                     format!(
                         "acknowledged {}; focus unavailable: {focus_error:#}",
@@ -1186,6 +1182,26 @@ async fn activate_record(
 
 fn activation_requires_acknowledgement(record: &AgentRecord) -> bool {
     record.attention == Attention::Done || has_pending_goal_outcome(record)
+}
+
+async fn acknowledge_activation(
+    paths: &RuntimePaths,
+    snapshot: &mut Snapshot,
+    selected: &AgentRecord,
+    focused: &AgentRecord,
+) -> Result<()> {
+    // A metadata child selects its parent's pane, but owns its own completion.
+    let mut acknowledged = false;
+    for record in std::iter::once(selected).chain((focused.id != selected.id).then_some(focused)) {
+        if activation_requires_acknowledgement(record) {
+            ipc::acknowledge(&paths.socket, &record.id).await?;
+            acknowledged = true;
+        }
+    }
+    if acknowledged {
+        *snapshot = ipc::snapshot(&paths.socket, false).await?;
+    }
+    Ok(())
 }
 
 fn has_pending_goal_outcome(record: &AgentRecord) -> bool {
@@ -4484,18 +4500,29 @@ mod tests {
     }
 
     #[test]
-    fn popup_exact_focus_closes_when_mark_used_is_unsupported() {
+    fn exact_focus_acknowledges_selected_completion_when_mark_used_is_unsupported() {
         const CHILD_ENV: &str = "TMUX_AGENT_ACTIVATION_TEST_CHILD";
         if std::env::var_os(CHILD_ENV).is_some() {
             let runtime = tokio::runtime::Runtime::new().unwrap();
-            runtime.block_on(popup_exact_focus_with_unsupported_mark_used_child());
+            runtime.block_on(async {
+                popup_exact_focus_with_unsupported_mark_used_child(None, true).await;
+                for popup in [false, true] {
+                    for parent_attention in [Attention::Idle, Attention::Done] {
+                        popup_exact_focus_with_unsupported_mark_used_child(
+                            Some(parent_attention),
+                            popup,
+                        )
+                        .await;
+                    }
+                }
+            });
             return;
         }
 
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "ui::tests::popup_exact_focus_closes_when_mark_used_is_unsupported",
+                "ui::tests::exact_focus_acknowledges_selected_completion_when_mark_used_is_unsupported",
                 "--nocapture",
             ])
             .env(CHILD_ENV, "1")
@@ -4506,7 +4533,10 @@ mod tests {
         assert!(status.success());
     }
 
-    async fn popup_exact_focus_with_unsupported_mark_used_child() {
+    async fn popup_exact_focus_with_unsupported_mark_used_child(
+        claude_parent_attention: Option<Attention>,
+        popup: bool,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4561,22 +4591,50 @@ mod tests {
         record.window_id = window_id;
         record.pane_id = pane_id;
         let expected_id = record.id.clone();
+        let mut agents = vec![record];
+        let mut selected = 0;
+        let mut expected_acknowledgements = vec![expected_id.clone()];
+        if let Some(attention) = claude_parent_attention {
+            let parent = &mut agents[0];
+            parent.agent = "Claude".into();
+            parent.attention = attention;
+            parent.seen = attention != Attention::Done;
+            let mut child = parent.clone();
+            child.id = format!("{}/claude/session/100/child", parent.id);
+            child.attention = Attention::Done;
+            child.seen = false;
+            child.subagent = Some(SubagentInfo {
+                parent_id: parent.id.clone(),
+                started_at_ms: 1,
+                finished_at_ms: Some(2),
+                name: Some("reviewer".into()),
+                thread_id: None,
+            });
+            expected_acknowledgements = vec![child.id.clone()];
+            if attention == Attention::Done {
+                expected_acknowledgements.push(parent.id.clone());
+            }
+            let mut sibling = child.clone();
+            sibling.id = format!("{}/claude/session/100/sibling", parent.id);
+            agents.extend([child, sibling]);
+            selected = 1;
+        }
         let mut acknowledged_snapshot = Snapshot {
-            agents: vec![record.clone()],
+            agents: agents.clone(),
             ..Snapshot::default()
         };
-        acknowledged_snapshot.agents[0].attention = Attention::Idle;
-        acknowledged_snapshot.agents[0].seen = true;
+        let expected_count = expected_acknowledgements.len();
         let server = tokio::spawn(async move {
             let mut marked = None;
-            let mut acknowledged = None;
-            for _ in 0..3 {
+            let mut acknowledged = Vec::new();
+            loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (reader, mut writer) = stream.into_split();
                 let mut reader = BufReader::new(reader);
                 let mut line = String::new();
                 reader.read_line(&mut line).await.unwrap();
                 let request = serde_json::from_str::<crate::model::IpcRequest>(&line).unwrap();
+                let is_snapshot = matches!(request, crate::model::IpcRequest::Snapshot { .. });
                 let response = match request {
                     crate::model::IpcRequest::MarkUsed { target } => {
                         marked = Some(target);
@@ -4585,7 +4643,14 @@ mod tests {
                         }
                     }
                     crate::model::IpcRequest::Acknowledge { target } => {
-                        acknowledged = Some(target);
+                        let agent = acknowledged_snapshot
+                            .agents
+                            .iter_mut()
+                            .find(|agent| agent.id == target)
+                            .expect("acknowledgement must name a current record");
+                        agent.attention = Attention::Idle;
+                        agent.seen = true;
+                        acknowledged.push(target);
                         crate::model::IpcResponse::Ack
                     }
                     crate::model::IpcRequest::Snapshot { .. } => {
@@ -4598,12 +4663,15 @@ mod tests {
                 let mut response = serde_json::to_vec(&response).unwrap();
                 response.push(b'\n');
                 writer.write_all(&response).await.unwrap();
+                if acknowledged.len() == expected_count && is_snapshot {
+                    break;
+                }
             }
             (marked, acknowledged)
         });
         let tmux = Tmux::new(&config);
         let mut snapshot = Snapshot {
-            agents: vec![record],
+            agents,
             ..Snapshot::default()
         };
         let context = ActivationContext {
@@ -4611,11 +4679,11 @@ mod tests {
             tmux: &tmux,
             config: &config,
             config_path: Path::new("/tmp/tmux-agent-config.toml"),
-            exit_after_focus: true,
+            exit_after_focus: popup,
         };
         let mut message = UiMessage::default();
 
-        let activation = activate_record(&context, &mut snapshot, 0, &mut message)
+        let activation = activate_record(&context, &mut snapshot, selected, &mut message)
             .await
             .unwrap();
         let requests = tokio::time::timeout(Duration::from_millis(500), server).await;
@@ -4623,14 +4691,28 @@ mod tests {
         let _ = Command::new("tmux")
             .args(["-L", &socket_name, "kill-server"])
             .status();
-        assert_eq!(activation, Activation::Close);
+        assert_eq!(
+            activation,
+            if popup {
+                Activation::Close
+            } else {
+                Activation::Completed
+            }
+        );
         let (marked, acknowledged) = requests
             .expect("successful focus should finish optional usage and acknowledgement IPC")
             .unwrap();
         assert_eq!(marked.as_deref(), Some(expected_id.as_str()));
-        assert_eq!(acknowledged.as_deref(), Some(expected_id.as_str()));
-        assert_eq!(snapshot.agents[0].attention, Attention::Idle);
-        assert!(snapshot.agents[0].seen);
+        assert_eq!(acknowledged, expected_acknowledgements);
+        assert_eq!(snapshot.agents[selected].attention, Attention::Idle);
+        assert!(snapshot.agents[selected].seen);
+        if claude_parent_attention.is_some() {
+            assert_eq!(snapshot.agents[2].attention, Attention::Done);
+            assert!(
+                !snapshot.agents[2].seen,
+                "do not acknowledge sibling children"
+            );
+        }
     }
 
     #[tokio::test]
