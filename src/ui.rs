@@ -1143,7 +1143,7 @@ async fn activate_record(
             Err(focus_error)
                 if focus_record.remote_alias.is_some()
                     && (focus_record.attention == Attention::Done
-                        || has_pending_goal_achievement(focus_record))
+                        || has_pending_goal_outcome(focus_record))
                     && is_focus_target_missing(&focus_error) =>
             {
                 acknowledge_record(context.paths, snapshot, &focus_record.id).await?;
@@ -1185,14 +1185,14 @@ async fn activate_record(
 }
 
 fn activation_requires_acknowledgement(record: &AgentRecord) -> bool {
-    record.attention == Attention::Done || has_pending_goal_achievement(record)
+    record.attention == Attention::Done || has_pending_goal_outcome(record)
 }
 
-fn has_pending_goal_achievement(record: &AgentRecord) -> bool {
+fn has_pending_goal_outcome(record: &AgentRecord) -> bool {
     !matches!(record.state, AgentState::Working | AgentState::Blocked)
         && record
             .goal
-            .is_some_and(|goal| goal.state == GoalState::Achieved && goal.achievement_pending)
+            .is_some_and(|goal| goal.state.is_terminal() && goal.achievement_pending)
 }
 
 fn subagent_view_command(
@@ -1474,7 +1474,7 @@ fn render_agent_list(
                         .goal
                         .as_ref()
                         .filter(|goal| {
-                            goal.state == GoalState::Pursuing || has_pending_goal_achievement(agent)
+                            goal.state == GoalState::Pursuing || has_pending_goal_outcome(agent)
                         })
                         .map(|goal| goal_label(goal, list_width < 60))
                 })
@@ -1511,6 +1511,7 @@ fn render_agent_list(
                     } else {
                         match agent.goal.as_ref().map(|goal| goal.state) {
                             Some(GoalState::Achieved) => "goal✓".to_string(),
+                            Some(GoalState::Unmet) => "goal!".to_string(),
                             _ => "goal".to_string(),
                         }
                     }
@@ -1833,8 +1834,10 @@ fn goal_label(goal: &GoalInfo, compact: bool) -> String {
     let state = match (goal.state, compact) {
         (GoalState::Pursuing, false) => "Pursuing goal",
         (GoalState::Achieved, false) => "Goal achieved",
+        (GoalState::Unmet, false) => "Goal unmet",
         (GoalState::Pursuing, true) => "goal",
         (GoalState::Achieved, true) => "goal✓",
+        (GoalState::Unmet, true) => "goal!",
     };
     let progress = match goal.progress {
         crate::model::GoalProgress::Elapsed { seconds } => format_goal_duration(seconds),
@@ -2715,14 +2718,14 @@ mod tests {
             achievement_pending: true,
             achievement_observed_at_ms: 123_000,
         });
-        assert!(has_pending_goal_achievement(&agent));
+        assert!(has_pending_goal_outcome(&agent));
 
         agent.state = AgentState::Working;
-        assert!(!has_pending_goal_achievement(&agent));
+        assert!(!has_pending_goal_outcome(&agent));
 
         agent.state = AgentState::Idle;
         agent.goal.as_mut().unwrap().achievement_pending = false;
-        assert!(!has_pending_goal_achievement(&agent));
+        assert!(!has_pending_goal_outcome(&agent));
 
         agent.goal = Some(GoalInfo {
             state: GoalState::Pursuing,
@@ -2730,7 +2733,7 @@ mod tests {
             achievement_pending: false,
             achievement_observed_at_ms: 0,
         });
-        assert!(!has_pending_goal_achievement(&agent));
+        assert!(!has_pending_goal_outcome(&agent));
     }
 
     #[test]
@@ -3635,6 +3638,71 @@ mod tests {
         assert_eq!(first_title_x, eleventh_title_x);
         assert_eq!(first_title_x, 14);
         assert_eq!(terminal.backend().buffer()[(keycap_x, 6)].symbol(), " ");
+    }
+
+    #[test]
+    fn unmet_goal_labels_and_acknowledgement_keep_activity_precedence() {
+        for (width, label) in [
+            (100, "Goal unmet (50K / 50K)"),
+            (55, "goal! (50K / 50K)"),
+            (48, "goal!"),
+        ] {
+            let tokens = if width == 48 { u64::MAX } else { 50_000 };
+            let mut agent = test_agent("Codex", Attention::Idle, AgentOrigin::Tmux);
+            agent.state = AgentState::Idle;
+            agent.title = "task".into();
+            agent.goal = Some(GoalInfo {
+                state: GoalState::Unmet,
+                progress: crate::model::GoalProgress::Tokens {
+                    used: tokens,
+                    budget: Some(tokens),
+                },
+                achievement_pending: true,
+                achievement_observed_at_ms: 123,
+            });
+            let mut snapshot = Snapshot {
+                agents: vec![agent],
+                ..Snapshot::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            assert!(activation_requires_acknowledgement(&snapshot.agents[0]));
+            terminal
+                .draw(|frame| render(frame, &snapshot, 0, "", 5))
+                .unwrap();
+            let row = row_text(&terminal, 4);
+            assert!(row.contains(label), "{row}");
+            if width == 48 {
+                assert!(!row.contains("goal! ("), "narrow fallback: {row}");
+            }
+            assert!(
+                !row.contains("goal✓") && !row.contains("Goal achieved"),
+                "{row}"
+            );
+            for (state, attention) in [
+                (AgentState::Working, Attention::Working),
+                (AgentState::Blocked, Attention::Blocked),
+            ] {
+                snapshot.agents[0].state = state;
+                snapshot.agents[0].attention = attention;
+                assert!(!activation_requires_acknowledgement(&snapshot.agents[0]));
+                terminal
+                    .draw(|frame| render(frame, &snapshot, 0, "", 5))
+                    .unwrap();
+                assert!(!row_text(&terminal, 4).contains(label));
+            }
+            snapshot.agents[0].state = AgentState::Idle;
+            snapshot.agents[0].attention = Attention::Idle;
+            snapshot.agents[0]
+                .goal
+                .as_mut()
+                .unwrap()
+                .achievement_pending = false;
+            assert!(!activation_requires_acknowledgement(&snapshot.agents[0]));
+            terminal
+                .draw(|frame| render(frame, &snapshot, 0, "", 5))
+                .unwrap();
+            assert!(!row_text(&terminal, 4).contains(label));
+        }
     }
 
     #[test]

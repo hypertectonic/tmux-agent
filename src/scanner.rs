@@ -714,12 +714,10 @@ fn goal_lifecycle(
             Some(goal)
         }
         Some(mut goal) => {
-            let (pending, observed_at_ms, newly_achieved) = match old.and_then(|record| record.goal)
-            {
+            let (pending, observed_at_ms, new_outcome) = match old.and_then(|record| record.goal) {
                 Some(previous) if previous.state == GoalState::Pursuing => (true, now_ms, true),
                 Some(previous)
-                    if previous.state == GoalState::Achieved
-                        && previous.progress == goal.progress =>
+                    if previous.state == goal.state && previous.progress == goal.progress =>
                 {
                     (
                         previous.achievement_pending,
@@ -727,7 +725,7 @@ fn goal_lifecycle(
                         false,
                     )
                 }
-                Some(previous) if previous.state == GoalState::Achieved => (true, now_ms, true),
+                Some(previous) if previous.state.is_terminal() => (true, now_ms, true),
                 None if old.is_some_and(|record| {
                     matches!(record.state, AgentState::Working | AgentState::Blocked)
                 }) =>
@@ -736,12 +734,12 @@ fn goal_lifecycle(
                 }
                 _ => (false, 0, false),
             };
-            goal.achievement_pending = pending && (newly_achieved || !active || was_active);
+            goal.achievement_pending = pending && (new_outcome || !active || was_active);
             goal.achievement_observed_at_ms = observed_at_ms;
             Some(goal)
         }
         None => old.and_then(|record| record.goal).and_then(|mut goal| {
-            (goal.state == GoalState::Achieved).then(|| {
+            goal.state.is_terminal().then(|| {
                 if active && !was_active {
                     goal.achievement_pending = false;
                 }
@@ -1734,6 +1732,63 @@ mod tests {
             achieved.progress,
             crate::model::GoalProgress::Elapsed { seconds: 42 }
         );
+    }
+
+    #[test]
+    fn unmet_goal_lifecycle_preserves_acknowledgement_and_distinguishes_outcomes() {
+        let observe = |status| detect::detect("codex", "project", status).unwrap().goal;
+        let pursuing = observe("model · Pursuing goal (40K / 50K)");
+        let unmet = observe("model · Goal unmet (50K / 50K tokens)");
+        let mut previous = old(AgentState::Working, true);
+        previous.goal = pursuing;
+        previous.goal = goal_lifecycle(Some(&previous), AgentState::Working, unmet, 2_000);
+        let first = previous.goal.unwrap();
+        assert!(first.achievement_pending);
+        assert_eq!(first.state, GoalState::Unmet);
+        assert_eq!(first.achievement_observed_at_ms, 2_000);
+        previous.state = AgentState::Idle;
+        assert_eq!(
+            goal_lifecycle(Some(&previous), AgentState::Idle, unmet, 3_000),
+            Some(first)
+        );
+        assert_eq!(
+            goal_lifecycle(Some(&previous), AgentState::Idle, None, 3_000),
+            Some(first)
+        );
+
+        previous.goal.as_mut().unwrap().achievement_pending = false;
+        let acknowledged = previous.goal;
+        assert_eq!(
+            goal_lifecycle(Some(&previous), AgentState::Idle, unmet, 4_000),
+            acknowledged
+        );
+        assert_eq!(
+            goal_lifecycle(Some(&previous), AgentState::Idle, None, 4_000),
+            acknowledged
+        );
+        assert!(
+            !goal_lifecycle(None, AgentState::Idle, unmet, 4_000)
+                .unwrap()
+                .achievement_pending
+        );
+
+        // Even identical displayed progress cannot equate success and exhaustion.
+        let mut achieved = unmet.unwrap();
+        achieved.state = GoalState::Achieved;
+        previous.goal = goal_lifecycle(Some(&previous), AgentState::Idle, Some(achieved), 5_000);
+        assert!(previous.goal.unwrap().achievement_pending);
+        assert_eq!(previous.goal.unwrap().achievement_observed_at_ms, 5_000);
+        previous.goal = goal_lifecycle(Some(&previous), AgentState::Idle, unmet, 6_000);
+        assert!(previous.goal.unwrap().achievement_pending);
+        assert_eq!(previous.goal.unwrap().achievement_observed_at_ms, 6_000);
+
+        previous.goal = goal_lifecycle(Some(&previous), AgentState::Working, unmet, 7_000);
+        assert!(!previous.goal.unwrap().achievement_pending);
+        previous.goal = goal_lifecycle(Some(&previous), AgentState::Working, pursuing, 8_000);
+        previous.state = AgentState::Working;
+        let next = goal_lifecycle(Some(&previous), AgentState::Idle, unmet, 9_000).unwrap();
+        assert!(next.achievement_pending);
+        assert_eq!(next.achievement_observed_at_ms, 9_000);
     }
 
     #[test]
