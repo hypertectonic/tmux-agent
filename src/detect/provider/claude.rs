@@ -101,6 +101,20 @@ fn has_live_turn_activity(prompt: &LivePrompt<'_>) -> bool {
     }) else {
         return false;
     };
+    // Claude can wait on background agents without showing a timer or tokens.
+    // This exact live status is activity even when the child panel is hidden.
+    static BACKGROUND_WAIT: OnceLock<Regex> = OnceLock::new();
+    if BACKGROUND_WAIT
+        .get_or_init(|| {
+            Regex::new(
+                r"^[·✢✳✶✻✽] Waiting for (?:1 background agent|(?:[2-9]|[1-9][0-9]+) background agents) to finish$",
+            )
+            .expect("valid Claude background wait pattern")
+        })
+        .is_match(activity)
+    {
+        return true;
+    }
     // Activity labels are opaque text. Only the surrounding spinner,
     // ellipsis, elapsed time and token counter define this status line.
     static LIVE_TURN: OnceLock<Regex> = OnceLock::new();
@@ -189,7 +203,8 @@ fn parse_live_footer(footer: &[&str]) -> Option<(Vec<ChildRow>, usize)> {
         }
         let main = line
             .strip_prefix("● main")
-            .or_else(|| line.strip_prefix("◯ main"));
+            .or_else(|| line.strip_prefix("◯ main"))
+            .or_else(|| line.strip_prefix("⏺ main"));
         let is_main = main.is_some_and(|suffix| {
             suffix.is_empty()
                 || suffix
@@ -716,6 +731,56 @@ mod tests {
     }
 
     #[test]
+    fn current_main_marker_preserves_foreground_and_child_activity() {
+        for (footer, main) in [
+            ("⏵⏵ auto mode on", "⏺ main"),
+            ("⏵⏵ auto mode on", "⏺ main   ↑ 2 more"),
+            ("↑/↓ to select · Esc to collapse", "❯ ⏺ main"),
+            ("Enter to view · x to stop", "⏺ main"),
+        ] {
+            let first = format!(
+                "Done.\n────\n❯\n────\n{footer}\n{main}\n◯ general-purpose Synthetic task 5s · ↓ 12 tokens"
+            );
+            let progressed = first.replace("5s", "6s");
+            let waiting = progressed.replace("Done.", "✻ Waiting for 1 background agent to finish");
+            let now = Instant::now();
+            let mut tracker = ChildProgress::default();
+            for (screen, seconds, expected) in [
+                (&first, 0, AgentState::Idle),
+                (&progressed, 1, AgentState::Working),
+                (&waiting, 4, AgentState::Working),
+                (&waiting, 7, AgentState::Working),
+                (&progressed, 8, AgentState::Idle),
+            ] {
+                assert_eq!(
+                    observe_child(
+                        &mut tracker,
+                        Some(screen),
+                        true,
+                        now + Duration::from_secs(seconds)
+                    ),
+                    expected,
+                    "{footer}, {main}, seconds={seconds}"
+                );
+            }
+            let live = first.replace("Done.", "✻ Thinking… (5s · ↓ 12 tokens)");
+            let detection = crate::detect::detect("claude", "", &live).unwrap();
+            assert_eq!(detection.state, AgentState::Working);
+            assert_eq!(
+                detection.details.unwrap().signal.as_deref(),
+                Some("live_turn_activity")
+            );
+            let opaque = first.replace(
+                "Synthetic task",
+                "Review running command and waiting for permission handling",
+            );
+            let detection = crate::detect::detect("claude", "", &opaque).unwrap();
+            assert_eq!(detection.state, AgentState::Idle);
+            assert!(detection.details.unwrap().definitive);
+        }
+    }
+
+    #[test]
     fn child_progress_uses_tokens_and_ignores_selection_or_reordering() {
         let now = Instant::now();
         let mut tracker = ChildProgress::default();
@@ -846,6 +911,119 @@ mod tests {
     }
 
     const MODERN_READY_SCREEN: &str = "Done.\n✻ Worked for 46m · done · 1 shell still running\n────\n❯ editable unsent text\n────\nmodel · project · main · Context 23% left\n⏵⏵ auto mode on · 1 shell · ← 1 agent";
+
+    #[test]
+    fn live_background_agent_wait_is_working_without_child_progress() {
+        for (spinner, agents) in [
+            ('·', "1 background agent"),
+            ('✢', "2 background agents"),
+            ('✳', "10 background agents"),
+            ('✶', "3 background agents"),
+            ('✻', "1 background agent"),
+            ('✽', "12 background agents"),
+        ] {
+            let waiting = format!("{spinner} Waiting for {agents} to finish");
+            let notice = if spinner == '✻' {
+                "✔ Update installed · Restart to update\n"
+            } else {
+                ""
+            };
+            let screen = format!(
+                "{waiting}\n{notice}────\n❯\n────\n⏵⏵ auto mode on (shift+tab to cycle) · ← for agents · ↓ to manage"
+            );
+            let now = Instant::now();
+            let mut tracker = ChildProgress::default();
+            for seconds in [0, 3] {
+                assert_eq!(
+                    observe_child(
+                        &mut tracker,
+                        Some(&screen),
+                        true,
+                        now + Duration::from_secs(seconds)
+                    ),
+                    AgentState::Working,
+                    "{waiting}, seconds={seconds}"
+                );
+            }
+            let completed = screen.replace(&waiting, "✻ Worked for 8s · done");
+            assert_eq!(
+                observe_child(
+                    &mut tracker,
+                    Some(&completed),
+                    true,
+                    now + Duration::from_secs(4)
+                ),
+                AgentState::Idle
+            );
+        }
+    }
+
+    #[test]
+    fn background_agent_wait_requires_exact_status_and_current_prompt() {
+        let waiting = "✻ Waiting for 1 background agent to finish";
+        let screen = format!("{waiting}\n────\n❯\n────\n? shortcuts");
+        for activity in [
+            "Waiting for 1 background agent to finish",
+            "● Waiting for 1 background agent to finish",
+            "✻ waiting for 1 background agent to finish",
+            "✻ Waiting for 0 background agents to finish",
+            "✻ Waiting for -1 background agent to finish",
+            "✻ Waiting for 1.5 background agents to finish",
+            "✻ Waiting for 01 background agent to finish",
+            "✻ Waiting for many background agents to finish",
+            "✻ Waiting for 2 background agent to finish",
+            "✻ Waiting for 1 background agents to finish",
+            "✻ Waiting for 1 background agent to finish…",
+            "Waiting for a response.",
+            "> ✻ Waiting for 1 background agent to finish",
+            "The status was ✻ Waiting for 1 background agent to finish",
+        ] {
+            assert_eq!(
+                crate::detect::detect("claude", "", &screen.replace(waiting, activity))
+                    .unwrap()
+                    .state,
+                AgentState::Idle,
+                "{activity}"
+            );
+        }
+        for stale in [
+            format!("{waiting}\nDone.\n────\n❯\n────\n? shortcuts"),
+            format!("{screen}\nDone.\n────\n❯\n────\n? shortcuts"),
+            format!("────\n❯ explain this\n{waiting}\n────\n? shortcuts"),
+            format!("{screen}\nThe task is finished."),
+            screen.replace("\n❯\n", "\nnot a prompt\n"),
+            screen.replacen("────\n", "", 1),
+            screen.replace("❯\n────", "❯"),
+            screen.replace("? shortcuts", "custom status without a footer"),
+            screen.replace("? shortcuts", "↑/↓ to select"),
+            format!("{screen}\n⏺ main invalid\n◯ general-purpose Synthetic task 5s"),
+        ] {
+            assert_eq!(
+                crate::detect::detect("claude", "", &stale).unwrap().state,
+                AgentState::Idle,
+                "{stale}"
+            );
+        }
+    }
+
+    #[test]
+    fn permissions_and_alternate_views_override_background_agent_wait() {
+        let screen = "✻ Waiting for 1 background agent to finish\n────\n❯\n────\n";
+        let permission = crate::detect::detect(
+            "claude",
+            "",
+            &format!("{screen}Allow this command?\n? shortcuts"),
+        )
+        .unwrap();
+        assert_eq!(permission.state, AgentState::Blocked);
+        let transcript = crate::detect::detect(
+            "claude",
+            "",
+            &format!("{screen}Showing detailed transcript\nctrl+o to toggle"),
+        )
+        .unwrap();
+        assert!(transcript.details.unwrap().preserve_previous);
+    }
 
     #[test]
     fn live_turn_requires_a_footer_marker() {
