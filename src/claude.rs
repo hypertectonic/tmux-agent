@@ -394,11 +394,17 @@ fn refresh_child(
         metadata.mtime(),
         metadata.mtime_nsec(),
     );
-    if let Some(cached) = cache.get(path).filter(|cached| {
+    let name = read_json::<ChildName>(&path.with_extension("meta.json"), 16 * 1024)
+        .map(|metadata| metadata.agent_type)
+        .filter(|name| {
+            !name.is_empty() && name.len() <= 80 && name.chars().all(|c| !c.is_control())
+        });
+    if let Some(cached) = cache.get_mut(path).filter(|cached| {
         cached.stamp == stamp
             && cached.child.id == id
             && cached.retry_at.is_none_or(|retry_at| now < retry_at)
     }) {
+        cached.child.name = name;
         return Some(cached.child.clone());
     }
     let previous = cache.get(path).filter(|cached| {
@@ -409,6 +415,14 @@ fn refresh_child(
     let tail_start = metadata.len().saturating_sub(TAIL_BYTES);
     let offset = previous.map_or(tail_start, |cached| cached.offset.max(tail_start));
     let mut file = File::open(path).ok()?;
+    let starts_mid_line = if offset > 0 && previous.is_none_or(|cached| offset != cached.offset) {
+        file.seek(SeekFrom::Start(offset - 1)).ok()?;
+        let mut preceding = [0_u8; 1];
+        file.read_exact(&mut preceding).ok()?;
+        preceding[0] != b'\n'
+    } else {
+        false
+    };
     file.seek(SeekFrom::Start(offset)).ok()?;
     let mut bytes = Vec::new();
     file.take(TAIL_BYTES).read_to_end(&mut bytes).ok()?;
@@ -416,10 +430,7 @@ fn refresh_child(
     let mut consumed = offset;
     let mut retry_at = None;
     let mut lines = bytes.split_inclusive(|b| *b == b'\n');
-    if offset > 0
-        && previous.is_none_or(|cached| offset != cached.offset)
-        && let Some(partial) = lines.next()
-    {
+    if starts_mid_line && let Some(partial) = lines.next() {
         consumed += partial.len() as u64;
     }
     for line in lines.filter(|line| line.ends_with(b"\n")) {
@@ -472,11 +483,7 @@ fn refresh_child(
         .then_some(timestamp);
     }
     let mut child = child?;
-    child.name = read_json::<ChildName>(&path.with_extension("meta.json"), 16 * 1024)
-        .map(|metadata| metadata.agent_type)
-        .filter(|name| {
-            !name.is_empty() && name.len() <= 80 && name.chars().all(|c| !c.is_control())
-        });
+    child.name = name;
     cache.insert(
         path.into(),
         CachedChild {
@@ -830,5 +837,49 @@ mod tests {
                 .finished_at_ms,
             Some(START + 3_000)
         );
+    }
+
+    #[test]
+    fn late_sidecar_and_renamed_agent_type_refresh_without_transcript_writes() {
+        let mut fixture = Fixture::new();
+        fixture.append("root", "one", 1, false);
+        let sidecar = fixture.path("root", "one").with_extension("meta.json");
+        fs::remove_file(&sidecar).unwrap();
+        let first = fixture.scan(1_000);
+        let id = children(&first)[0].id.clone();
+        assert!(first[&id].subagent.as_ref().unwrap().name.is_none());
+        fs::write(&sidecar, json!({"agentType":"reviewer"}).to_string()).unwrap();
+        let second = fixture.scan(2_000);
+        assert_eq!(
+            second[&id].subagent.as_ref().unwrap().name.as_deref(),
+            Some("reviewer")
+        );
+        fs::write(&sidecar, json!({"agentType":"researcher"}).to_string()).unwrap();
+        let third = fixture.scan(3_000);
+        assert_eq!(
+            third[&id].subagent.as_ref().unwrap().name.as_deref(),
+            Some("researcher")
+        );
+        assert_eq!(third[&id].title, "researcher");
+    }
+
+    #[test]
+    fn bounded_tail_keeps_first_complete_event_when_start_is_newline_aligned() {
+        let mut fixture = Fixture::new();
+        fixture.append("root", "one", 1, false);
+        let path = fixture.path("root", "one");
+        let event = fs::read(&path).unwrap();
+        let mut bytes = b"{}\n".to_vec();
+        bytes.extend_from_slice(&event);
+        bytes.extend(std::iter::repeat_n(
+            b' ',
+            TAIL_BYTES as usize - event.len() - 1,
+        ));
+        bytes.push(b'\n');
+        assert_eq!(bytes.len() as u64, TAIL_BYTES + 3);
+        fs::write(&path, bytes).unwrap();
+        let records = fixture.scan(1_000);
+        assert_eq!(children(&records).len(), 1);
+        assert_eq!(children(&records)[0].state, AgentState::Working);
     }
 }

@@ -208,8 +208,10 @@ can still animate a parent whose child has no fresh metadata.
 
 Filesystem discovery runs at most once per second and adds no subprocesses or
 pane captures. Each session examines at most 4,096 directory entries and keeps
-the newest 128 child transcript files among them. Unchanged files reuse cached
-metadata; changed files read at most 256 KiB from their unread suffix or tail.
+the newest 128 child transcript files among them. Unchanged transcripts reuse
+cached lifecycle metadata; bounded name sidecars refresh on each poll. Changed
+transcripts read at most 256 KiB from their unread suffix or tail, plus one
+preceding byte when needed to distinguish a partial line from a complete event.
 Partial lines wait for completion and oversized lines are skipped. Events newer
 than the scan's timestamp remain unread until a normal later poll, even if the
 file does not change again. Registry and
