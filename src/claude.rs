@@ -186,7 +186,7 @@ impl ChildTracker {
                             fs::symlink_metadata(&path)
                                 .ok()
                                 .filter(|meta| meta.is_file())
-                                .map(|meta| (meta.mtime(), path))
+                                .map(|meta| ((meta.mtime(), meta.mtime_nsec()), path))
                         })
                         .collect();
                     paths.sort();
@@ -881,5 +881,35 @@ mod tests {
         let records = fixture.scan(1_000);
         assert_eq!(children(&records).len(), 1);
         assert_eq!(children(&records)[0].state, AgentState::Working);
+    }
+
+    #[test]
+    fn newest_child_within_one_second_survives_the_child_limit() {
+        let mut fixture = Fixture::new();
+        let second = std::time::UNIX_EPOCH + std::time::Duration::from_millis(START);
+        for index in 0..MAX_CHILDREN {
+            let id = format!("older-{index:03}");
+            fixture.append("root", &id, 1, false);
+            File::options()
+                .write(true)
+                .open(fixture.path("root", &id))
+                .unwrap()
+                .set_modified(second + std::time::Duration::from_nanos(100))
+                .unwrap();
+        }
+        fixture.append("root", "a-newest", 1, false);
+        File::options()
+            .write(true)
+            .open(fixture.path("root", "a-newest"))
+            .unwrap()
+            .set_modified(second + std::time::Duration::from_nanos(900_000_000))
+            .unwrap();
+        let records = fixture.scan(1_000);
+        assert_eq!(children(&records).len(), MAX_CHILDREN);
+        assert!(
+            children(&records)
+                .iter()
+                .any(|child| child.id.ends_with("/a-newest"))
+        );
     }
 }
