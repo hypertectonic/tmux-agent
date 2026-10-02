@@ -84,6 +84,13 @@ pub enum AgentOrigin {
 pub enum GoalState {
     Pursuing,
     Achieved,
+    Unmet,
+}
+
+impl GoalState {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Achieved | Self::Unmet)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,16 +117,17 @@ pub struct GoalInfo {
     pub state: GoalState,
     #[serde(flatten)]
     pub progress: GoalProgress,
+    // Legacy wire names cover notification/acknowledgement of both terminal outcomes.
     #[serde(default, skip_serializing_if = "is_false")]
     pub achievement_pending: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub achievement_observed_at_ms: u64,
 }
 
-// Old readers require elapsed_seconds in `goal`. Keep token progress in an
-// additive sibling so they retain the agent or runner and ignore only its goal.
+// Old readers require elapsed_seconds in `goal` and know only pursuing/achieved.
+// Additive siblings let them retain the agent or runner and ignore only its goal.
 pub(crate) mod goal_wire {
-    use super::{GoalInfo, GoalProgress};
+    use super::{GoalInfo, GoalProgress, GoalState};
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
 
     #[derive(Default, Serialize, Deserialize)]
@@ -128,6 +136,21 @@ pub(crate) mod goal_wire {
         goal: Option<GoalInfo>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_goal: Option<GoalInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unmet_goal: Option<UnmetGoal>,
+    }
+
+    // Keep this budgeted outcome out of both pre-unmet wire fields. Required
+    // token fields also prevent an elapsed-only or budgetless unmet outcome.
+    #[derive(Serialize, Deserialize)]
+    struct UnmetGoal {
+        state: GoalState,
+        used_tokens: u64,
+        budget_tokens: u64,
+        #[serde(default, skip_serializing_if = "super::is_false")]
+        achievement_pending: bool,
+        #[serde(default, skip_serializing_if = "super::is_zero")]
+        achievement_observed_at_ms: u64,
     }
 
     pub fn serialize<S: Serializer>(
@@ -136,9 +159,29 @@ pub(crate) mod goal_wire {
     ) -> Result<S::Ok, S::Error> {
         let mut wire = GoalWire::default();
         if let Some(goal) = goal {
-            match goal.progress {
-                GoalProgress::Elapsed { .. } => wire.goal = Some(*goal),
-                GoalProgress::Tokens { .. } => wire.token_goal = Some(*goal),
+            match (goal.state, goal.progress) {
+                (
+                    GoalState::Unmet,
+                    GoalProgress::Tokens {
+                        used,
+                        budget: Some(budget),
+                    },
+                ) => {
+                    wire.unmet_goal = Some(UnmetGoal {
+                        state: GoalState::Unmet,
+                        used_tokens: used,
+                        budget_tokens: budget,
+                        achievement_pending: goal.achievement_pending,
+                        achievement_observed_at_ms: goal.achievement_observed_at_ms,
+                    });
+                }
+                (GoalState::Unmet, _) => {
+                    return Err(serde::ser::Error::custom(
+                        "unmet goal requires token usage and budget",
+                    ));
+                }
+                (_, GoalProgress::Elapsed { .. }) => wire.goal = Some(*goal),
+                (_, GoalProgress::Tokens { .. }) => wire.token_goal = Some(*goal),
             }
         }
         wire.serialize(serializer)
@@ -148,17 +191,34 @@ pub(crate) mod goal_wire {
         deserializer: D,
     ) -> Result<Option<GoalInfo>, D::Error> {
         let wire = GoalWire::deserialize(deserializer)?;
-        match (wire.goal, wire.token_goal) {
-            (None, None) => Ok(None),
-            (Some(goal), None) if matches!(goal.progress, GoalProgress::Elapsed { .. }) => {
+        match (wire.goal, wire.token_goal, wire.unmet_goal) {
+            (None, None, None) => Ok(None),
+            (Some(goal), None, None)
+                if goal.state != GoalState::Unmet
+                    && matches!(goal.progress, GoalProgress::Elapsed { .. }) =>
+            {
                 Ok(Some(goal))
             }
-            (None, Some(goal)) if matches!(goal.progress, GoalProgress::Tokens { .. }) => {
+            (None, Some(goal), None)
+                if goal.state != GoalState::Unmet
+                    && matches!(goal.progress, GoalProgress::Tokens { .. }) =>
+            {
                 Ok(Some(goal))
             }
-            (Some(_), Some(_)) => Err(D::Error::custom("conflicting goal and token_goal")),
+            (None, None, Some(goal)) if goal.state == GoalState::Unmet => Ok(Some(GoalInfo {
+                state: GoalState::Unmet,
+                progress: GoalProgress::Tokens {
+                    used: goal.used_tokens,
+                    budget: Some(goal.budget_tokens),
+                },
+                achievement_pending: goal.achievement_pending,
+                achievement_observed_at_ms: goal.achievement_observed_at_ms,
+            })),
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
+                Err(D::Error::custom("conflicting goal fields"))
+            }
             _ => Err(D::Error::custom(
-                "goal progress does not match its wire field",
+                "goal state or progress does not match its wire field",
             )),
         }
     }
@@ -717,6 +777,116 @@ mod tests {
         assert!(record.goal.is_none());
         assert!(record.subagent.is_none());
         assert!(record.detection.is_none());
+    }
+
+    #[test]
+    fn unmet_goal_wire_preserves_pre_unmet_snapshot_readers() {
+        #[derive(Deserialize)]
+        #[serde(tag = "state", rename_all = "snake_case")]
+        enum OldGoal {
+            Pursuing,
+            Achieved,
+        }
+        #[derive(Deserialize)]
+        struct OldAgent {
+            id: String,
+            state: AgentState,
+            goal: Option<OldGoal>,
+            token_goal: Option<OldGoal>,
+        }
+        #[derive(Deserialize)]
+        struct OldSnapshot {
+            protocol: u32,
+            agents: Vec<OldAgent>,
+        }
+
+        let mut agent = sortable_agent("1", "work", Attention::Idle, 1);
+        let goal = GoalInfo {
+            state: GoalState::Unmet,
+            progress: GoalProgress::Tokens {
+                used: 50_500,
+                budget: Some(50_000),
+            },
+            achievement_pending: true,
+            achievement_observed_at_ms: 123,
+        };
+        agent.goal = Some(goal);
+        let snapshot = Snapshot {
+            protocol: PROTOCOL_VERSION,
+            agents: vec![agent],
+            ..Snapshot::default()
+        };
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert!(encoded["agents"][0].get("goal").is_none());
+        assert!(encoded["agents"][0].get("token_goal").is_none());
+        assert_eq!(
+            encoded["agents"][0]["unmet_goal"],
+            serde_json::json!({
+                "state": "unmet", "used_tokens": 50_500, "budget_tokens": 50_000,
+                "achievement_pending": true, "achievement_observed_at_ms": 123
+            })
+        );
+        let old: OldSnapshot = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(old.protocol, PROTOCOL_VERSION);
+        assert_eq!(old.agents.len(), 1);
+        assert_eq!(old.agents[0].id, "1");
+        assert_eq!(old.agents[0].state, AgentState::Idle);
+        assert!(old.agents[0].goal.is_none());
+        assert!(old.agents[0].token_goal.is_none());
+        assert_eq!(
+            serde_json::from_value::<Snapshot>(encoded).unwrap().agents[0].goal,
+            Some(goal)
+        );
+    }
+
+    #[test]
+    fn unmet_goal_wire_rejects_wrong_state_progress_and_conflicts() {
+        let agent = sortable_agent("1", "work", Attention::Idle, 1);
+        let unmet =
+            serde_json::json!({"state": "unmet", "used_tokens": 50_500, "budget_tokens": 50_000});
+        for field in ["goal", "token_goal"] {
+            let mut encoded = serde_json::to_value(&agent).unwrap();
+            encoded[field] = unmet.clone();
+            assert!(serde_json::from_value::<AgentRecord>(encoded.clone()).is_err());
+            encoded[field] = if field == "goal" {
+                serde_json::json!({"state": "pursuing", "elapsed_seconds": 42})
+            } else {
+                serde_json::json!({"state": "pursuing", "used_tokens": 40_000, "budget_tokens": 50_000})
+            };
+            encoded["unmet_goal"] = unmet.clone();
+            assert!(serde_json::from_value::<AgentRecord>(encoded).is_err());
+        }
+        for invalid in [
+            serde_json::json!({"state": "achieved", "used_tokens": 50_500, "budget_tokens": 50_000}),
+            serde_json::json!({"state": "pursuing", "used_tokens": 50_500, "budget_tokens": 50_000}),
+            serde_json::json!({"state": "unmet", "used_tokens": 50_500}),
+            serde_json::json!({"state": "unmet", "elapsed_seconds": 42}),
+        ] {
+            let mut encoded = serde_json::to_value(&agent).unwrap();
+            encoded["unmet_goal"] = invalid;
+            assert!(serde_json::from_value::<AgentRecord>(encoded).is_err());
+        }
+        let mut encoded = serde_json::to_value(&agent).unwrap();
+        encoded["unmet_goal"] = unmet.clone();
+        encoded["unmet_goal"]["future_metadata"] = serde_json::json!(true);
+        let restored = serde_json::from_value::<AgentRecord>(encoded).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap()["unmet_goal"], unmet);
+        for progress in [
+            GoalProgress::Elapsed { seconds: 42 },
+            GoalProgress::Tokens {
+                used: 50_000,
+                budget: None,
+            },
+        ] {
+            let mut invalid = agent.clone();
+            invalid.goal = Some(GoalInfo {
+                state: GoalState::Unmet,
+                progress,
+                achievement_pending: false,
+                achievement_observed_at_ms: 0,
+            });
+            assert!(serde_json::to_value(invalid).is_err());
+        }
     }
 
     #[test]

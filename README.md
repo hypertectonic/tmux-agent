@@ -104,6 +104,11 @@ Linux release archives require glibc 2.35 or newer. Windows is not supported.
   beneath their actual parent.
 - Local and SSH-federated machines in one view.
 
+Codex budget exhaustion appears as `Goal unmet`, or `goal!` in a narrow view,
+not as goal achievement. Like achieved goals, the notice waits for working or
+blocked activity to finish and clears when acknowledged by activation or `a`.
+The ordinary `done` state means the turn finished, not that the goal succeeded.
+
 A session's activity indicator animates while the parent or any recognized
 descendant is working. The parent keeps its own state, completion and
 acknowledgement behavior; `1 subagent working` or `2 subagents working` explains

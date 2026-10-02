@@ -995,6 +995,48 @@ mod tests {
     }
 
     #[test]
+    fn unmet_goal_wire_preserves_pre_unmet_runner_readers() {
+        #[derive(Deserialize)]
+        #[serde(tag = "state", rename_all = "snake_case")]
+        enum OldGoal {
+            Pursuing,
+            Achieved,
+        }
+        #[derive(Deserialize)]
+        struct OldRunner {
+            protocol: u32,
+            run_id: String,
+            state: AgentState,
+            goal: Option<OldGoal>,
+            token_goal: Option<OldGoal>,
+        }
+        let mut state = state(123);
+        state.goal =
+            crate::detect::detect("codex", "project", "model · Goal unmet (50K / 50K tokens)")
+                .unwrap()
+                .goal;
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert!(encoded.get("goal").is_none());
+        assert!(encoded.get("token_goal").is_none());
+        assert_eq!(
+            encoded["unmet_goal"],
+            serde_json::json!({
+                "state": "unmet", "used_tokens": 50_000, "budget_tokens": 50_000
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RunnerState>(encoded.clone()).unwrap(),
+            state
+        );
+        let old: OldRunner = serde_json::from_value(encoded).unwrap();
+        assert_eq!(old.protocol, RUNNER_PROTOCOL);
+        assert_eq!(old.run_id, state.run_id);
+        assert_eq!(old.state, state.state);
+        assert!(old.goal.is_none());
+        assert!(old.token_goal.is_none());
+    }
+
+    #[test]
     fn token_goal_wire_preserves_legacy_runner_readers() {
         #[derive(Deserialize)]
         struct LegacyGoal {

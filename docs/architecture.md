@@ -115,10 +115,12 @@ blocked > done > working > idle > unknown
 
 `done` is derived when an active agent becomes idle while its tmux window is
 not visible. Activating the row or using `acknowledge` marks the completion
-seen. Codex goal achievements use the same explicit acknowledgement boundary.
+seen. Codex terminal goal outcomes use the same explicit acknowledgement boundary.
 Codex goal state and progress come from its visible status footer. Unbudgeted
 goals show elapsed time; budgeted goals show token usage and budget while pursuing,
-then token usage when achieved. Token counts reflect Codex's rounded display,
+then token usage when achieved. Budget exhaustion is a separate `unmet` outcome
+with both usage and budget, displayed as `Goal unmet` or compact `goal!`, never
+`Goal achieved` or `goal✓`. Token counts reflect Codex's rounded display,
 not exact accounting. No objective text is collected. Detection
 supports the single-line footer and a status row immediately above known default
 shortcut, agent-navigation, queue, or warning hints. Warning notices may appear
@@ -130,10 +132,22 @@ Internally, goal progress is either elapsed seconds or token usage with an optio
 budget. Agent snapshots and owned-PTY runner state preserve the existing `goal`
 object for elapsed progress. Token progress uses the additive `token_goal` sibling
 with `used_tokens` and optional `budget_tokens`, never a fabricated elapsed time.
-Both forms carry the same goal state and achievement acknowledgement metadata.
-Older protocol-4 snapshot readers and protocol-2 runner readers ignore token goals
-without losing the agent or runner. New readers accept either form and reject
-conflicting non-null siblings. Neither protocol version changes.
+Unmet goals use a separate additive `unmet_goal` sibling with state `unmet` and
+required `used_tokens` and `budget_tokens`. The existing `goal` and `token_goal`
+forms retain only pursuing/achieved states. Older protocol-4 snapshot readers and
+protocol-2 runner readers ignore unsupported goal details without losing the
+agent or runner. New readers reject conflicting non-null siblings and mismatched
+states or progress. Neither protocol version changes.
+
+All forms share acknowledgement metadata. The existing `achievement_pending`,
+`achievement_observed_at_ms`, and persisted `goal_achievements` names cover both
+achieved and unmet outcomes. A transition from pursuing, an active turn, or a
+different outcome/progress creates a pending notice; a historical outcome first
+seen while idle does not. Working and blocked activity take precedence, deferring
+the goal notice until inactive. Focus/activation, `acknowledge`, and mark-all-read
+clear the notice. Repeated cached footers cannot restore an acknowledged notice;
+a new pursuit or changed outcome/progress can create a new one. Ordinary `done`
+attention means the turn finished, not that the goal succeeded.
 
 Within the idle bucket, top-level agents sort by the newer of their state-change
 time and their last successful focus through tmux-agent. The daemon keeps focus

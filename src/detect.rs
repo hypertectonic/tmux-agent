@@ -111,7 +111,7 @@ pub fn stable_title(agent: &str, title: &str) -> Option<String> {
 fn detect_codex_goal(screen: &str) -> Option<GoalInfo> {
     static GOAL: OnceLock<Regex> = OnceLock::new();
     let pattern = GOAL.get_or_init(|| {
-        Regex::new(r"(Pursuing goal|Goal achieved) \(([^()]*)\)\s*$")
+        Regex::new(r"(Pursuing goal|Goal achieved|Goal unmet) \(([^()]*)\)\s*$")
             .expect("Codex goal footer regex is valid")
     });
     let mut lines = screen
@@ -131,10 +131,18 @@ fn detect_codex_goal(screen: &str) -> Option<GoalInfo> {
     let state = match captures.get(1)?.as_str() {
         "Pursuing goal" => GoalState::Pursuing,
         "Goal achieved" => GoalState::Achieved,
+        "Goal unmet" => GoalState::Unmet,
         _ => return None,
     };
     let usage = captures.get(2)?.as_str();
     let progress = match state {
+        GoalState::Unmet => {
+            let (used, budget) = usage.strip_suffix(" tokens")?.split_once(" / ")?;
+            GoalProgress::Tokens {
+                used: parse_goal_tokens(used)?,
+                budget: Some(parse_goal_tokens(budget)?),
+            }
+        }
         GoalState::Pursuing if usage.contains(" / ") => {
             let (used, budget) = usage.split_once(" / ")?;
             GoalProgress::Tokens {
@@ -448,6 +456,32 @@ mod tests {
     }
 
     #[test]
+    fn codex_unmet_goal_footer_preserves_budget_in_both_layouts() {
+        for suffix in ["", "\n? for shortcuts", "\n⚠ 1 warning · f2 to view"] {
+            let screen = format!("model · Goal unmet (50.5K / 50K tokens){suffix}");
+            for (title, state) in [
+                ("project", AgentState::Idle),
+                ("⠸ project", AgentState::Working),
+                ("Action required", AgentState::Blocked),
+            ] {
+                let detected = detect("codex", title, &screen).unwrap();
+                assert_eq!(detected.state, state);
+                let goal = detected.goal.expect("budget exhaustion is a goal outcome");
+                assert_eq!(serde_json::to_value(goal.state).unwrap(), "unmet");
+                assert_eq!(
+                    goal.progress,
+                    GoalProgress::Tokens {
+                        used: 50_500,
+                        budget: Some(50_000)
+                    }
+                );
+                let stale = format!("{screen}\n› Next request\nmodel · Ready{suffix}");
+                assert!(detect("codex", title, &stale).unwrap().goal.is_none());
+            }
+        }
+    }
+
+    #[test]
     fn codex_goal_footer_reports_token_progress() {
         for (status, state, used, budget) in [
             (
@@ -498,6 +532,11 @@ mod tests {
         for status in [
             "Pursuing goal (40K tokens)",
             "Goal achieved (40K / 50K)",
+            "Goal unmet (50K tokens)",
+            "Goal unmet (50K / 50K)",
+            "Goal unmet (42s)",
+            "Goal unmet (50K / 50k tokens)",
+            "Goal unmet (50K / 18446744073709551616 tokens)",
             "Pursuing goal (40k / 50K)",
             "Pursuing goal (1.234K / 50K)",
             "Pursuing goal (1.5 / 50K)",
