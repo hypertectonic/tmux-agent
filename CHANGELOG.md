@@ -4,6 +4,27 @@ All notable changes to `tmux-agent` will be documented in this file.
 
 The project uses semantic versioning.
 
+## [0.11.0] - 2026-10-02
+
+### Added
+
+- Show recognized Claude children beneath their verified parent using local
+  session and lifecycle metadata. Selecting a child focuses its parent.
+- Display budget-exhausted Codex goals as `Goal unmet` or compact `goal!`,
+  with completion acknowledgement and backward-compatible snapshot fields.
+
+### Fixed
+
+- Report current cached SSH and Mosh focus bindings in diagnostics rather
+  than relying only on inherited SSH connection metadata. Diagnostics distinguish
+  binding evidence from verified inner-pane selection.
+
+### Documentation
+
+- Permit folder-trust confirmation for an explicitly requested workspace
+  worker in its verified checkout, while retaining checks for unexpected paths,
+  authentication and broader permissions.
+
 ## [0.10.2] - 2026-10-02
 
 ### Fixed
