@@ -112,8 +112,34 @@ protocol version. Restart the central daemon after correcting configuration.
 
 ## Remote focus fails
 
-Remote focus requires a unique local tmux pane carrying the matching SSH
-connection, an ordinary-terminal mosh pane whose client process names the
+First separate federation health from focus. A healthy `peer:<name>` check
+means the collector is connected with a compatible protocol. It does not mean
+an interactive SSH or Mosh attachment exists or that inner selection succeeded.
+`focus:<name>` reports how many remote records have a cached local transport
+binding in the daemon snapshot. Doctor does not select or verify an inner pane.
+
+Current remote tmux records use `session_connections`, not the agent's inherited
+`ssh_connection`. The old warning "no remote record currently exposes an SSH
+connection tuple" can therefore appear even when a live SSH or Mosh attachment
+has a resolved `focus_target`. That warning alone does not prove focus is broken.
+
+If no attachment evidence is reported, attach the remote session through a local
+SSH or Mosh tmux pane and refresh. Persistent sessions survive disconnection,
+but their transport binding does not. Reconnection discovers the new client on
+subsequent scans. Incomplete inspection can also leave attachment evidence
+absent. If evidence exists without a binding, inspect the local transport panes
+for a missing match or multiple matches. `tmux-agent explain <id-or-pane>` shows
+the selected record; an alias-level check may include other unbound records.
+
+A snapshot binding still needs live revalidation during focus. Inner tmux
+selection also needs structured `[[machine]]` configuration and the peer's
+`remote_tmux_focus_v1` capability. Raw collectors, older peers, and some explicit
+or legacy bindings support only outer transport focus. When testing, verify the
+requested inner window and pane, not just the outer SSH or Mosh pane. See
+[remote focus](remote-machines.md#remote-focus) for confirmation and failure behavior.
+
+Remote focus requires a unique local tmux pane carrying the matching live SSH
+or Mosh session attachment, an ordinary-terminal mosh pane whose client process names the
 configured remote and whose normalized title matches, or a mirror pane with
 the public remote marker options. Multiple matching panes are rejected.
 Ordinary-terminal mosh focus never uses title alone, never claims an explicitly
