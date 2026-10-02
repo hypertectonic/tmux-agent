@@ -171,7 +171,10 @@ owners, including two live processes resuming the same session, are rejected.
 Working-directory similarity and display labels never establish ownership.
 The record ID includes the parent, Claude session and child IDs, and the
 provider's full kernel start value. A replacement process cannot inherit cached
-children. Old events predating that process are not treated as current work.
+children. Provider lifetime is tracked separately from the optional tmux
+foreground-group identity, so ordinary terminals and unmatched owned PTYs also
+support metadata discovery. Old events predating that process are not treated
+as current work.
 
 Only that registry working directory's project/session `subagents` directory is
 examined. Claude documents the stable `agent-{agentId}.jsonl` path and reuses the
@@ -207,7 +210,9 @@ Filesystem discovery runs at most once per second and adds no subprocesses or
 pane captures. Each session examines at most 4,096 directory entries and keeps
 the newest 128 child transcript files among them. Unchanged files reuse cached
 metadata; changed files read at most 256 KiB from their unread suffix or tail.
-Partial lines wait for completion and oversized lines are skipped. Registry and
+Partial lines wait for completion and oversized lines are skipped. Events newer
+than the scan's timestamp remain unread until a normal later poll, even if the
+file does not change again. Registry and
 name files are limited to 16 KiB. This bounded adapter does not replay parent
 transcripts or recursively search projects. Federation carries only ordinary
 derived child records, never local transcript content.

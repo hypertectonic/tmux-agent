@@ -60,6 +60,14 @@ struct Child {
 struct CachedChild {
     stamp: (u64, u64, i64, i64),
     offset: u64,
+    retry_at: Option<u64>,
+    child: Child,
+}
+
+struct Observation {
+    parent_id: String,
+    parent_process: Option<crate::model::ProcessIdentity>,
+    provider_process: crate::model::ProcessIdentity,
     child: Child,
 }
 
@@ -68,7 +76,7 @@ pub(crate) struct ChildTracker {
     home: Option<PathBuf>,
     last_scan: Option<u64>,
     files: HashMap<PathBuf, CachedChild>,
-    observations: Vec<(String, crate::model::ProcessIdentity, Child)>,
+    observations: Vec<Observation>,
 }
 
 impl ChildTracker {
@@ -151,8 +159,10 @@ impl ChildTracker {
                 }
                 for owners in owners.into_values().filter(|owners| owners.len() == 1) {
                     let (parent_id, session, start) = owners.into_iter().next().unwrap();
-                    let Some(parent_process) = records[&parent_id].process else {
-                        continue;
+                    let parent_process = records[&parent_id].process;
+                    let provider_process = crate::model::ProcessIdentity {
+                        pid: session.pid,
+                        started_at_ms: Some(start),
                     };
                     let project = project_name(&session.cwd);
                     let directory = home
@@ -204,21 +214,45 @@ impl ChildTracker {
                             now,
                         ) && child.last_event >= start
                         {
-                            self.observations
-                                .push((parent_id.clone(), parent_process, child));
+                            self.observations.push(Observation {
+                                parent_id: parent_id.clone(),
+                                parent_process,
+                                provider_process,
+                                child,
+                            });
                         }
                     }
                 }
             }
             self.files.retain(|path, _| visited.contains(path));
         }
-        for (parent_id, process, child) in &self.observations {
-            let Some(parent) = records
-                .get(parent_id)
-                .filter(|record| record.process.as_ref() == Some(process))
-            else {
+        let mut current_starts = HashMap::new();
+        for Observation {
+            parent_id,
+            parent_process,
+            provider_process,
+            child,
+        } in &self.observations
+        {
+            let Some(parent) = records.get(parent_id).filter(|record| {
+                record.agent == "Claude"
+                    && record.subagent.is_none()
+                    && record.process == *parent_process
+            }) else {
                 continue;
             };
+            // Terminal and unmatched owned-PTY records have no foreground-group
+            // identity. Keep their verified provider lifetime separate instead.
+            if !record_pids
+                .get(parent_id)
+                .is_some_and(|pids| pids.contains(&provider_process.pid))
+                || *current_starts
+                    .entry(provider_process.pid)
+                    .or_insert_with(|| process_start(provider_process.pid))
+                    != provider_process.started_at_ms
+            {
+                continue;
+            }
             if now.saturating_sub(child.last_event) >= STALE_MS
                 || child
                     .finished
@@ -360,14 +394,17 @@ fn refresh_child(
         metadata.mtime(),
         metadata.mtime_nsec(),
     );
-    if let Some(cached) = cache
-        .get(path)
-        .filter(|cached| cached.stamp == stamp && cached.child.id == id)
-    {
+    if let Some(cached) = cache.get(path).filter(|cached| {
+        cached.stamp == stamp
+            && cached.child.id == id
+            && cached.retry_at.is_none_or(|retry_at| now < retry_at)
+    }) {
         return Some(cached.child.clone());
     }
     let previous = cache.get(path).filter(|cached| {
-        cached.child.id == id && cached.stamp.0 == stamp.0 && cached.stamp.1 < stamp.1
+        cached.child.id == id
+            && cached.stamp.0 == stamp.0
+            && (cached.stamp.1 < stamp.1 || cached.stamp == stamp && cached.retry_at.is_some())
     });
     let tail_start = metadata.len().saturating_sub(TAIL_BYTES);
     let offset = previous.map_or(tail_start, |cached| cached.offset.max(tail_start));
@@ -377,6 +414,7 @@ fn refresh_child(
     file.take(TAIL_BYTES).read_to_end(&mut bytes).ok()?;
     let mut child = previous.map(|cached| cached.child.clone());
     let mut consumed = offset;
+    let mut retry_at = None;
     let mut lines = bytes.split_inclusive(|b| *b == b'\n');
     if offset > 0
         && previous.is_none_or(|cached| offset != cached.offset)
@@ -401,10 +439,16 @@ fn refresh_child(
             .timestamp
             .as_deref()
             .and_then(|timestamp| crate::codex::parse_rfc3339_ms(timestamp).ok())
-            .filter(|timestamp| *timestamp <= now)
         else {
             continue;
         };
+        if timestamp > now {
+            // The transcript can advance after the scanner captures `now`.
+            // Leave this line unread and reconsider it on a normal later poll.
+            consumed -= line.len() as u64;
+            retry_at = Some(timestamp);
+            break;
+        }
         let current = child.get_or_insert_with(|| Child {
             id: id.into(),
             name: None,
@@ -438,6 +482,7 @@ fn refresh_child(
         CachedChild {
             stamp,
             offset: consumed,
+            retry_at,
             child: child.clone(),
         },
     );
@@ -734,5 +779,56 @@ mod tests {
         let records = scan(&mut fixture, 3_000);
         assert_eq!(children(&records).len(), 1);
         assert_ne!(children(&records)[0].id, old_id);
+    }
+
+    #[test]
+    fn terminal_and_owned_pty_parents_do_not_need_a_foreground_group_identity() {
+        for id in ["host/terminal/tty1/10", "host/run/fixture-run"] {
+            let mut fixture = Fixture::new();
+            fixture.parents[0].id = id.into();
+            fixture.parents[0].origin = crate::model::AgentOrigin::Terminal;
+            fixture.parents[0].pane_id.clear();
+            fixture.parents[0].process = None;
+            fixture.append("root", "one", 1, false);
+            let records = fixture.scan(1_000);
+            let rows = children(&records);
+            assert_eq!(rows.len(), 1, "parent {id}");
+            assert_eq!(rows[0].subagent.as_ref().unwrap().parent_id, id);
+            assert!(records[id].process.is_none());
+            assert!(rows[0].process.is_none());
+            let mut replacement = HashMap::from([(id.into(), fixture.parents[0].clone())]);
+            fixture.tracker.reconcile_with(
+                &mut replacement,
+                &HashMap::from([(id.into(), HashSet::from([10]))]),
+                &HashMap::from([(10, "claude".into())]),
+                START + 1_500,
+                |_| Some(START + 500),
+            );
+            assert!(
+                children(&replacement).is_empty(),
+                "cached provider lifetime for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_newer_than_scan_start_is_reconsidered_without_another_write() {
+        let mut fixture = Fixture::new();
+        fixture.append("root", "one", 1, false);
+        assert_eq!(children(&fixture.scan(1_000))[0].state, AgentState::Working);
+        fixture.append("root", "one", 3, true);
+        assert_eq!(children(&fixture.scan(2_000))[0].state, AgentState::Working);
+        // The file is unchanged here. The pending completion must not be lost
+        // just because it was appended after the preceding scan began.
+        let records = fixture.scan(4_000);
+        assert_eq!(children(&records)[0].attention, Attention::Done);
+        assert_eq!(
+            children(&records)[0]
+                .subagent
+                .as_ref()
+                .unwrap()
+                .finished_at_ms,
+            Some(START + 3_000)
+        );
     }
 }
