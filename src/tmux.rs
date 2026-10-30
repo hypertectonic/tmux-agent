@@ -3695,19 +3695,19 @@ exit 1
             set_test_pane_title(
                 &socket_name,
                 &recoverable,
-                "[mosh] remote-mac:~/Developer/Omu/recovered-project",
+                "[mosh] remote-mac:~/projects/recovered-project",
             );
             for pane_id in [&ambiguous_one, &ambiguous_two] {
                 set_test_pane_title(
                     &socket_name,
                     pane_id,
-                    "[mosh] remote-mac:~/Developer/Omu/ambiguous-project",
+                    "[mosh] remote-mac:~/projects/ambiguous-project",
                 );
             }
             set_test_pane_title(
                 &socket_name,
                 &failed,
-                "[mosh] remote-mac:~/Developer/Omu/failed-project",
+                "[mosh] remote-mac:~/projects/failed-project",
             );
             test_tmux_output(&socket_name, &["select-pane", "-t", &unrelated]);
 
@@ -3717,7 +3717,7 @@ exit 1
             };
             let tmux = Tmux::new(&config);
             let mut record = remote_tmux_record("recovered-session", "recovered-project");
-            record.cwd = "/Users/example/Developer/Omu/recovered-project".into();
+            record.cwd = "/Users/example/projects/recovered-project".into();
 
             let mut named = remote_tmux_record("named-session", "recovered-project");
             named.server = "named".into();
@@ -3729,14 +3729,14 @@ exit 1
             assert!(!log_path.exists());
 
             let mut missing = remote_tmux_record("missing-session", "missing-project");
-            missing.cwd = "/Users/example/Developer/Omu/missing-project".into();
+            missing.cwd = "/Users/example/projects/missing-project".into();
             assert_eq!(
                 tmux.focus_agent(&missing).unwrap(),
                 FocusOutcome::TransportOnly
             );
 
             let mut ambiguous = remote_tmux_record("ambiguous-session", "ambiguous-project");
-            ambiguous.cwd = "/Users/example/Developer/Omu/ambiguous-project".into();
+            ambiguous.cwd = "/Users/example/projects/ambiguous-project".into();
             let error = tmux.focus_agent(&ambiguous).unwrap_err();
             assert!(error.to_string().contains(&ambiguous_one));
             assert!(error.to_string().contains(&ambiguous_two));
@@ -3753,7 +3753,7 @@ exit 1
             }
 
             let mut failed_record = remote_tmux_record("failed-session", "failed-project");
-            failed_record.cwd = "/Users/example/Developer/Omu/failed-project".into();
+            failed_record.cwd = "/Users/example/projects/failed-project".into();
             let error = tmux.focus_agent(&failed_record).unwrap_err();
             assert!(error.to_string().contains("did not attach"));
             wait_for_test_file_contents(
@@ -4910,14 +4910,14 @@ exit 1
 
     #[test]
     fn remote_terminal_title_does_not_claim_an_explicit_session_mirror() {
-        let mut marked = pane("%63", "walkme", "walk-me-through-the-code");
+        let mut marked = pane("%63", "project-session", "sample-project");
         marked.mirror_host = Some("remote-mac".into());
-        marked.mirror_session = Some("wmtc-manual-48".into());
+        marked.mirror_session = Some("remote-session".into());
         let panes = [marked];
         let processes = HashMap::from([("%63".to_string(), "ssh remote-mac".to_string())]);
 
         assert!(
-            find_transport_pane(&panes, &processes, "remote-mac", "walk-me-through-the-code")
+            find_transport_pane(&panes, &processes, "remote-mac", "sample-project")
                 .unwrap()
                 .is_none()
         );
@@ -4925,18 +4925,18 @@ exit 1
 
     #[test]
     fn explicit_remote_session_selects_the_marked_pane_over_a_matching_title() {
-        let title_match = pane("%61", "walkme", "walk-me-through-the-code");
+        let title_match = pane("%61", "project-session", "sample-project");
         let mut marked = pane(
             "%63",
-            "walkme",
-            "remote.local:wmtc-manual-48:0:node:walk-me-through-the-code",
+            "project-session",
+            "remote.example:remote-session:0:node:sample-project",
         );
         marked.mirror_host = Some("remote-mac".into());
-        marked.mirror_session = Some("wmtc-manual-48".into());
+        marked.mirror_session = Some("remote-session".into());
         let panes = [title_match, marked];
 
         assert_eq!(
-            find_mirror_pane(&panes, "remote-mac", "wmtc-manual-48")
+            find_mirror_pane(&panes, "remote-mac", "remote-session")
                 .unwrap()
                 .map(|pane| pane.pane_id.as_str()),
             Some("%63")
@@ -4946,13 +4946,13 @@ exit 1
     #[test]
     fn duplicate_remote_session_markers_are_not_guessed() {
         let panes = ["%63", "%64"].map(|pane_id| {
-            let mut pane = pane(pane_id, "walkme", "remote session");
+            let mut pane = pane(pane_id, "project-session", "remote session");
             pane.mirror_host = Some("remote-mac".into());
-            pane.mirror_session = Some("wmtc-manual-48".into());
+            pane.mirror_session = Some("remote-session".into());
             pane
         });
 
-        let error = find_mirror_pane(&panes, "remote-mac", "wmtc-manual-48").unwrap_err();
+        let error = find_mirror_pane(&panes, "remote-mac", "remote-session").unwrap_err();
         assert!(error.to_string().contains("%63, %64"));
     }
 
