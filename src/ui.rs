@@ -2827,7 +2827,7 @@ mod tests {
     fn explicitly_mapped_remote_tmux_breadcrumb_stays_remote() {
         let mut remote = test_agent("Codex", Attention::Working, AgentOrigin::Tmux);
         remote.remote_alias = Some("remote-mac".into());
-        remote.session_name = "wmtc-manual-48".into();
+        remote.session_name = "remote-session".into();
         remote.window_index = 0;
         remote.pane_index = 0;
         remote.label = Some("testing env".into());
@@ -2835,9 +2835,9 @@ mod tests {
         assert!(remote.focus_target.is_none());
         assert_eq!(
             location_breadcrumb(&remote),
-            "remote-mac › wmtc-manual-48 › 0.0"
+            "remote-mac › remote-session › 0.0"
         );
-        assert_eq!(remote.location_label(), "wmtc-manual-48:0.0");
+        assert_eq!(remote.location_label(), "remote-session:0.0");
     }
 
     #[test]

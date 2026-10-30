@@ -2683,12 +2683,12 @@ mod tests {
             Attention::Working,
         );
         record.remote_alias = Some("remote-mac".into());
-        record.session_name = "wmtc-manual-48".into();
-        record.title = "walk-me-through-the-code".into();
+        record.session_name = "remote-session".into();
+        record.title = "sample-project".into();
         let transports = [transport(
-            "walkme-1.1",
+            "project-session-1.1",
             None,
-            "walk-me-through-the-code",
+            "sample-project",
             Some("development"),
         )];
 
