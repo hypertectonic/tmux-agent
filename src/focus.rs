@@ -742,87 +742,88 @@ mod tests {
             .find(|pane| *pane != request.pane_id)
             .unwrap()
             .to_string();
-        inner
-            .run(&["refresh-client", "-t", client.trim(), "-f", "active-pane"])
-            .unwrap();
-        inner
-            .run(&["bind-key", "-n", "F11", "select-pane", "-t", &other_pane])
-            .unwrap();
-        inner
-            .run(&[
-                "bind-key",
-                "-n",
-                "F12",
-                "set-option",
-                "-gF",
-                "@focus_test_client_pane",
-                "#{pane_id}",
-            ])
-            .unwrap();
-        outer
-            .run(&["send-keys", "-t", "outer:0", "F11", "F12"])
-            .unwrap();
-        wait_until_ready("independent remote pane selection", || {
+        if enable_independent_pane_mode(&inner, client.trim()) {
             inner
+                .run(&["bind-key", "-n", "F11", "select-pane", "-t", &other_pane])
+                .unwrap();
+            inner
+                .run(&[
+                    "bind-key",
+                    "-n",
+                    "F12",
+                    "set-option",
+                    "-gF",
+                    "@focus_test_client_pane",
+                    "#{pane_id}",
+                ])
+                .unwrap();
+            outer
+                .run(&["send-keys", "-t", "outer:0", "F11", "F12"])
+                .unwrap();
+            wait_until_ready("independent remote pane selection", || {
+                inner
+                    .run(&["show-option", "-gqv", "@focus_test_client_pane"])
+                    .unwrap()
+                    .trim()
+                    == other_pane
+            });
+            inner.run(&["select-window", "-t", "$0:0"]).unwrap();
+            let before_rejection = current();
+            let selected = select_remote(&inner, &request);
+            inner
+                .run(&["set-option", "-gu", "@focus_test_client_pane"])
+                .unwrap();
+            outer.run(&["send-keys", "-t", "outer:0", "F12"]).unwrap();
+            wait_until_ready("remote client pane observation", || {
+                !inner
+                    .run(&["show-option", "-gqv", "@focus_test_client_pane"])
+                    .unwrap()
+                    .trim()
+                    .is_empty()
+            });
+            let actual = inner
                 .run(&["show-option", "-gqv", "@focus_test_client_pane"])
-                .unwrap()
-                .trim()
-                == other_pane
-        });
-        inner.run(&["select-window", "-t", "$0:0"]).unwrap();
-        let before_rejection = current();
-        let selected = select_remote(&inner, &request);
-        inner
-            .run(&["set-option", "-gu", "@focus_test_client_pane"])
-            .unwrap();
-        outer.run(&["send-keys", "-t", "outer:0", "F12"]).unwrap();
-        wait_until_ready("remote client pane observation", || {
-            !inner
-                .run(&["show-option", "-gqv", "@focus_test_client_pane"])
-                .unwrap()
-                .trim()
-                .is_empty()
-        });
-        let actual = inner
-            .run(&["show-option", "-gqv", "@focus_test_client_pane"])
-            .unwrap();
-        assert!(
-            selected
-                .as_ref()
-                .is_err_and(|error| error.to_string().contains("active-pane")),
-            "independent client pane was not selected, yet remote focus confirmed success: {}",
-            actual.trim()
-        );
-        assert_eq!(
-            current(),
-            before_rejection,
-            "unsupported client mutated before rejection"
-        );
-        inner
-            .run(&["refresh-client", "-t", client.trim(), "-f", "!active-pane"])
-            .unwrap();
-        inner.run(&["select-pane", "-t", &other_pane]).unwrap();
-        let change_mode = shell_join(&[
-            "refresh-client".into(),
-            "-t".into(),
-            client.trim().into(),
-            "-f".into(),
-            "active-pane".into(),
-        ]);
-        inner
-            .run(&["set-hook", "-g", "after-select-pane", &change_mode])
-            .unwrap();
-        let changed_mode = select_remote(&inner, &request).unwrap_err();
-        assert!(
-            changed_mode.to_string().contains("active-pane"),
-            "{changed_mode:#}"
-        );
-        inner
-            .run(&["set-hook", "-gu", "after-select-pane"])
-            .unwrap();
-        inner
-            .run(&["refresh-client", "-t", client.trim(), "-f", "!active-pane"])
-            .unwrap();
+                .unwrap();
+            assert!(
+                selected
+                    .as_ref()
+                    .is_err_and(|error| error.to_string().contains("active-pane")),
+                "independent client pane was not selected, yet remote focus confirmed success: {}",
+                actual.trim()
+            );
+            assert_eq!(
+                current(),
+                before_rejection,
+                "unsupported client mutated before rejection"
+            );
+            inner
+                .run(&["refresh-client", "-t", client.trim(), "-f", "!active-pane"])
+                .unwrap();
+            inner.run(&["select-pane", "-t", &other_pane]).unwrap();
+            let change_mode = shell_join(&[
+                "refresh-client".into(),
+                "-t".into(),
+                client.trim().into(),
+                "-f".into(),
+                "active-pane".into(),
+            ]);
+            inner
+                .run(&["set-hook", "-g", "after-select-pane", &change_mode])
+                .unwrap();
+            let changed_mode = select_remote(&inner, &request).unwrap_err();
+            assert!(
+                changed_mode.to_string().contains("active-pane"),
+                "{changed_mode:#}"
+            );
+            inner
+                .run(&["set-hook", "-gu", "after-select-pane"])
+                .unwrap();
+            inner
+                .run(&["refresh-client", "-t", client.trim(), "-f", "!active-pane"])
+                .unwrap();
+        } else {
+            eprintln!("remote active-pane cases not applicable: tmux does not support the flag");
+        }
         inner
             .run(&["switch-client", "-c", client.trim(), "-t", "unrelated"])
             .unwrap();
@@ -850,6 +851,22 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    fn enable_independent_pane_mode(tmux: &Tmux, client: &str) -> bool {
+        tmux.run(&["refresh-client", "-t", client, "-f", "active-pane"])
+            .unwrap();
+        // tmux 3.8 removed this flag and silently ignores attempts to set it.
+        let clients = tmux
+            .run(&["list-clients", "-F", "#{client_name}\t#{client_flags}"])
+            .unwrap();
+        let mut matches = clients.lines().filter_map(|line| {
+            let (name, flags) = line.split_once('\t')?;
+            (name == client).then_some(flags)
+        });
+        let flags = matches.next().expect("probe client is no longer attached");
+        assert!(matches.next().is_none(), "probe client is ambiguous");
+        flags.split(',').any(|flag| flag == "active-pane")
     }
 
     fn check_activation_clients(
@@ -995,6 +1012,16 @@ mod tests {
         };
         let initiating_name = client_name(initiating);
         let spectator_name = client_name(spectator);
+        let independent_panes = enable_independent_pane_mode(outer, &initiating_name);
+        outer
+            .run(&[
+                "refresh-client",
+                "-t",
+                &initiating_name,
+                "-f",
+                "!active-pane",
+            ])
+            .unwrap();
         let alternate = outer
             .run(&[
                 "split-window",
@@ -1020,6 +1047,10 @@ mod tests {
             "single-client",
             "detach",
         ] {
+            if !independent_panes && matches!(case, "independent-local" | "changed-client-mode") {
+                eprintln!("{case} not applicable: tmux does not support the active-pane flag");
+                continue;
+            }
             outer
                 .run(&["switch-client", "-c", &initiating_name, "-t", "ui"])
                 .unwrap();
@@ -1069,7 +1100,10 @@ mod tests {
                     let initiating_name = &initiating_name;
                     let alternate = &alternate;
                     async move {
-                        assert!(!matches!(case, "old-peer" | "local" | "independent-local"));
+                        assert!(
+                            !matches!(case, "old-peer" | "local" | "independent-local"),
+                            "unexpected remote control for {case}"
+                        );
                         if case == "failed-control" {
                             bail!("synthetic control rejection")
                         }

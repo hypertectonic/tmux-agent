@@ -74,6 +74,11 @@ check stale lifetime/target identities, client replacement, and missing-target
 acknowledgement. Each case prints a result, and a missing or skipped named test
 fails the gate.
 
+The inner-focus fixture probes support for tmux's `active-pane` client flag.
+On tmux 3.8 and newer, which removed the flag, only the independent-pane
+rejection cases are not applicable. The remaining focus and transport checks
+still run; older tmux versions exercise those rejection cases as well.
+
 Root-owned sshd and the unprivileged scanner run inside a disposable container
 with no external network or published ports. Keys, login configuration, tmux
 sockets, daemons and UI clients are fixture-only. The test verifies that the
