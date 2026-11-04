@@ -69,6 +69,21 @@ cat >"$test_root/bin/tmux" <<EOF
 #!/bin/sh
 set -eu
 printf '%s\n' "\$*" >>"$test_root/tmux-calls"
+visibility_format=\$(printf '#{window_active}\\037#{session_attached}')
+if [ "\$#" -eq 7 ] && [ "\$3" = display-message ] &&
+    [ "\$4" = -p ] && [ "\$5" = -t ] && [ "\$7" = "\$visibility_format" ]; then
+    target=\$6
+    if [ -e "$test_root/visibility-fail-\$target" ] &&
+        [ ! -e "$test_root/visibility-release-\$target" ]; then
+        printf '%s\n' failed >>"$test_root/visibility-\$target"
+        printf '%s\n' 'synthetic visibility query failure' >&2
+        exit 1
+    fi
+    output=\$("$real_tmux" "\$@")
+    printf '%s\n' ok >>"$test_root/visibility-\$target"
+    printf '%s\n' "\$output"
+    exit 0
+fi
 for argument in "\$@"; do
     if [ "\$argument" = "-H" ] && [ -e "$test_root/wake-block" ]; then
         printf '%s\n' "\$$" >>"$test_root/wake-started"
@@ -147,6 +162,7 @@ ui_pane=$(
 printf -v ui_command 'env PATH=%q %q --config %q ui' \
     "$test_root/bin:$PATH" "$binary" "$config"
 "${tmux_test[@]}" set-option -pt "$ui_pane" remain-on-exit on
+touch "$test_root/visibility-fail-$ui_pane"
 "${tmux_test[@]}" respawn-pane -k -t "$ui_pane" "$ui_command"
 second_ui_pane=$(
     "${tmux_test[@]}" split-window -d -t "$second_agent_pane" -P -F '#{pane_id}' 'sleep 300'
@@ -155,6 +171,11 @@ second_ui_pane=$(
 "${tmux_test[@]}" respawn-pane -k -t "$second_ui_pane" "$ui_command"
 "${tmux_test[@]}" select-window -t "$ui_pane"
 for _ in {1..50}; do
+    if [[ $("${tmux_test[@]}" display-message -p -t "$ui_pane" '#{pane_dead}') == 1 ]] &&
+        grep -Fx failed "$test_root/visibility-$ui_pane" >/dev/null 2>&1; then
+        printf '%s\n' 'initial visibility failure terminated the UI' >&2
+        exit 1
+    fi
     marker=$("${tmux_test[@]}" display-message -p -t "$ui_pane" '#{@tmux_agent_ui}')
     second_marker=$(
         "${tmux_test[@]}" display-message -p -t "$second_ui_pane" '#{@tmux_agent_ui}'
@@ -179,6 +200,63 @@ if "${tmux_test[@]}" capture-pane -p -t "$ui_pane" | grep -F 'CODEX' >/dev/null 
     exit 1
 fi
 sleep 0.5
+
+# The first pane starts without a visibility result. It must draw a usable
+# frame, stay alive through failures, and resume probing after recovery.
+for _ in {1..50}; do
+    if grep -Fx failed "$test_root/visibility-$ui_pane" >/dev/null 2>&1 &&
+        "${tmux_test[@]}" capture-pane -p -t "$ui_pane" | grep -F 'q close' >/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+grep -Fx failed "$test_root/visibility-$ui_pane" >/dev/null
+if [[ $("${tmux_test[@]}" display-message -p -t "$ui_pane" '#{pane_dead}') != 0 ]]; then
+    printf '%s\n' 'initial visibility failure terminated the UI' >&2
+    exit 1
+fi
+"${tmux_test[@]}" capture-pane -p -t "$ui_pane" | grep -F 'q close' >/dev/null
+touch "$test_root/visibility-release-$ui_pane"
+recovered=0
+for _ in {1..50}; do
+    if grep -Fx ok "$test_root/visibility-$ui_pane" >/dev/null; then
+        recovered=1
+        break
+    fi
+    sleep 0.1
+done
+[[ $recovered == 1 ]] || {
+    printf '%s\n' 'UI did not retry its initial failed visibility query' >&2
+    exit 1
+}
+
+# The second pane has already observed that it is hidden. Repeated failed
+# probes must keep the hidden cadence, not exit or immediately retry.
+grep -Fx ok "$test_root/visibility-$second_ui_pane" >/dev/null
+touch "$test_root/visibility-fail-$second_ui_pane"
+for _ in {1..50}; do
+    if grep -Fx failed "$test_root/visibility-$second_ui_pane" >/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+grep -Fx failed "$test_root/visibility-$second_ui_pane" >/dev/null
+sleep 2.2
+failed_probes=$(grep -c '^failed$' "$test_root/visibility-$second_ui_pane")
+if ((failed_probes < 2 || failed_probes > 3)) ||
+    [[ $("${tmux_test[@]}" display-message -p -t "$second_ui_pane" '#{pane_dead}') != 0 ]]; then
+    printf 'hidden UI failed to retain bounded retries: %s probes\n' "$failed_probes" >&2
+    exit 1
+fi
+touch "$test_root/visibility-release-$second_ui_pane"
+for _ in {1..50}; do
+    [[ $(tail -n 1 "$test_root/visibility-$second_ui_pane") == ok ]] && break
+    sleep 0.1
+done
+[[ $(tail -n 1 "$test_root/visibility-$second_ui_pane") == ok ]] || {
+    printf '%s\n' 'hidden UI did not recover visibility checks' >&2
+    exit 1
+}
 
 printf '%s\n' "$first_agent_pid" "$second_agent_pid" >"$fixture_pid"
 
@@ -275,5 +353,15 @@ if [[ $selection_synced != 1 ]]; then
     "${tmux_test[@]}" capture-pane -p -S -80 -t "$second_ui_pane" >&2
     exit 1
 fi
+
+"${tmux_test[@]}" send-keys -t "$second_ui_pane" q y
+for _ in {1..50}; do
+    [[ $("${tmux_test[@]}" display-message -p -t "$second_ui_pane" '#{pane_dead}') == 1 ]] && break
+    sleep 0.1
+done
+[[ $("${tmux_test[@]}" display-message -p -t "$second_ui_pane" '#{pane_dead_status}') == 0 ]] || {
+    printf '%s\n' 'recovered UI did not close cleanly on explicit quit' >&2
+    exit 1
+}
 
 printf '%s\n' 'event-driven UI tests passed'
