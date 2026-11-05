@@ -4,7 +4,7 @@ All notable changes to `tmux-agent` will be documented in this file.
 
 The project uses semantic versioning.
 
-## [0.11.0] - 2026-10-02
+## [0.11.0] - 2026-11-05
 
 ### Added
 
@@ -15,6 +15,8 @@ The project uses semantic versioning.
 
 ### Fixed
 
+- Keep persistent UIs alive after failed tmux visibility queries, preserving
+  their last known visibility and retrying at the existing bounded cadence.
 - Acknowledge a completed Claude child when selecting its parent pane, without
   clearing sibling completions.
 - Report current cached SSH and Mosh focus bindings in diagnostics rather

@@ -131,7 +131,10 @@ impl UiSchedule {
         }
     }
 
-    fn visibility_checked(&mut self, visible: bool, now: Instant) {
+    fn visibility_checked(&mut self, result: Result<bool>, now: Instant) {
+        // Visibility is only a rendering hint. A failed probe must neither close
+        // the UI nor wake a hidden pane; retry at its last known cadence.
+        let visible = result.unwrap_or(self.visible);
         if visible && !self.visible {
             self.dirty = true;
             self.next_animation_frame = now + SPINNER_FRAME_TIME;
@@ -636,7 +639,13 @@ async fn run_loop(
     let mut message = UiMessage::default();
     let started = Instant::now();
     let mut schedule = match ui_pane_id {
-        Some(pane_id) => UiSchedule::new(read_pane_visibility(tmux, pane_id).await?, started),
+        Some(pane_id) => {
+            // Unknown visibility gets one initial frame, then waits for a
+            // successful probe before enabling animation and normal redraws.
+            let mut schedule = UiSchedule::new(false, started);
+            schedule.visibility_checked(read_pane_visibility(tmux, pane_id).await, Instant::now());
+            schedule
+        }
         None => UiSchedule::always_visible(started),
     };
     let animation_started = started;
@@ -845,8 +854,8 @@ async fn run_loop(
                     }
                     LoopTimer::Ui(UiTimer::VisibilityProbe) => {
                         let pane_id = ui_pane_id.context("visibility timer without a UI pane")?;
-                        let visible = read_pane_visibility(tmux, pane_id).await?;
-                        schedule.visibility_checked(visible, Instant::now());
+                        let result = read_pane_visibility(tmux, pane_id).await;
+                        schedule.visibility_checked(result, Instant::now());
                     }
                     LoopTimer::MessageExpiry => {
                         if message.expire(now) {
@@ -2443,7 +2452,7 @@ mod tests {
         let (deadline, timer) = schedule.next_timer(false, false).unwrap();
         assert_eq!(deadline, started + VISIBLE_VISIBILITY_PROBE_INTERVAL);
         assert_eq!(timer, UiTimer::VisibilityProbe);
-        schedule.visibility_checked(true, deadline);
+        schedule.visibility_checked(Ok(true), deadline);
         assert!(!schedule.should_render());
     }
 
@@ -2639,11 +2648,73 @@ mod tests {
         );
 
         let hidden_probe = started + HIDDEN_VISIBILITY_PROBE_INTERVAL;
-        schedule.visibility_checked(false, hidden_probe);
+        schedule.visibility_checked(Ok(false), hidden_probe);
         assert!(!schedule.should_render());
 
-        schedule.visibility_checked(true, hidden_probe);
+        schedule.visibility_checked(Ok(true), hidden_probe);
         assert!(schedule.should_render());
+    }
+
+    #[test]
+    fn unknown_visibility_renders_once_then_waits_for_recovery() {
+        let started = Instant::now();
+        let mut schedule = UiSchedule::new(false, started);
+        schedule.visibility_checked(Err(anyhow::anyhow!("synthetic probe failure")), started);
+        assert!(schedule.should_render());
+        schedule.rendered();
+        schedule.view_changed();
+        assert!(!schedule.should_render());
+        assert_eq!(
+            schedule.next_timer(true, true),
+            Some((started + Duration::from_secs(2), UiTimer::VisibilityProbe))
+        );
+
+        let recovered = started + Duration::from_secs(2);
+        schedule.visibility_checked(Ok(true), recovered);
+        assert!(schedule.should_render());
+        schedule.rendered();
+        assert_eq!(
+            schedule.next_timer(true, true),
+            Some((recovered + SPINNER_FRAME_TIME, UiTimer::AnimationFrame))
+        );
+    }
+
+    #[test]
+    fn failed_visibility_probes_retain_rendering_and_retry_cadence() {
+        for visible in [false, true] {
+            let started = Instant::now();
+            let mut schedule = UiSchedule::new(visible, started);
+            schedule.rendered();
+            let interval = if visible {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_secs(2)
+            };
+            for probe in 1..=3 {
+                let now = started + interval * probe;
+                schedule.visibility_checked(Err(anyhow::anyhow!("synthetic probe failure")), now);
+                assert!(!schedule.should_render());
+                assert_eq!(
+                    schedule.next_timer(false, false),
+                    Some((now + interval, UiTimer::VisibilityProbe))
+                );
+                schedule.view_changed();
+                assert_eq!(schedule.should_render(), visible);
+                if visible {
+                    schedule.rendered();
+                } else {
+                    // Even working agents cannot introduce animation/elapsed
+                    // timers while a hidden pane's visibility is unavailable.
+                    assert_eq!(
+                        schedule.next_timer(true, true),
+                        Some((now + interval, UiTimer::VisibilityProbe))
+                    );
+                }
+            }
+            schedule.visibility_checked(Ok(!visible), started + interval * 4);
+            schedule.view_changed();
+            assert_eq!(schedule.should_render(), !visible);
+        }
     }
 
     #[test]

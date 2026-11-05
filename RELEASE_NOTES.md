@@ -1,8 +1,13 @@
-tmux-agent v0.11.0 adds Claude child rows and unmet Codex goal outcomes, and
-improves remote-focus diagnostics.
+tmux-agent v0.11.0 keeps persistent UIs alive after failed visibility queries,
+adds Claude child rows and unmet Codex goal outcomes, and improves remote-focus
+diagnostics.
 
 ## Changes
 
+- Recover silently from failed tmux visibility queries instead of closing the
+  UI. Preserve the last known visibility and retry at the existing cadence.
+  If the first query fails, draw one frame and use the hidden cadence until
+  visibility is known. This does not change host limits or restart tmux.
 - Show recognized Claude children beneath their verified parent, independently
   of the visible child panel. Selecting one focuses the parent rather than
   opening a transcript or sending input to the child.
