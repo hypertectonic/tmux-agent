@@ -75,6 +75,7 @@ if [ "\$#" -eq 7 ] && [ "\$3" = display-message ] &&
     target=\$6
     if [ -e "$test_root/visibility-fail-\$target" ] &&
         [ ! -e "$test_root/visibility-release-\$target" ]; then
+        python3 -c 'import time; print(time.monotonic())' >>"$test_root/visibility-failed-times-\$target"
         printf '%s\n' failed >>"$test_root/visibility-\$target"
         printf '%s\n' 'synthetic visibility query failure' >&2
         exit 1
@@ -235,19 +236,27 @@ done
 grep -Fx ok "$test_root/visibility-$second_ui_pane" >/dev/null
 touch "$test_root/visibility-fail-$second_ui_pane"
 for _ in {1..50}; do
-    if grep -Fx failed "$test_root/visibility-$second_ui_pane" >/dev/null; then
+    failed_probes=$(grep -c '^failed$' "$test_root/visibility-$second_ui_pane" || true)
+    if ((failed_probes >= 2)); then
         break
     fi
     sleep 0.1
 done
-grep -Fx failed "$test_root/visibility-$second_ui_pane" >/dev/null
-sleep 2.2
-failed_probes=$(grep -c '^failed$' "$test_root/visibility-$second_ui_pane")
-if ((failed_probes < 2 || failed_probes > 3)) ||
+if ((failed_probes < 2)) ||
     [[ $("${tmux_test[@]}" display-message -p -t "$second_ui_pane" '#{pane_dead}') != 0 ]]; then
     printf 'hidden UI failed to retain bounded retries: %s probes\n' "$failed_probes" >&2
     exit 1
 fi
+# Measure successive attempts, not a count in a window that could also accept
+# one-second retries. Allow scheduling delays, but not an early second probe.
+python3 - "$test_root/visibility-failed-times-$second_ui_pane" <<'PY'
+import sys
+from pathlib import Path
+
+times = [float(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+if any(later - earlier < 1.8 for earlier, later in zip(times, times[1:])):
+    raise SystemExit("hidden UI retried before the two-second visibility interval")
+PY
 touch "$test_root/visibility-release-$second_ui_pane"
 for _ in {1..50}; do
     [[ $(tail -n 1 "$test_root/visibility-$second_ui_pane") == ok ]] && break
@@ -257,6 +266,21 @@ done
     printf '%s\n' 'hidden UI did not recover visibility checks' >&2
     exit 1
 }
+
+# The first pane has recovered while visible. Fail its next probes and wait
+# for two failures so the UI has consumed at least one before the view changes.
+# The new row must still render without a successful visibility query.
+failed_before=$(grep -c '^failed$' "$test_root/visibility-$ui_pane")
+rm "$test_root/visibility-release-$ui_pane"
+for _ in {1..50}; do
+    failed_probes=$(grep -c '^failed$' "$test_root/visibility-$ui_pane")
+    ((failed_probes >= failed_before + 2)) && break
+    sleep 0.1
+done
+if ((failed_probes < failed_before + 2)); then
+    printf '%s\n' 'visible UI did not continue probing after a visibility failure' >&2
+    exit 1
+fi
 
 printf '%s\n' "$first_agent_pid" "$second_agent_pid" >"$fixture_pid"
 
@@ -299,12 +323,13 @@ if [[ $rendered != 1 ]]; then
         "${tmux_test[@]}" display-message -p -t "$ui_pane" \
             '#{window_active}|#{session_attached}'
     )
-    printf 'event-driven UI did not render the published row; visibility=%s\n' \
+    printf 'visible UI did not render the published row while visibility queries failed; visibility=%s\n' \
         "$visibility" >&2
     "${tmux_test[@]}" capture-pane -p -S -80 -t "$ui_pane" >&2
     "${tmux_test[@]}" capture-pane -p -S -80 -t "$second_ui_pane" >&2
     exit 1
 fi
+touch "$test_root/visibility-release-$ui_pane"
 
 touch "$test_root/wake-block"
 : >"$test_root/wake-started"
