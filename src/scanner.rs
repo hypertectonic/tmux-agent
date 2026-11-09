@@ -1898,7 +1898,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_failure_preserves_state_without_strong_title_evidence() {
+    fn capture_failure_preserves_state_until_a_fresh_idle_observation() {
         let mut detection = detect::detect("codex", "work", "").unwrap();
         preserve_on_capture_failure(&mut detection);
         assert!(detection.details.as_ref().unwrap().preserve_previous);
@@ -1910,6 +1910,16 @@ mod tests {
             result.details.unwrap().transition.as_deref(),
             Some("screen_capture_failed")
         );
+
+        let recovered = tracker.stabilize(
+            &previous.id,
+            "Codex:42",
+            detect::detect("codex", "work", "").unwrap(),
+            Some(&previous),
+            5_000,
+        );
+        assert_eq!(recovered.state, AgentState::Idle);
+        assert!(!recovered.details.unwrap().preserve_previous);
     }
 
     #[test]

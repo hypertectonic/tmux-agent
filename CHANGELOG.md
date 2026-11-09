@@ -4,6 +4,13 @@ All notable changes to `tmux-agent` will be documented in this file.
 
 The project uses semantic versioning.
 
+## [0.11.1] - 2026-11-09
+
+### Fixed
+
+- Bound pane capture batches to avoid tmux command-size failures that could
+  leave idle agents marked as working when many panes need capturing.
+
 ## [0.11.0] - 2026-11-05
 
 ### Added
