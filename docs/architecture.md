@@ -30,6 +30,11 @@ screen and waits for the same background interval before retrying. Replaying a
 cached quiet screen does not count as a new idle observation, while current
 tmux metadata and title evidence are still evaluated on every scan.
 
+Due captures run in batches of at most 32 panes to keep each framed request
+below tmux's command-size limit. Each batch uses one tmux process and fresh
+nonce framing; results are combined by pane ID. A missing pane or failed batch
+does not discard other captures or prevent later batches from running.
+
 Process starts, exits, and SSH connection changes can therefore take about one
 second to appear. Tmux metadata and screen-derived state in displayed windows
 remain on the normal scan cadence.

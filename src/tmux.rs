@@ -28,6 +28,8 @@ const REMOTE_SESSION_OPTION: &str = "@tmux_agent_remote_session";
 const PROCESS_INVENTORY_TTL: Duration = Duration::from_secs(1);
 const REMOTE_ATTACH_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// Leave room for nonce framing and pane IDs below tmux's command-size limit.
+const CAPTURE_BATCH_SIZE: usize = 32;
 static CAPTURE_BATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 const PROCESS_COLUMNS: &str = "uid=,pid=,ppid=,pgid=,tpgid=,tdev=,etime=,args=";
@@ -847,35 +849,36 @@ impl Tmux {
     }
 
     pub fn capture_visible_batch(&self, pane_ids: &[String]) -> HashMap<String, Result<String>> {
-        if pane_ids.is_empty() {
-            return HashMap::new();
+        let mut captures = HashMap::new();
+        for batch in pane_ids.chunks(CAPTURE_BATCH_SIZE) {
+            let framing = CaptureBatchFraming::fresh();
+            let command_args = capture_batch_args(batch, &framing);
+            let mut command = Command::new("tmux");
+            command.args(&self.args).args(&command_args);
+            captures.extend(match command.output() {
+                Ok(output) => parse_capture_batch(
+                    batch,
+                    &framing,
+                    &String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                ),
+                Err(error) => {
+                    let message = error.to_string();
+                    batch
+                        .iter()
+                        .map(|pane_id| {
+                            (
+                                pane_id.clone(),
+                                Err(anyhow::anyhow!(
+                                    "run tmux capture-pane batch for {pane_id}: {message}"
+                                )),
+                            )
+                        })
+                        .collect()
+                }
+            });
         }
-        let framing = CaptureBatchFraming::fresh();
-        let command_args = capture_batch_args(pane_ids, &framing);
-        let mut command = Command::new("tmux");
-        command.args(&self.args).args(&command_args);
-        match command.output() {
-            Ok(output) => parse_capture_batch(
-                pane_ids,
-                &framing,
-                &String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr).trim(),
-            ),
-            Err(error) => {
-                let message = error.to_string();
-                pane_ids
-                    .iter()
-                    .map(|pane_id| {
-                        (
-                            pane_id.clone(),
-                            Err(anyhow::anyhow!(
-                                "run tmux capture-pane batch for {pane_id}: {message}"
-                            )),
-                        )
-                    })
-                    .collect()
-            }
-        }
+        captures
     }
 
     pub fn process_working_directories(&self, pids: &[u32]) -> HashMap<u32, String> {
@@ -4775,13 +4778,21 @@ exit 1
         assert!(!capture.contains(" -M"));
     }
 
-    #[test]
-    fn batched_capture_preserves_successes_when_one_pane_disappears() {
+    fn with_capture_test_panes(test: impl FnOnce(&Tmux, &[String])) {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let socket_name = format!("tmux-agent-capture-{}-{nonce}", std::process::id());
+        struct Server(String);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux")
+                    .args(["-L", &self.0, "kill-server"])
+                    .output();
+            }
+        }
+        let _server = Server(socket_name.clone());
         let config = Config {
             tmux_args: vec!["-L".into(), socket_name.clone()],
             ..Config::default()
@@ -4848,14 +4859,10 @@ exit 1
             });
             assert!(ready, "pane {pane_id} did not render {expected}");
         }
-        let missing = "%999999".to_string();
-        let requested = vec![pane_ids[0].clone(), missing.clone(), pane_ids[1].clone()];
+        test(&Tmux::new(&config), &pane_ids);
+    }
 
-        let captures = Tmux::new(&config).capture_visible_batch(&requested);
-
-        let _ = Command::new("tmux")
-            .args(["-L", &socket_name, "kill-server"])
-            .status();
+    fn assert_capture_mapping(captures: &HashMap<String, Result<String>>, pane_ids: &[String]) {
         assert!(
             captures[&pane_ids[0]]
                 .as_ref()
@@ -4872,7 +4879,42 @@ exit 1
             "second capture was {:?}",
             captures[&pane_ids[1]]
         );
-        assert!(captures[&missing].is_err());
+    }
+
+    #[test]
+    fn batched_capture_preserves_successes_when_one_pane_disappears() {
+        with_capture_test_panes(|tmux, pane_ids| {
+            let missing = "%999999".to_string();
+            let requested = vec![pane_ids[0].clone(), missing.clone(), pane_ids[1].clone()];
+            let captures = tmux.capture_visible_batch(&requested);
+            assert_eq!(captures.len(), 3);
+            assert_capture_mapping(&captures, pane_ids);
+            assert!(captures[&missing].is_err());
+        });
+    }
+
+    #[test]
+    fn batched_capture_handles_requests_above_the_single_command_limit() {
+        with_capture_test_panes(|tmux, pane_ids| {
+            // Repeat two panes to exceed the old command size without starting
+            // a large number of processes. Each pane has distinct screen text.
+            let mut requested = vec![pane_ids[0].clone(); 32];
+            requested.extend(vec![pane_ids[1].clone(); 128]);
+            let captures = tmux.capture_visible_batch(&requested);
+            assert_eq!(captures.len(), 2);
+            assert_capture_mapping(&captures, pane_ids);
+
+            // Failures on both sides of a batch boundary must not discard
+            // earlier successes or prevent later batches from capturing.
+            let missing = "%999999".to_string();
+            for index in [31, 32, 64] {
+                requested[index] = missing.clone();
+            }
+            let captures = tmux.capture_visible_batch(&requested);
+            assert_eq!(captures.len(), 3);
+            assert_capture_mapping(&captures, pane_ids);
+            assert!(captures[&missing].is_err());
+        });
     }
 
     #[test]
