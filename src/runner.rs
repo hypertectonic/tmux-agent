@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
+use std::num::NonZeroU16;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -88,8 +89,8 @@ impl TerminalBuffer {
     fn new(rows: u16, cols: u16) -> Self {
         Self {
             parser: vt100::Parser::new_with_callbacks(
-                rows.max(2),
-                cols.max(2),
+                NonZeroU16::new(rows.max(2)).unwrap(),
+                NonZeroU16::new(cols.max(2)).unwrap(),
                 2_000,
                 TitleCallbacks::default(),
             ),
@@ -101,7 +102,10 @@ impl TerminalBuffer {
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
-        self.parser.screen_mut().set_size(rows.max(2), cols.max(2));
+        self.parser.screen_mut().set_size(
+            NonZeroU16::new(rows.max(2)).unwrap(),
+            NonZeroU16::new(cols.max(2)).unwrap(),
+        );
     }
 
     fn evidence(&self) -> (String, String) {

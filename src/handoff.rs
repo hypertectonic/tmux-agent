@@ -807,10 +807,8 @@ fn recipient_fingerprint(request: &HandoffRequest) -> String {
     // The working-state override is not part of message/recipient identity.
     let mut identity = request.clone();
     identity.allow_working = false;
-    format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&identity).expect("serializable request"))
-    )
+    let encoded = serde_json::to_vec(&identity).expect("serializable request");
+    crate::checksum::sha256_hex(Sha256::digest(encoded).into())
 }
 
 #[derive(Serialize, Deserialize)]

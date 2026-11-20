@@ -1042,8 +1042,16 @@ fn verify_checksum(archive: &Path, sums: &Path, archive_name: &str) -> Result<()
     let expected = expected.context("SHA256SUMS has no entry for the selected archive")?;
     let mut file = File::open(archive).context("open release archive for checksum")?;
     let mut digest = Sha256::new();
-    io::copy(&mut file, &mut digest).context("hash release archive")?;
-    let actual = format!("{:x}", digest.finalize());
+    let mut buffer = [0; 8192];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => digest.update(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("hash release archive"),
+        }
+    }
+    let actual = crate::checksum::sha256_hex(digest.finalize().into());
     ensure!(
         actual == expected,
         "checksum mismatch for selected release archive"
@@ -1476,7 +1484,7 @@ mod tests {
             recorded_target,
             unsafe_license,
         );
-        let checksum = format!("{:x}", Sha256::digest(&archive));
+        let checksum = crate::checksum::sha256_hex(Sha256::digest(&archive).into());
         client
             .responses
             .insert(format!("{base}/{archive_name}"), archive);
