@@ -1,3 +1,4 @@
+mod checksum;
 mod claude;
 mod codex;
 mod config;
