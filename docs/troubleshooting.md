@@ -26,6 +26,36 @@ different `@tmux-agent-key`, reload the tmux configuration, and try again.
 Confirm that TPM sourced `tmux-agent.tmux` and that `bin/tmux-agent` is
 executable.
 
+## A persistent UI exits or stops updating
+
+A failed tmux visibility query should not close a persistent `tmux-agent ui`.
+The UI retains its last known visibility and retries silently, every 250 ms
+while visible or two seconds while hidden. If the first query fails, it draws
+one frame and waits for a successful query before enabling normal redraws
+and animation. This does not mark a healthy daemon as disconnected. Explicit
+quit, terminal closure, and terminal I/O errors still end the UI.
+
+Older builds can exit after one failed visibility query. An error such as
+`server exited unexpectedly` does not by itself prove the tmux server stopped.
+Check `tmux list-sessions` and `tmux-agent daemon status` against the same
+server. If tmux remains available, restart the UI. Repeated failures need
+investigation even when the UI recovers.
+
+File-descriptor exhaustion is one possible cause of dropped tmux commands,
+not a diagnosis based on that error text alone. Obtain the selected server's
+PID with `tmux display-message -p '#{pid}'`. Inspect its open descriptors
+locally with `lsof -nP -p <server-pid>`. On Linux, `/proc/<server-pid>/limits`
+shows the running server's limits and `/proc/<server-pid>/fd` its descriptors.
+Look for descriptor use near the open-file limit and errors such as
+`Too many open files`. These outputs can contain private paths and socket
+details. Do not attach them to a public report without redaction.
+
+`ulimit -Sn` and `ulimit -Hn` describe the current shell, not an already
+running tmux server. Changing `ulimit` in a pane cannot raise its parent
+server's limit. A higher limit must be configured in the shell or service
+that starts tmux, before starting a new server. Plan session migration or a
+server restart separately; do not kill a live server to try this diagnostic.
+
 ## A provider session is missing
 
 - Confirm the provider is Codex, Claude, OpenCode, Grok, OMP, or Pi.

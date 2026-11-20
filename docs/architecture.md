@@ -30,6 +30,11 @@ screen and waits for the same background interval before retrying. Replaying a
 cached quiet screen does not count as a new idle observation, while current
 tmux metadata and title evidence are still evaluated on every scan.
 
+Due captures run in batches of at most 32 panes to keep each framed request
+below tmux's command-size limit. Each batch uses one tmux process and fresh
+nonce framing; results are combined by pane ID. A missing pane or failed batch
+does not discard other captures or prevent later batches from running.
+
 Process starts, exits, and SSH connection changes can therefore take about one
 second to appear. Tmux metadata and screen-derived state in displayed windows
 remain on the normal scan cadence.
@@ -272,7 +277,11 @@ latest snapshot, search, and selection but pause drawing, working animation,
 and elapsed-time ticks until the window is visible again. An explicit numeric
 selection permits one hidden redraw so sibling pane buffers stay synchronized
 without waiting for their next visibility probe. Visibility never changes
-search, selection, scrolling, or activation state. Popups remain visible for
+search, selection, scrolling, or activation state. Failed visibility probes
+retain the last known state and retry silently at the normal cadence, every
+250 ms while visible or two seconds while hidden. If the initial probe fails,
+the UI draws once and uses the hidden cadence until visibility is known.
+These failures do not change daemon connection status. Popups remain visible for
 their whole lifetime, and `r` replaces the current watch with a freshly
 connected stream and its initial snapshot.
 
